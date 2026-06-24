@@ -136,7 +136,7 @@ class DeltaClient:
         end_ts = start_ts + 86400
 
         params = {
-            "resolution": "1D",
+            "resolution": "1d",
             "symbol": delta_symbol,
             "start": start_ts,
             "end": end_ts
