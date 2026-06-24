@@ -24,11 +24,11 @@ IST = pytz.timezone("Asia/Kolkata")
 DELTA_BASE_URL = "https://api.india.delta.exchange"
 
 SYMBOL_MAP = {
-    "ETHUSD": "ETHUSD",
-    "SOLUSD": "SOLUSD",
-    "XRPUSD": "XRPUSD",
-    "TAOUSD": "TAOUSD",
-    "ICPUSD": "ICPUSD",
+    "ETHUSD":  "ETHUSD",
+    "SOLUSD":  "SOLUSD",
+    "XRPUSD":  "XRPUSD",
+    "TAOUSD":  "TAOUSD",
+    "XAUTUSD": "XAUTUSD",
 }
 
 FIXED_LEVERAGE = 5
