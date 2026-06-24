@@ -8,7 +8,7 @@ from datetime import date
 import threading
 
 
-SYMBOLS = ["ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "ICPUSD"]
+SYMBOLS = ["ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "XAUTUSD"]
 
 
 @dataclass
