@@ -44,9 +44,9 @@ async def daily_reset(state: BotState, engine: StrategyEngine, telegram: Telegra
         f"✅ Daily levels set:\n"
         f"{'='*30}\n" +
         "\n".join([
-            f"*{sym}* | PDH: {lvl['pdh']:.4f} | PDL: {lvl['pdl']:.4f}"
-            for sym, lvl in state.levels.items()
-        ])
+    f"*{sym}* | PDH: {lvl.pdh:.4f} | PDL: {lvl.pdl:.4f}"
+    for sym, lvl in state.levels.items()
+])
     )
     logger.info(f"Levels set: {state.levels}")
 
