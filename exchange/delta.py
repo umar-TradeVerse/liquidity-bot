@@ -122,7 +122,7 @@ class DeltaClient:
         return None
 
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
-        """Fetch the completed previous day candle (1D resolution)."""
+        """Fetch the completed previous day candle (1d resolution)."""
         delta_symbol = SYMBOL_MAP.get(symbol)
         if not delta_symbol:
             logger.error(f"Unknown symbol: {symbol}")
