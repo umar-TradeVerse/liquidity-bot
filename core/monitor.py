@@ -1,6 +1,6 @@
 """
 MarketMonitor — continuously polls 1m candles and routes signals to execution.
-Runs from 5:30 AM IST until end of day.
+Runs Monday to Friday only, from 5:30 AM IST.
 """
 
 import asyncio
@@ -16,9 +16,9 @@ from notifications.telegram import TelegramBot
 logger = logging.getLogger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
 
-POLL_INTERVAL_SECONDS = 15   # Check every 15 seconds
-DAY_END_HOUR = 23            # Stop monitoring at 11 PM IST (before next 5:30 AM)
-DAY_END_MINUTE = 30
+POLL_INTERVAL_SECONDS = 15
+DAY_END_HOUR = 13
+DAY_END_MINUTE = 0
 
 
 class MarketMonitor:
@@ -28,8 +28,19 @@ class MarketMonitor:
         self.engine = engine
         self.state = state
         self.telegram = telegram
-        # Track last processed candle timestamp per symbol
         self._last_candle_time = {sym: None for sym in SYMBOLS}
+
+    def _is_trading_day(self) -> bool:
+        """Returns True only for Monday (0) to Friday (4)."""
+        now = datetime.now(IST)
+        weekday = now.weekday()  # 0=Monday, 6=Sunday
+        return weekday < 5
+
+    def _is_trading_hours(self) -> bool:
+        """Returns True between 5:30 AM and 11:30 PM IST."""
+        now = datetime.now(IST)
+        current_time = now.time()
+        return dtime(5, 30) <= current_time <= dtime(DAY_END_HOUR, DAY_END_MINUTE)
 
     async def run(self):
         """Main monitoring loop."""
@@ -37,19 +48,20 @@ class MarketMonitor:
 
         while True:
             try:
-                now = datetime.now(IST)
+                # Weekend check
+                if not self._is_trading_day():
+                    now = datetime.now(IST)
+                    logger.info(f"Weekend — skipping ({now.strftime('%A')})")
+                    await asyncio.sleep(3600)  # Check again in 1 hour
+                    continue
 
-                # Wait until levels are ready
+                # Levels not ready yet
                 if not self.state.levels_ready() or self.state.paused:
                     await asyncio.sleep(30)
                     continue
 
-                # Check if within trading hours (5:30 AM to 11:30 PM IST)
-                current_time = now.time()
-                start_time = dtime(5, 30)
-                end_time = dtime(DAY_END_HOUR, DAY_END_MINUTE)
-
-                if not (start_time <= current_time <= end_time):
+                # Outside trading hours
+                if not self._is_trading_hours():
                     await asyncio.sleep(60)
                     continue
 
@@ -69,12 +81,10 @@ class MarketMonitor:
             if not candle:
                 return
 
-            # Skip if we already processed this candle
             if self._last_candle_time[symbol] == candle['time']:
                 return
             self._last_candle_time[symbol] = candle['time']
 
-            # Run strategy
             signal = self.engine.process_candle(symbol, candle)
             if signal:
                 await self._handle_signal(signal)
@@ -87,7 +97,6 @@ class MarketMonitor:
         symbol = signal.symbol
 
         if not self.state.can_trade():
-            # Max trades reached — notify and skip
             logger.info(f"SKIPPED {symbol} — max 2 trades reached today")
             await self.telegram.send_alert(
                 f"⏭️ *Setup Skipped* — Max trades reached\n\n"
@@ -101,7 +110,6 @@ class MarketMonitor:
             self.state.mark_scenario_fired(symbol)
             return
 
-        # Notify: setup detected
         await self.telegram.send_alert(
             f"🔍 *Setup Detected*\n\n"
             f"*Symbol:* {symbol}\n"
@@ -114,7 +122,6 @@ class MarketMonitor:
             f"⏳ Placing order..."
         )
 
-        # Execute order
         try:
             order_result = await self.delta.place_order(
                 symbol=symbol,
@@ -126,6 +133,10 @@ class MarketMonitor:
 
             if order_result and order_result.get('success'):
                 order_id = order_result.get('order_id', 'N/A')
+                trade_usd = order_result.get('trade_usd', 0)
+                quantity = order_result.get('quantity', 0)
+                sl_warning = order_result.get('sl_failed', False)
+
                 record = TradeRecord(
                     symbol=symbol,
                     side=signal.side,
@@ -138,24 +149,30 @@ class MarketMonitor:
                 self.state.register_trade(record)
                 self.state.mark_scenario_fired(symbol)
 
-                await self.telegram.send_alert(
+                msg = (
                     f"✅ *Trade Executed*\n\n"
                     f"*Symbol:* {symbol}\n"
                     f"*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Entry:* {signal.entry_price:.4f}\n"
                     f"*SL:* {signal.sl_price:.4f}\n"
+                    f"*Trade Size:* ${trade_usd:.2f} (25% of wallet)\n"
                     f"*Leverage:* 5x\n"
+                    f"*Quantity:* {quantity}\n"
                     f"*Order ID:* `{order_id}`\n"
                     f"*Scenario:* {signal.scenario.replace('_', ' ').title()}\n"
                     f"*Trades today:* {self.state.trades_today}/2\n\n"
                     f"⚠️ TP is manual — monitor your position."
                 )
+
+                if sl_warning:
+                    msg += "\n\n🚨 *SL order failed — place SL manually immediately!*"
+
+                await self.telegram.send_alert(msg)
                 logger.info(f"Trade executed: {record}")
 
             else:
-                error_msg = order_result.get('error', 'Unknown error') if order_result else 'No response'
+                error_msg = order_result.get('error', 'Unknown') if order_result else 'No response'
                 logger.error(f"{symbol} | Order failed: {error_msg}")
-                # Do NOT count failed order toward daily limit
                 await self.telegram.send_alert(
                     f"❌ *Order Failed* — NOT counted toward daily limit\n\n"
                     f"*Symbol:* {symbol}\n"
@@ -165,7 +182,7 @@ class MarketMonitor:
                 )
 
         except Exception as e:
-            logger.error(f"{symbol} | Order execution exception: {e}", exc_info=True)
+            logger.error(f"{symbol} | Order exception: {e}", exc_info=True)
             await self.telegram.send_alert(
                 f"❌ *Order Exception* — NOT counted toward daily limit\n\n"
                 f"*Symbol:* {symbol}\n"
