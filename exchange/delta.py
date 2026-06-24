@@ -21,7 +21,7 @@ import pytz
 logger = logging.getLogger("delta")
 IST = pytz.timezone("Asia/Kolkata")
 
-DELTA_BASE_URL = "https://api.delta.exchange"
+DELTA_BASE_URL = "https://api.india.delta.exchange"
 
 SYMBOL_MAP = {
     "ETHUSD": "ETHUSD",
