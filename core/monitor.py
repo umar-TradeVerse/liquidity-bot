@@ -1,6 +1,6 @@
 """
 MarketMonitor — continuously polls 1m candles and routes signals to execution.
-Runs Monday to Friday only, from 5:30 AM IST.
+Runs Monday to Friday only, from 5:30 AM to 1:00 PM IST.
 """
 
 import asyncio
@@ -31,41 +31,31 @@ class MarketMonitor:
         self._last_candle_time = {sym: None for sym in SYMBOLS}
 
     def _is_trading_day(self) -> bool:
-        """Returns True only for Monday (0) to Friday (4)."""
         now = datetime.now(IST)
-        weekday = now.weekday()  # 0=Monday, 6=Sunday
-        return weekday < 5
+        return now.weekday() < 5
 
     def _is_trading_hours(self) -> bool:
-        """Returns True between 5:30 AM and 11:30 PM IST."""
         now = datetime.now(IST)
-        current_time = now.time()
-        return dtime(5, 30) <= current_time <= dtime(DAY_END_HOUR, DAY_END_MINUTE)
+        return dtime(5, 30) <= now.time() <= dtime(DAY_END_HOUR, DAY_END_MINUTE)
 
     async def run(self):
-        """Main monitoring loop."""
         logger.info("Market monitor started")
-
         while True:
             try:
-                # Weekend check
                 if not self._is_trading_day():
                     now = datetime.now(IST)
                     logger.info(f"Weekend — skipping ({now.strftime('%A')})")
-                    await asyncio.sleep(3600)  # Check again in 1 hour
+                    await asyncio.sleep(3600)
                     continue
 
-                # Levels not ready yet
                 if not self.state.levels_ready() or self.state.paused:
                     await asyncio.sleep(30)
                     continue
 
-                # Outside trading hours
                 if not self._is_trading_hours():
                     await asyncio.sleep(60)
                     continue
 
-                # Process all symbols concurrently
                 tasks = [self._process_symbol(sym) for sym in SYMBOLS]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -75,7 +65,6 @@ class MarketMonitor:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def _process_symbol(self, symbol: str):
-        """Fetch latest 1m candle and run strategy check for one symbol."""
         try:
             candle = await self.delta.get_latest_1m_candle(symbol)
             if not candle:
@@ -93,11 +82,11 @@ class MarketMonitor:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
     async def _handle_signal(self, signal: Signal):
-        """Execute or skip a signal based on daily trade limit."""
         symbol = signal.symbol
 
         if not self.state.can_trade():
             logger.info(f"SKIPPED {symbol} — max 2 trades reached today")
+            self.state.mark_scenario_fired(symbol)
             await self.telegram.send_alert(
                 f"⏭️ *Setup Skipped* — Max trades reached\n\n"
                 f"*Symbol:* {symbol}\n"
@@ -107,7 +96,6 @@ class MarketMonitor:
                 f"*Would-be Entry:* {signal.entry_price:.4f}\n"
                 f"*Would-be SL:* {signal.sl_price:.4f}"
             )
-            self.state.mark_scenario_fired(symbol)
             return
 
         await self.telegram.send_alert(
@@ -171,7 +159,6 @@ class MarketMonitor:
                 logger.info(f"Trade executed: {record}")
 
             else:
-               else:
                 error_msg = order_result.get('error', 'Unknown') if order_result else 'No response'
                 logger.error(f"{symbol} | Order failed: {error_msg}")
                 self.state.mark_scenario_fired(symbol)
