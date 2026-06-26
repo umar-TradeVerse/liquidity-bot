@@ -1,9 +1,6 @@
 """
 Delta Exchange API client.
-Handles: candle fetching, wallet balance, order placement with SL.
-
-Position sizing: 25% of total wallet balance per trade, 5x leverage.
-Trading days: Monday to Friday only (checked in monitor.py).
+Fixed trade size per trade, 5x leverage. No wallet balance fetch needed.
 """
 
 import asyncio
@@ -32,7 +29,9 @@ SYMBOL_MAP = {
 }
 
 FIXED_LEVERAGE = 5
-WALLET_TRADE_PCT = 0.25  # 25% of total wallet balance per trade
+# Fixed trade size in USD — set via Railway environment variable TRADE_SIZE_USD
+# Default: 30 USD per trade × 5x leverage = 150 USD notional position
+TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "30"))
 
 
 class DeltaClient:
@@ -48,7 +47,6 @@ class DeltaClient:
         return self._session
 
     def _generate_signature(self, method: str, path: str, payload: str = "") -> dict:
-        """Generate Delta Exchange API signature headers."""
         timestamp = str(int(time.time()))
         message = method + timestamp + path + payload
         signature = hmac.new(
@@ -104,25 +102,7 @@ class DeltaClient:
             logger.error(f"POST {path} error: {e}")
             return {"success": False, "error": str(e)}
 
-    async def get_wallet_balance(self) -> Optional[float]:
-        """
-        Fetch total wallet balance in USD from Delta Exchange.
-        Returns total balance as float, or None on failure.
-        """
-        result = await self._get("/v2/wallet/balances", auth=True)
-        if result and result.get("result"):
-            balances = result["result"]
-            for asset in balances:
-                # Delta returns balances per asset — look for USDT or USD
-                if asset.get("asset_symbol") in ("USDT", "USD"):
-                    total = float(asset.get("balance", 0))
-                    logger.info(f"Wallet balance: ${total:.2f}")
-                    return total
-        logger.error("Could not fetch wallet balance")
-        return None
-
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
-        """Fetch the completed previous day candle (1d resolution)."""
         delta_symbol = SYMBOL_MAP.get(symbol)
         if not delta_symbol:
             logger.error(f"Unknown symbol: {symbol}")
@@ -159,7 +139,6 @@ class DeltaClient:
         return None
 
     async def get_latest_1m_candle(self, symbol: str) -> Optional[dict]:
-        """Fetch the most recently completed 1-minute candle."""
         delta_symbol = SYMBOL_MAP.get(symbol)
         if not delta_symbol:
             return None
@@ -192,45 +171,31 @@ class DeltaClient:
     async def place_order(self, symbol: str, side: str, entry_price: float,
                           sl_price: float, leverage: int = 5) -> Optional[dict]:
         """
-        Place a market order with stop loss on Delta Exchange.
-        Position size = 25% of total wallet balance × 5x leverage.
-
-        Steps:
-          1. Fetch wallet balance
-          2. Calculate quantity
-          3. Set leverage
-          4. Place market order
-          5. Place stop loss order
+        Place a market order with stop loss.
+        Position size = TRADE_SIZE_USD × leverage / entry_price
+        Default: $30 × 5x = $150 notional
         """
         delta_symbol = SYMBOL_MAP.get(symbol)
         if not delta_symbol:
             return {"success": False, "error": f"Unknown symbol: {symbol}"}
 
-        # Step 1: Fetch wallet balance
-        wallet_balance = await self.get_wallet_balance()
-        if not wallet_balance or wallet_balance <= 0:
-            return {"success": False, "error": "Could not fetch wallet balance"}
-
-        # Step 2: Calculate position size
-        # 25% of wallet × 5x leverage = notional position value
-        trade_usd = wallet_balance * WALLET_TRADE_PCT
-        notional = trade_usd * leverage
+        # Calculate quantity from fixed trade size
+        notional = TRADE_SIZE_USD * leverage
         quantity = max(1, int(notional / entry_price))
 
         logger.info(
-            f"{symbol} | Wallet: ${wallet_balance:.2f} | "
-            f"Trade size (25%): ${trade_usd:.2f} | "
-            f"Notional (5x): ${notional:.2f} | "
-            f"Qty: {quantity}"
+            f"{symbol} | Trade size: ${TRADE_SIZE_USD} | "
+            f"Notional ({leverage}x): ${notional} | "
+            f"Entry: {entry_price} | Qty: {quantity}"
         )
 
-        # Step 3: Set leverage
+        # Set leverage
         await self._post("/v2/orders/leverage", {
             "product_symbol": delta_symbol,
             "leverage": str(leverage)
         })
 
-        # Step 4: Place market entry order
+        # Place market entry order
         order_payload = {
             "product_symbol": delta_symbol,
             "side": side.lower(),
@@ -246,7 +211,7 @@ class DeltaClient:
         order_id = order_result.get("result", {}).get("id", "unknown")
         logger.info(f"{symbol} | Entry order placed: {order_id}")
 
-        # Step 5: Place stop loss order
+        # Place stop loss order
         sl_side = "sell" if side == "BUY" else "buy"
         sl_payload = {
             "product_symbol": delta_symbol,
@@ -267,7 +232,7 @@ class DeltaClient:
                 return {
                     "success": True,
                     "order_id": order_id,
-                    "trade_usd": trade_usd,
+                    "trade_usd": TRADE_SIZE_USD,
                     "quantity": quantity,
                     "warning": "SL order failed — manual SL placement required",
                     "sl_failed": True
@@ -280,6 +245,6 @@ class DeltaClient:
             "success": True,
             "order_id": order_id,
             "sl_order_id": sl_order_id,
-            "trade_usd": trade_usd,
+            "trade_usd": TRADE_SIZE_USD,
             "quantity": quantity
         }
