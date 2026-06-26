@@ -171,8 +171,10 @@ class MarketMonitor:
                 logger.info(f"Trade executed: {record}")
 
             else:
+               else:
                 error_msg = order_result.get('error', 'Unknown') if order_result else 'No response'
                 logger.error(f"{symbol} | Order failed: {error_msg}")
+                self.state.mark_scenario_fired(symbol)
                 await self.telegram.send_alert(
                     f"❌ *Order Failed* — NOT counted toward daily limit\n\n"
                     f"*Symbol:* {symbol}\n"
@@ -183,6 +185,7 @@ class MarketMonitor:
 
         except Exception as e:
             logger.error(f"{symbol} | Order exception: {e}", exc_info=True)
+            self.state.mark_scenario_fired(symbol)
             await self.telegram.send_alert(
                 f"❌ *Order Exception* — NOT counted toward daily limit\n\n"
                 f"*Symbol:* {symbol}\n"
