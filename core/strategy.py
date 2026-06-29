@@ -1,15 +1,19 @@
 """
 StrategyEngine — PDH/PDL fetch + signal detection for all 3 scenarios.
 
-Signal flow per symbol per 1m candle:
-  1. If scenario already fired → skip
-  2. Check for sweep reversal (Scenario 1)
-  3. Check for breakout (Scenario 2)
-  4. If neither → inside day (Scenario 3, silent)
+SWEEP REVERSAL rule (tightened):
+  - For SHORT: price must close above PDH AND rejection candle's HIGH must be
+    above PDH (confirming an actual wick sweep, not just consolidation above PDH)
+  - For LONG: price must close below PDL AND rejection candle's LOW must be
+    below PDL (confirming an actual wick sweep below PDL)
+
+BREAKOUT rule:
+  - No rejection candle formed near PDH/PDL
+  - Two consecutive closes above PDH (LONG) or below PDL (SHORT)
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 from core.state import BotState, SYMBOLS
 from core.patterns import (
     is_rejection_candle_bearish,
@@ -27,11 +31,11 @@ SL_BUFFER_PCT = 0.001
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, scenario, pattern, pdh, pdl):
         self.symbol = symbol
-        self.side = side                  # 'BUY' or 'SELL'
+        self.side = side
         self.entry_price = entry_price
         self.sl_price = sl_price
-        self.scenario = scenario          # 'sweep_reversal' or 'breakout'
-        self.pattern = pattern            # candlestick pattern name or 'breakout'
+        self.scenario = scenario
+        self.pattern = pattern
         self.pdh = pdh
         self.pdl = pdl
 
@@ -44,11 +48,9 @@ class StrategyEngine:
     def __init__(self, delta: DeltaClient, state: BotState):
         self.delta = delta
         self.state = state
-        # Per-symbol: store last candle for engulfing detection
         self._prev_candles = {sym: None for sym in SYMBOLS}
 
     async def fetch_and_set_levels(self) -> bool:
-        """Fetch previous day OHLC for all symbols and store PDH/PDL."""
         success_count = 0
         for symbol in SYMBOLS:
             try:
@@ -72,14 +74,11 @@ class StrategyEngine:
         """
         Process a new 1m candle for a symbol.
         Returns a Signal if an actionable setup is detected, else None.
-
-        candle: {open, high, low, close, volume, time}
         """
         level = self.state.get_level(symbol)
         if not level:
             return None
 
-        # Skip if a scenario already fired today for this symbol
         if level.scenario_fired:
             return None
 
@@ -88,23 +87,28 @@ class StrategyEngine:
         prev = self._prev_candles.get(symbol)
         signal = None
 
-        # ── SCENARIO 1: SWEEP REVERSAL ──────────────────────────────────────
+        # ── SCENARIO 1: SWEEP REVERSAL — BEARISH (SHORT) ─────────────────────
 
-        # Phase A: Detect PDH break — price closed above PDH
+        # Phase A: Price closes above PDH → sweep detected
         if not level.pdh_swept and candle['close'] > pdh:
             level.pdh_swept = True
-            logger.info(f"{symbol} | PDH swept — watching for rejection candle")
+            logger.info(f"{symbol} | PDH swept (close above PDH) — watching for rejection")
 
-        # Phase B: After PDH swept — look for rejection candle
+        # Phase B: Look for rejection candle
+        # KEY FIX: rejection candle's HIGH must be above PDH
+        # This confirms price actually spiked above PDH (wick sweep), not just consolidated
         elif level.pdh_swept and level.rejection_candle is None:
-            if is_rejection_candle_bearish(candle, prev):
+            if (is_rejection_candle_bearish(candle, prev) and
+                    candle['high'] > pdh):  # ← wick must be above PDH
                 self.state.set_rejection_candle(symbol, candle, side='above_pdh')
                 pname = pattern_name(candle, prev, side='bearish')
-                logger.info(f"{symbol} | Rejection candle detected: {pname} | "
+                logger.info(f"{symbol} | Bearish rejection candle above PDH: {pname} | "
                             f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
 
-        # Phase C: Confirmation — next candle breaks rejection candle low → SHORT
-        elif level.pdh_swept and level.rejection_candle is not None and level.rejection_side == 'above_pdh':
+        # Phase C: Confirmation — next candle closes below rejection candle low → SHORT
+        elif (level.pdh_swept and
+              level.rejection_candle is not None and
+              level.rejection_side == 'above_pdh'):
             rej = level.rejection_candle
             if candle['close'] < rej['low']:
                 sl = rej['high'] * (1 + SL_BUFFER_PCT)
@@ -121,23 +125,25 @@ class StrategyEngine:
                 )
                 logger.info(f"{symbol} | SHORT signal | Entry:{candle['close']:.4f} SL:{sl:.4f}")
             elif not self._candle_near_rejection(candle, level.rejection_candle, side='above_pdh'):
-                # Price moved away from rejection without confirming → invalidate
                 self.state.clear_rejection_candle(symbol)
-                logger.info(f"{symbol} | Rejection candle invalidated (price moved away)")
+                logger.info(f"{symbol} | Rejection candle invalidated")
 
-        # ── PDL SWEEP (mirror) ───────────────────────────────────────────────
+        # ── SCENARIO 1: SWEEP REVERSAL — BULLISH (LONG) ──────────────────────
 
         if not level.pdl_swept and candle['close'] < pdl:
             level.pdl_swept = True
-            logger.info(f"{symbol} | PDL swept — watching for rejection candle")
+            logger.info(f"{symbol} | PDL swept (close below PDL) — watching for rejection")
 
         elif level.pdl_swept and level.rejection_candle is None:
-            if is_rejection_candle_bullish(candle, prev):
+            if (is_rejection_candle_bullish(candle, prev) and
+                    candle['low'] < pdl):  # ← wick must be below PDL
                 self.state.set_rejection_candle(symbol, candle, side='below_pdl')
                 pname = pattern_name(candle, prev, side='bullish')
-                logger.info(f"{symbol} | Bullish rejection candle: {pname}")
+                logger.info(f"{symbol} | Bullish rejection candle below PDL: {pname}")
 
-        elif level.pdl_swept and level.rejection_candle is not None and level.rejection_side == 'below_pdl':
+        elif (level.pdl_swept and
+              level.rejection_candle is not None and
+              level.rejection_side == 'below_pdl'):
             rej = level.rejection_candle
             if candle['close'] > rej['high']:
                 sl = rej['low'] * (1 - SL_BUFFER_PCT)
@@ -156,23 +162,22 @@ class StrategyEngine:
             elif not self._candle_near_rejection(candle, level.rejection_candle, side='below_pdl'):
                 self.state.clear_rejection_candle(symbol)
 
-        # ── SCENARIO 2: BREAKOUT (no sweep rejection) ───────────────────────
+        # ── SCENARIO 2: BREAKOUT ──────────────────────────────────────────────
+        # Only when no sweep flags are set (clean break, no rejection)
 
-        # Only check breakout if no sweep was detected (no pdh_swept/pdl_swept)
         if signal is None and not level.pdh_swept and not level.pdl_swept:
 
-            # Bullish breakout: clean close above PDH, no rejection candle formed
+            # Bullish breakout: two consecutive closes above PDH, no rejection
             if (not level.pdh_broken and
                     candle['close'] > pdh and
                     level.rejection_candle is None):
-                # Need confirmation: check if prev candle also closed above PDH
                 if prev and prev['close'] > pdh:
                     level.pdh_broken = True
                     signal = Signal(
                         symbol=symbol,
                         side='BUY',
                         entry_price=candle['close'],
-                        sl_price=pdh * (1 - SL_BUFFER_PCT),  # SL just below PDH
+                        sl_price=pdh * (1 - SL_BUFFER_PCT),
                         scenario='breakout',
                         pattern='Bullish Breakout',
                         pdh=pdh,
@@ -180,7 +185,7 @@ class StrategyEngine:
                     )
                     logger.info(f"{symbol} | BULLISH BREAKOUT | Entry:{candle['close']:.4f}")
 
-            # Bearish breakout: clean close below PDL
+            # Bearish breakout: two consecutive closes below PDL, no rejection
             elif (not level.pdl_broken and
                     candle['close'] < pdl and
                     level.rejection_candle is None):
@@ -190,7 +195,7 @@ class StrategyEngine:
                         symbol=symbol,
                         side='SELL',
                         entry_price=candle['close'],
-                        sl_price=pdl * (1 + SL_BUFFER_PCT),  # SL just above PDL
+                        sl_price=pdl * (1 + SL_BUFFER_PCT),
                         scenario='breakout',
                         pattern='Bearish Breakout',
                         pdh=pdh,
@@ -198,18 +203,12 @@ class StrategyEngine:
                     )
                     logger.info(f"{symbol} | BEARISH BREAKOUT | Entry:{candle['close']:.4f}")
 
-        # Store current candle as prev for next iteration
         self._prev_candles[symbol] = candle
-
         return signal
 
     def _candle_near_rejection(self, candle: dict, rejection: dict, side: str) -> bool:
-        """
-        Checks if the current candle is still 'near' the rejection candle.
-        If price has moved more than 0.5% away from rejection zone, invalidate.
-        """
         if side == 'above_pdh':
             distance = abs(candle['close'] - rejection['low']) / rejection['low']
         else:
             distance = abs(candle['close'] - rejection['high']) / rejection['high']
-        return distance < 0.005  # within 0.5%
+        return distance < 0.005
