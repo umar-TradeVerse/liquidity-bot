@@ -29,8 +29,6 @@ SYMBOL_MAP = {
 }
 
 FIXED_LEVERAGE = 5
-# Fixed trade size in USD — set via Railway environment variable TRADE_SIZE_USD
-# Default: 30 USD per trade × 5x leverage = 150 USD notional position
 TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "30"))
 
 
@@ -103,17 +101,20 @@ class DeltaClient:
             return {"success": False, "error": str(e)}
 
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch the last completed daily candle.
+        Looks back up to 7 days to handle weekends and holidays (e.g. Gold).
+        Takes the second-to-last candle to ensure it's fully completed.
+        """
         delta_symbol = SYMBOL_MAP.get(symbol)
         if not delta_symbol:
             logger.error(f"Unknown symbol: {symbol}")
             return None
 
         now_ist = datetime.now(IST)
-        yesterday_ist = (now_ist - timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        start_ts = int(yesterday_ist.timestamp())
-        end_ts = start_ts + 86400
+        # Look back 7 days to handle weekends/holidays
+        start_ts = int((now_ist - timedelta(days=7)).timestamp())
+        end_ts = int(now_ist.timestamp())
 
         params = {
             "resolution": "1d",
@@ -125,16 +126,35 @@ class DeltaClient:
         result = await self._get("/v2/history/candles", params=params)
         if result and result.get("result"):
             candles = result["result"]
-            if candles:
-                c = candles[-1]
-                return {
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                    "volume": float(c.get("volume", 0)),
-                    "time": c["time"]
-                }
+            # Filter out candles with zero volume (non-trading days like weekends for Gold)
+            active_candles = [c for c in candles if float(c.get("volume", 0)) > 0]
+
+            if not active_candles:
+                # Fallback: use all candles if volume filter removes everything
+                active_candles = candles
+
+            if len(active_candles) >= 2:
+                # Take second-to-last = last FULLY completed trading day
+                c = active_candles[-2]
+            elif len(active_candles) == 1:
+                c = active_candles[-1]
+            else:
+                logger.error(f"{symbol} | No candle data returned")
+                return None
+
+            pdh = float(c["high"])
+            pdl = float(c["low"])
+            logger.info(f"{symbol} | Previous day candle → H:{pdh} L:{pdl} V:{c.get('volume', 0)}")
+
+            return {
+                "open": float(c["open"]),
+                "high": pdh,
+                "low": pdl,
+                "close": float(c["close"]),
+                "volume": float(c.get("volume", 0)),
+                "time": c["time"]
+            }
+
         logger.error(f"{symbol} | No daily candle data returned")
         return None
 
@@ -179,7 +199,6 @@ class DeltaClient:
         if not delta_symbol:
             return {"success": False, "error": f"Unknown symbol: {symbol}"}
 
-        # Calculate quantity from fixed trade size
         notional = TRADE_SIZE_USD * leverage
         quantity = max(1, int(notional / entry_price))
 
