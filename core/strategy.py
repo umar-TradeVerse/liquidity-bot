@@ -3,9 +3,17 @@ StrategyEngine — PDH/PDL fetch + signal detection for all 3 scenarios.
 
 SWEEP REVERSAL rule (tightened):
   - For SHORT: price must close above PDH AND rejection candle's HIGH must be
-    above PDH (confirming an actual wick sweep, not just consolidation above PDH)
+    above PDH AND within PROXIMITY_PCT of PDH (confirming an actual wick sweep
+    right at the level, not a breakout that ran far away)
   - For LONG: price must close below PDL AND rejection candle's LOW must be
-    below PDL (confirming an actual wick sweep below PDL)
+    below PDL AND within PROXIMITY_PCT of PDL
+
+  CRITICAL FIX: if price moves more than PROXIMITY_PCT away from PDH/PDL
+  without a rejection candle forming, the sweep watch EXPIRES and converts
+  to breakout-eligible instead of waiting indefinitely for a rejection that
+  will never be a genuine "sweep" (this was firing false sweep-reversal
+  signals when price had already broken out and moved far away, e.g. SOL
+  climbing from PDH 70.4 to 75 before a random bearish candle fired SHORT).
 
 BREAKOUT rule:
   - No rejection candle formed near PDH/PDL
@@ -26,6 +34,10 @@ logger = logging.getLogger("strategy")
 
 # SL buffer: 0.1% above/below rejection candle high/low
 SL_BUFFER_PCT = 0.001
+
+# Rejection candle must be within this % of PDH/PDL to count as a genuine sweep.
+# Beyond this, it's no longer a "sweep" — it's a breakout that already happened.
+PROXIMITY_PCT = 0.008  # 0.8%
 
 
 class Signal:
@@ -95,11 +107,19 @@ class StrategyEngine:
             logger.info(f"{symbol} | PDH swept (close above PDH) — watching for rejection")
 
         # Phase B: Look for rejection candle
-        # KEY FIX: rejection candle's HIGH must be above PDH
-        # This confirms price actually spiked above PDH (wick sweep), not just consolidated
+        # KEY FIX: rejection candle's HIGH must be above PDH AND within
+        # PROXIMITY_PCT of PDH. If price has moved further away than that
+        # without a rejection forming, the sweep watch expires (this was a
+        # breakout, not a sweep) — pdh_swept is reset so Scenario 2 can fire.
         elif level.pdh_swept and level.rejection_candle is None:
-            if (is_rejection_candle_bearish(candle, prev) and
-                    candle['high'] > pdh):  # ← wick must be above PDH
+            distance_from_pdh = (candle['close'] - pdh) / pdh
+            if distance_from_pdh > PROXIMITY_PCT:
+                level.pdh_swept = False
+                logger.info(f"{symbol} | Sweep watch expired — price {distance_from_pdh*100:.2f}% "
+                            f"above PDH with no rejection. Reverting to breakout-eligible.")
+            elif (is_rejection_candle_bearish(candle, prev) and
+                    candle['high'] > pdh and
+                    (candle['high'] - pdh) / pdh <= PROXIMITY_PCT):
                 self.state.set_rejection_candle(symbol, candle, side='above_pdh')
                 pname = pattern_name(candle, prev, side='bearish')
                 logger.info(f"{symbol} | Bearish rejection candle above PDH: {pname} | "
@@ -135,8 +155,14 @@ class StrategyEngine:
             logger.info(f"{symbol} | PDL swept (close below PDL) — watching for rejection")
 
         elif level.pdl_swept and level.rejection_candle is None:
-            if (is_rejection_candle_bullish(candle, prev) and
-                    candle['low'] < pdl):  # ← wick must be below PDL
+            distance_from_pdl = (pdl - candle['close']) / pdl
+            if distance_from_pdl > PROXIMITY_PCT:
+                level.pdl_swept = False
+                logger.info(f"{symbol} | Sweep watch expired — price {distance_from_pdl*100:.2f}% "
+                            f"below PDL with no rejection. Reverting to breakout-eligible.")
+            elif (is_rejection_candle_bullish(candle, prev) and
+                    candle['low'] < pdl and
+                    (pdl - candle['low']) / pdl <= PROXIMITY_PCT):
                 self.state.set_rejection_candle(symbol, candle, side='below_pdl')
                 pname = pattern_name(candle, prev, side='bullish')
                 logger.info(f"{symbol} | Bullish rejection candle below PDL: {pname}")
