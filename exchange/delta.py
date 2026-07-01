@@ -164,10 +164,10 @@ class DeltaClient:
             return None
 
         now = int(time.time())
-        start = now - 180
+        start = now - 900
 
         params = {
-            "resolution": "1m",
+            "resolution": "5m",
             "symbol": delta_symbol,
             "start": start,
             "end": now
@@ -230,14 +230,14 @@ class DeltaClient:
         order_id = order_result.get("result", {}).get("id", "unknown")
         logger.info(f"{symbol} | Entry order placed: {order_id}")
 
-        # Place stop loss order
+        # Place stop loss order as limit order (Delta Exchange India only supports limit_order)
         sl_side = "sell" if side == "BUY" else "buy"
         sl_payload = {
             "product_symbol": delta_symbol,
             "side": sl_side,
-            "order_type": "stop_market_order",
+            "order_type": "limit_order",
             "size": quantity,
-            "stop_price": str(round(sl_price, 4)),
+            "limit_price": str(round(sl_price, 4)),
             "reduce_only": True,
             "time_in_force": "gtc"
         }
