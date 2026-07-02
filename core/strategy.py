@@ -28,7 +28,7 @@ from core.patterns import (
     is_rejection_candle_bullish,
     pattern_name
 )
-from exchange.delta import DeltaClient
+from exchange.coindcx import CoinDCXClient
 
 logger = logging.getLogger("strategy")
 
@@ -57,8 +57,8 @@ class Signal:
 
 
 class StrategyEngine:
-    def __init__(self, delta: DeltaClient, state: BotState):
-        self.delta = delta
+    def __init__(self, coindcx: CoinDCXClient, state: BotState):
+        self.coindcx = coindcx
         self.state = state
         self._prev_candles = {sym: None for sym in SYMBOLS}
 
@@ -66,7 +66,7 @@ class StrategyEngine:
         success_count = 0
         for symbol in SYMBOLS:
             try:
-                prev_candle = await self.delta.get_previous_day_candle(symbol)
+                prev_candle = await self.coindcx.get_previous_day_candle(symbol)
                 if prev_candle:
                     self.state.set_levels(
                         symbol,
