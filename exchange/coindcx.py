@@ -2,6 +2,7 @@
 CoinDCX Futures API client for trading bot.
 Authenticated API - supports market orders and stop_market_order for SL.
 No IP whitelisting restrictions.
+Leverage: 5x
 """
 
 import asyncio
@@ -21,7 +22,7 @@ IST = pytz.timezone("Asia/Kolkata")
 COINDCX_BASE_URL = "https://api.coindcx.com"
 COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 
-# Symbol mapping: Delta symbol → CoinDCX futures symbol
+# Symbol mapping: Delta symbol → CoinDCX USDT futures symbol
 SYMBOL_MAP = {
     "ETHUSD": "B-ETH_USDT",
     "SOLUSD": "B-SOL_USDT",
@@ -196,7 +197,7 @@ class CoinDCXClient:
 
     async def place_market_order(self, symbol: str, side: str, quantity: float) -> Optional[dict]:
         """
-        Place a market entry order.
+        Place a market entry order with 5x leverage.
         Returns: order ID on success, None on failure
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -210,6 +211,7 @@ class CoinDCXClient:
             "side": side.lower(),  # buy or sell
             "order_type": "market_order",
             "total_quantity": quantity,
+            "leverage": 5,
             "margin_currency_short_name": "USDT",
             "timestamp": timestamp
         }
@@ -217,13 +219,14 @@ class CoinDCXClient:
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
             order_id = result.get("id")
-            logger.info(f"{symbol} {side} market order placed: {order_id}")
+            logger.info(f"{symbol} {side} market order placed (5x leverage): {order_id}")
             return {
                 "id": order_id,
                 "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
-                "type": "market"
+                "type": "market",
+                "leverage": 5
             }
         
         logger.error(f"{symbol} | Failed to place market order")
@@ -232,7 +235,7 @@ class CoinDCXClient:
     async def place_stop_market_order(self, symbol: str, side: str, quantity: float, 
                                      stop_price: float) -> Optional[dict]:
         """
-        Place a stop-market SL order (triggered when price hits stop_price).
+        Place a stop-market SL order (triggered when price hits stop_price) with 5x leverage.
         Returns: order ID on success, None on failure
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -249,6 +252,7 @@ class CoinDCXClient:
             "side": sl_side,
             "order_type": "stop_market_order",
             "total_quantity": quantity,
+            "leverage": 5,
             "stop_price": stop_price,  # Trigger price
             "margin_currency_short_name": "USDT",
             "timestamp": timestamp
@@ -257,14 +261,15 @@ class CoinDCXClient:
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
             order_id = result.get("id")
-            logger.info(f"{symbol} SL order placed at {stop_price}: {order_id}")
+            logger.info(f"{symbol} SL order placed at {stop_price} (5x leverage): {order_id}")
             return {
                 "id": order_id,
                 "symbol": symbol,
                 "side": sl_side,
                 "quantity": quantity,
                 "stop_price": stop_price,
-                "type": "stop_market"
+                "type": "stop_market",
+                "leverage": 5
             }
         
         logger.error(f"{symbol} | Failed to place SL order")
