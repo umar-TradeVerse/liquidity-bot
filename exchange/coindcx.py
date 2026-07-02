@@ -1,8 +1,7 @@
 """
 CoinDCX Futures API client for trading bot.
-Authenticated API - supports market orders and stop_market_order for SL.
-No IP whitelisting restrictions.
-Leverage: 5x
+Corrected format with nested body structure and built-in SL mechanism.
+Single order placement with integrated stop_loss_price (no separate SL order).
 """
 
 import asyncio
@@ -51,21 +50,19 @@ class CoinDCXClient:
         signature = hmac.new(secret_bytes, body.encode(), hashlib.sha256).hexdigest()
         return signature
 
-    async def _post(self, endpoint: str, data: dict, authenticated: bool = True) -> Optional[dict]:
-        """Make POST request to CoinDCX API."""
+    async def _post(self, endpoint: str, data: dict) -> Optional[dict]:
+        """Make POST request to CoinDCX API with signature."""
         session = await self._get_session()
         url = self.base_url + endpoint
         
         json_body = json.dumps(data, separators=(',', ':'))
         
+        signature = self._generate_signature(json_body)
         headers = {
             'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': self.api_key,
+            'X-AUTH-SIGNATURE': signature
         }
-        
-        if authenticated:
-            signature = self._generate_signature(json_body)
-            headers['X-AUTH-APIKEY'] = self.api_key
-            headers['X-AUTH-SIGNATURE'] = signature
         
         try:
             async with session.post(url, data=json_body, headers=headers,
@@ -195,10 +192,13 @@ class CoinDCXClient:
             }
         return None
 
-    async def place_market_order(self, symbol: str, side: str, quantity: float) -> Optional[dict]:
+    async def place_market_order(self, symbol: str, side: str, quantity: float, 
+                                sl_price: float) -> Optional[dict]:
         """
-        Place a market entry order with 5x leverage.
-        Returns: order ID on success, None on failure
+        Place a market order with integrated SL using stop_loss_price.
+        This is a SINGLE order with built-in SL, not two separate orders.
+        
+        Returns: order response dict on success, None on failure
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -206,73 +206,40 @@ class CoinDCXClient:
             return None
 
         timestamp = int(time.time() * 1000)
+        
+        # Nested body structure as per CoinDCX API
         body = {
-            "pair": coindcx_symbol,
-            "side": side.lower(),  # buy or sell
-            "order_type": "market_order",
-            "total_quantity": quantity,
-            "leverage": 5,
-            "margin_currency_short_name": "USDT",
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "order": {
+                "side": side.lower(),  # buy or sell
+                "pair": coindcx_symbol,
+                "order_type": "market_order",
+                "total_quantity": quantity,
+                "leverage": 5,
+                "stop_loss_price": sl_price,  # Built-in SL
+                "notification": "email_notification",
+                "time_in_force": "good_till_cancel",
+                "hidden": False,
+                "post_only": False
+            }
         }
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
+            # CoinDCX returns order details including order_id
             order_id = result.get("id")
-            logger.info(f"{symbol} {side} market order placed (5x leverage): {order_id}")
+            logger.info(f"{symbol} {side} market order placed with SL @ {sl_price}: {order_id}")
             return {
                 "id": order_id,
                 "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
-                "type": "market",
+                "sl_price": sl_price,
+                "type": "market_with_sl",
                 "leverage": 5
             }
         
-        logger.error(f"{symbol} | Failed to place market order")
-        return None
-
-    async def place_stop_market_order(self, symbol: str, side: str, quantity: float, 
-                                     stop_price: float) -> Optional[dict]:
-        """
-        Place a stop-market SL order (triggered when price hits stop_price) with 5x leverage.
-        Returns: order ID on success, None on failure
-        """
-        coindcx_symbol = SYMBOL_MAP.get(symbol)
-        if not coindcx_symbol:
-            logger.error(f"Unknown symbol: {symbol}")
-            return None
-
-        # For stop_market_order, opposite side (if long entry, short SL)
-        sl_side = "sell" if side.lower() == "buy" else "buy"
-        
-        timestamp = int(time.time() * 1000)
-        body = {
-            "pair": coindcx_symbol,
-            "side": sl_side,
-            "order_type": "stop_market_order",
-            "total_quantity": quantity,
-            "leverage": 5,
-            "stop_price": stop_price,  # Trigger price
-            "margin_currency_short_name": "USDT",
-            "timestamp": timestamp
-        }
-
-        result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
-        if result:
-            order_id = result.get("id")
-            logger.info(f"{symbol} SL order placed at {stop_price} (5x leverage): {order_id}")
-            return {
-                "id": order_id,
-                "symbol": symbol,
-                "side": sl_side,
-                "quantity": quantity,
-                "stop_price": stop_price,
-                "type": "stop_market",
-                "leverage": 5
-            }
-        
-        logger.error(f"{symbol} | Failed to place SL order")
+        logger.error(f"{symbol} | Failed to place market order with SL")
         return None
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
