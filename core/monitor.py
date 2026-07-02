@@ -115,34 +115,19 @@ class MarketMonitor:
             trade_size_usd = float(os.getenv('TRADE_SIZE_USD', 30))
             quantity = trade_size_usd / signal.entry_price
 
-            # Place market entry order
-            entry_result = await self.coindcx.place_market_order(
+            # SINGLE order with built-in SL (CoinDCX Futures API)
+            # No separate SL order needed — it's included in the order itself
+            order_result = await self.coindcx.place_market_order(
                 symbol=symbol,
-                side='buy' if signal.side == 'BUY' else 'sell',
-                quantity=quantity
+                side=signal.side,
+                quantity=quantity,
+                sl_price=signal.sl_price
             )
 
-            # Place stop-market SL order
-            sl_result = await self.coindcx.place_stop_market_order(
-                symbol=symbol,
-                side='buy' if signal.side == 'BUY' else 'sell',
-                quantity=quantity,
-                stop_price=signal.sl_price
-            ) if entry_result else None
-
-            order_result = {
-                'success': entry_result is not None,
-                'order_id': entry_result.get('id') if entry_result else 'N/A',
-                'trade_usd': trade_size_usd,
-                'quantity': quantity,
-                'sl_failed': sl_result is None
-            }
-
-            if order_result and order_result.get('success'):
-                order_id = order_result.get('order_id', 'N/A')
-                trade_usd = order_result.get('trade_usd', 0)
-                quantity = order_result.get('quantity', 0)
-                sl_warning = order_result.get('sl_failed', False)
+            if order_result and order_result.get('id'):
+                order_id = order_result.get('id', 'N/A')
+                trade_usd = trade_size_usd
+                quantity_filled = order_result.get('quantity', quantity)
 
                 record = TradeRecord(
                     symbol=symbol,
@@ -162,23 +147,21 @@ class MarketMonitor:
                     f"*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Entry:* {signal.entry_price:.4f}\n"
                     f"*SL:* {signal.sl_price:.4f}\n"
-                    f"*Trade Size:* ${trade_usd:.2f} (25% of wallet)\n"
+                    f"*Trade Size:* ${trade_usd:.2f}\n"
                     f"*Leverage:* 5x\n"
-                    f"*Quantity:* {quantity}\n"
+                    f"*Quantity:* {quantity_filled}\n"
                     f"*Order ID:* `{order_id}`\n"
                     f"*Scenario:* {signal.scenario.replace('_', ' ').title()}\n"
                     f"*Trades today:* {self.state.trades_today}/2\n\n"
-                    f"⚠️ TP is manual — monitor your position."
+                    f"⚠️ TP is manual — monitor your position.\n"
+                    f"✅ SL is built-in — automatically triggered."
                 )
-
-                if sl_warning:
-                    msg += "\n\n🚨 *SL order failed — place SL manually immediately!*"
 
                 await self.telegram.send_alert(msg)
                 logger.info(f"Trade executed: {record}")
 
             else:
-                error_msg = order_result.get('error', 'Unknown') if order_result else 'No response'
+                error_msg = order_result.get('error', 'Unknown') if order_result else 'No response from API'
                 logger.error(f"{symbol} | Order failed: {error_msg}")
                 self.state.mark_scenario_fired(symbol)
                 await self.telegram.send_alert(
