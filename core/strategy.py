@@ -190,14 +190,18 @@ class StrategyEngine:
 
         # ── SCENARIO 2: BREAKOUT ──────────────────────────────────────────────
         # Only when no sweep flags are set (clean break, no rejection)
+        # CRITICAL: only fire if current close is within PROXIMITY_PCT of level
+        # (prevents firing when price has already run far beyond the level)
 
         if signal is None and not level.pdh_swept and not level.pdl_swept:
 
             # Bullish breakout: two consecutive closes above PDH, no rejection
+            # Current candle must be within PROXIMITY_PCT of PDH to be a fresh breakout
             if (not level.pdh_broken and
                     candle['close'] > pdh and
                     level.rejection_candle is None):
-                if prev and prev['close'] > pdh:
+                distance_from_pdh = (candle['close'] - pdh) / pdh
+                if distance_from_pdh <= PROXIMITY_PCT and prev and prev['close'] > pdh:
                     level.pdh_broken = True
                     signal = Signal(
                         symbol=symbol,
@@ -209,13 +213,16 @@ class StrategyEngine:
                         pdh=pdh,
                         pdl=pdl
                     )
-                    logger.info(f"{symbol} | BULLISH BREAKOUT | Entry:{candle['close']:.4f}")
+                    logger.info(f"{symbol} | BULLISH BREAKOUT | Entry:{candle['close']:.4f} "
+                               f"(within {distance_from_pdh*100:.2f}% of PDH)")
 
             # Bearish breakout: two consecutive closes below PDL, no rejection
+            # Current candle must be within PROXIMITY_PCT of PDL to be a fresh breakout
             elif (not level.pdl_broken and
                     candle['close'] < pdl and
                     level.rejection_candle is None):
-                if prev and prev['close'] < pdl:
+                distance_from_pdl = (pdl - candle['close']) / pdl
+                if distance_from_pdl <= PROXIMITY_PCT and prev and prev['close'] < pdl:
                     level.pdl_broken = True
                     signal = Signal(
                         symbol=symbol,
@@ -227,7 +234,8 @@ class StrategyEngine:
                         pdh=pdh,
                         pdl=pdl
                     )
-                    logger.info(f"{symbol} | BEARISH BREAKOUT | Entry:{candle['close']:.4f}")
+                    logger.info(f"{symbol} | BEARISH BREAKOUT | Entry:{candle['close']:.4f} "
+                               f"(within {distance_from_pdl*100:.2f}% of PDL)")
 
         self._prev_candles[symbol] = candle
         return signal
