@@ -1,11 +1,12 @@
 """
-Liquidity Strategy Bot — Delta Exchange
+Liquidity Strategy Bot — CoinDCX
 Entry point: starts scheduler + monitoring loop
 """
 
 import asyncio
 import logging
 import sys
+import os
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
@@ -14,7 +15,7 @@ from core.state import BotState
 from core.strategy import StrategyEngine
 from core.monitor import MarketMonitor
 from notifications.telegram import TelegramBot
-from exchange.delta import DeltaClient
+from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
 
 logger = setup_logger("main")
@@ -55,11 +56,14 @@ async def main():
     logger.info("Starting Liquidity Bot...")
 
     # Init components
-    delta = DeltaClient()
+    coindcx = CoinDCXClient(
+        api_key=os.getenv('COINDCX_API_KEY'),
+        api_secret=os.getenv('COINDCX_API_SECRET')
+    )
     telegram = TelegramBot()
     state = BotState()
-    engine = StrategyEngine(delta, state)
-    monitor = MarketMonitor(delta, engine, state, telegram)
+    engine = StrategyEngine(coindcx, state)
+    monitor = MarketMonitor(coindcx, engine, state, telegram)
 
     # Test connections
     if not await telegram.test_connection():
