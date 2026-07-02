@@ -1,5 +1,5 @@
 """
-MarketMonitor — continuously polls 1m candles and routes signals to execution.
+MarketMonitor — continuously polls 5m candles and routes signals to execution.
 Runs Monday to Friday only, from 5:30 AM to 1:00 PM IST.
 """
 
@@ -7,10 +7,11 @@ import asyncio
 import logging
 from datetime import datetime, time as dtime
 import pytz
+import os
 
 from core.state import BotState, SYMBOLS, TradeRecord
 from core.strategy import StrategyEngine, Signal
-from exchange.delta import DeltaClient
+from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
 
 logger = logging.getLogger("monitor")
@@ -22,9 +23,9 @@ DAY_END_MINUTE = 0
 
 
 class MarketMonitor:
-    def __init__(self, delta: DeltaClient, engine: StrategyEngine,
+    def __init__(self, coindcx: CoinDCXClient, engine: StrategyEngine,
                  state: BotState, telegram: TelegramBot):
-        self.delta = delta
+        self.coindcx = coindcx
         self.engine = engine
         self.state = state
         self.telegram = telegram
@@ -66,7 +67,7 @@ class MarketMonitor:
 
     async def _process_symbol(self, symbol: str):
         try:
-            candle = await self.delta.get_latest_1m_candle(symbol)
+            candle = await self.coindcx.get_latest_5m_candle(symbol)
             if not candle:
                 return
 
@@ -111,13 +112,31 @@ class MarketMonitor:
         )
 
         try:
-            order_result = await self.delta.place_order(
+            trade_size_usd = float(os.getenv('TRADE_SIZE_USD', 30))
+            quantity = trade_size_usd / signal.entry_price
+
+            # Place market entry order
+            entry_result = await self.coindcx.place_market_order(
                 symbol=symbol,
-                side=signal.side,
-                entry_price=signal.entry_price,
-                sl_price=signal.sl_price,
-                leverage=5
+                side='buy' if signal.side == 'BUY' else 'sell',
+                quantity=quantity
             )
+
+            # Place stop-market SL order
+            sl_result = await self.coindcx.place_stop_market_order(
+                symbol=symbol,
+                side='buy' if signal.side == 'BUY' else 'sell',
+                quantity=quantity,
+                stop_price=signal.sl_price
+            ) if entry_result else None
+
+            order_result = {
+                'success': entry_result is not None,
+                'order_id': entry_result.get('id') if entry_result else 'N/A',
+                'trade_usd': trade_size_usd,
+                'quantity': quantity,
+                'sl_failed': sl_result is None
+            }
 
             if order_result and order_result.get('success'):
                 order_id = order_result.get('order_id', 'N/A')
