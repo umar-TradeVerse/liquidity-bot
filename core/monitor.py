@@ -18,7 +18,7 @@ logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
 
 POLL_INTERVAL_SECONDS = 15
-DAY_END_HOUR = 13
+DAY_END_HOUR = 23
 DAY_END_MINUTE = 0
 
 
