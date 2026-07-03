@@ -49,6 +49,7 @@ class CoinDCXClient:
         self.base_url = COINDCX_BASE_URL
         self.public_url = COINDCX_PUBLIC_URL
         self._session: Optional[aiohttp.ClientSession] = None
+        self.last_error: Optional[str] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -79,16 +80,20 @@ class CoinDCXClient:
             async with session.post(url, data=json_body, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status in [200, 201]:
+                    self.last_error = None
                     return await resp.json()
                 else:
                     text = await resp.text()
                     logger.error(f"POST {endpoint} → {resp.status}: {text}")
+                    self.last_error = text
                     return None
         except asyncio.TimeoutError:
             logger.error(f"POST {endpoint} timeout")
+            self.last_error = "Request timed out"
             return None
         except Exception as e:
             logger.error(f"POST {endpoint} error: {e}")
+            self.last_error = str(e)
             return None
 
     async def _get(self, path: str, params: dict = None) -> Optional[dict]:
@@ -193,12 +198,9 @@ class CoinDCXClient:
 
     async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
         """
-        Fetch the latest completed 15m candle.
+        Fetch the latest completed 15-minute candle.
         Sorts candles explicitly by timestamp (ascending) before picking the
-        second-to-last one — do not trust the API's return order, since it
-        may be newest-first rather than oldest-first (this caused a bug
-        where stale ~2hr-old candles were being used instead of the most
-        recently completed one).
+        second-to-last one — do not trust the API's return order.
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -292,8 +294,8 @@ class CoinDCXClient:
                 "leverage": 5
             }
 
-        logger.error(f"{symbol} | Failed to place market order with SL")
-        return None
+        logger.error(f"{symbol} | Failed to place market order with SL: {self.last_error}")
+        return {"id": None, "error": self.last_error or "Unknown error"}
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
         """Fetch open orders for a symbol."""
