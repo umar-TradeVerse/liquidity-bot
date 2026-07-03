@@ -1,5 +1,5 @@
 """
-MarketMonitor — continuously polls 5m candles and routes signals to execution.
+MarketMonitor — continuously polls 15m candles and routes signals to execution.
 Runs Monday to Friday only, from 5:30 AM to 1:00 PM IST.
 """
 
@@ -65,26 +65,23 @@ class MarketMonitor:
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-   async def _process_symbol(self, symbol: str):
-    try:
-        candle = await self.coindcx.get_latest_15m_candle(symbol)
-        if not candle:
-            logger.debug(f"{symbol} | No candle data")
-            return
-        
-        if self._last_candle_time[symbol] == candle['time']:
-            logger.debug(f"{symbol} | Candle already processed")
-            return
-        
-        self._last_candle_time[symbol] = candle['time']
-        logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} L={candle['low']:.4f} C={candle['close']:.4f}")
-        
-        signal = self.engine.process_candle(symbol, candle)
-        if signal:
-            await self._handle_signal(signal)
+    async def _process_symbol(self, symbol: str):
+        try:
+            candle = await self.coindcx.get_latest_15m_candle(symbol)
+            if not candle:
+                logger.debug(f"{symbol} | No candle data")
+                return
 
-    except Exception as e:
-        logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
+            if self._last_candle_time[symbol] == candle['time']:
+                logger.debug(f"{symbol} | Candle already processed")
+                return
+
+            self._last_candle_time[symbol] = candle['time']
+            logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} L={candle['low']:.4f} C={candle['close']:.4f}")
+
+            signal = self.engine.process_candle(symbol, candle)
+            if signal:
+                await self._handle_signal(signal)
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
