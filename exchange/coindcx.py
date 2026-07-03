@@ -66,7 +66,7 @@ class CoinDCXClient:
         
         try:
             async with session.post(url, data=json_body, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status in [200, 201]:
                     return await resp.json()
                 else:
@@ -86,7 +86,7 @@ class CoinDCXClient:
         url = self.public_url + path
         try:
             async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
