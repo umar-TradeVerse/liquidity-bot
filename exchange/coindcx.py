@@ -28,7 +28,17 @@ SYMBOL_MAP = {
     "SOLUSD": "B-SOL_USDT",
     "XRPUSD": "B-XRP_USDT",
     "TAOUSD": "B-TAO_USDT",
-    "AEROUSD": "B-AERO_USDT"
+    "AEROUSD": "B-AERO_USDT",
+    "BTCUSD": "B-BTC_USDT",
+    "DOGEUSD": "B-DOGE_USDT",
+    "ADAUSD": "B-ADA_USDT",
+    "LINKUSD": "B-LINK_USDT",
+    "AVAXUSD": "B-AVAX_USDT",
+    "DOTUSD": "B-DOT_USDT",
+    "LTCUSD": "B-LTC_USDT",
+    "BNBUSD": "B-BNB_USDT",
+    "TRXUSD": "B-TRX_USDT",
+    "SUIUSD": "B-SUI_USDT"
 }
 
 
