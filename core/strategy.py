@@ -29,8 +29,8 @@ from core.patterns import (
     pattern_name
 )
 from exchange.coindcx import CoinDCXClient
-
-logger = logging.getLogger("strategy")
+from utils.logger import setup_logger
+logger = setup_logger("strategy")
 
 # SL buffer: 0.1% above/below rejection candle high/low
 SL_BUFFER_PCT = 0.001
