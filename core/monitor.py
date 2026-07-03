@@ -1,9 +1,9 @@
 """
-MarketMonitor — continuously polls 15m candles and routes signals to execution.
-Runs Monday to Friday only, from 5:30 AM to 1:00 PM IST.
+MarketMonitor — continuously polls 15-minute candles and routes signals to execution.
+Runs Monday to Friday only, from 5:30 AM to 11:00 PM IST.
 """
+
 import asyncio
-import logging
 from datetime import datetime, time as dtime
 import pytz
 import os
@@ -13,13 +13,16 @@ from core.strategy import StrategyEngine, Signal
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
 from utils.logger import setup_logger
-
 logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
 
 POLL_INTERVAL_SECONDS = 15
 DAY_END_HOUR = 23
 DAY_END_MINUTE = 0
+
+# TEMPORARY — set back to False once you're done testing over the weekend.
+# When True, the bot ignores the Mon-Fri restriction and trades every day.
+TESTING_IGNORE_WEEKENDS = True
 
 
 class MarketMonitor:
@@ -32,6 +35,8 @@ class MarketMonitor:
         self._last_candle_time = {sym: None for sym in SYMBOLS}
 
     def _is_trading_day(self) -> bool:
+        if TESTING_IGNORE_WEEKENDS:
+            return True
         now = datetime.now(IST)
         return now.weekday() < 5
 
