@@ -2,7 +2,6 @@
 MarketMonitor — continuously polls 15m candles and routes signals to execution.
 Runs Monday to Friday only, from 5:30 AM to 1:00 PM IST.
 """
-
 import asyncio
 import logging
 from datetime import datetime, time as dtime
@@ -13,8 +12,9 @@ from core.state import BotState, SYMBOLS, TradeRecord
 from core.strategy import StrategyEngine, Signal
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
+from utils.logger import setup_logger
 
-logger = logging.getLogger("monitor")
+logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
 
 POLL_INTERVAL_SECONDS = 15
