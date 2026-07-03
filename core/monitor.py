@@ -67,7 +67,7 @@ class MarketMonitor:
 
     async def _process_symbol(self, symbol: str):
         try:
-            candle = await self.coindcx.get_latest_5m_candle(symbol)
+            candle = await self.coindcx.get_latest_15m_candle(symbol)
             if not candle:
                 return
 
