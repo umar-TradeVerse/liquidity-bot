@@ -114,7 +114,9 @@ class CoinDCXClient:
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
         """
         Fetch the last completed daily candle for a symbol.
-        Returns the second-to-last candle to ensure it's fully completed.
+        Matches candles by actual IST calendar date instead of assuming
+        array position/order — this avoids picking a stale candle if the
+        API returns results in an unexpected order or with gaps.
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -122,8 +124,10 @@ class CoinDCXClient:
             return None
 
         now_ist = datetime.now(IST)
-        # Look back 7 days to handle weekends
-        start_ts = int((now_ist - timedelta(days=7)).timestamp() * 1000)
+        yesterday_date = (now_ist - timedelta(days=1)).date()
+
+        # Look back 10 days to comfortably cover weekends/gaps
+        start_ts = int((now_ist - timedelta(days=10)).timestamp() * 1000)
         end_ts = int(now_ist.timestamp() * 1000)
 
         params = {
@@ -131,42 +135,61 @@ class CoinDCXClient:
             "interval": "1d",
             "from": start_ts,
             "to": end_ts,
-            "limit": 10
+            "limit": 15
         }
 
         result = await self._get("/market_data/candles", params=params)
-        if result and isinstance(result, list) and len(result) > 0:
-            candles = result
-            # Filter out candles with zero volume (non-trading days)
-            active_candles = [c for c in candles if float(c.get("volume", 0)) > 0]
 
-            if not active_candles:
-                active_candles = candles
+        # DIAGNOSTIC: show every candle's date so ordering/gaps are visible
+        if result and isinstance(result, list):
+            debug_dates = [
+                (datetime.fromtimestamp(int(c["time"]) / 1000, IST).date().isoformat(), c.get("high"), c.get("low"))
+                for c in result
+            ]
+            logger.info(f"{symbol} | Daily candles returned (date, H, L): {debug_dates} "
+                        f"| target=yesterday={yesterday_date.isoformat()}")
 
-            if len(active_candles) >= 2:
-                # Take second-to-last = last FULLY completed trading day
-                c = active_candles[-2]
-            elif len(active_candles) == 1:
-                c = active_candles[-1]
+        if not result or not isinstance(result, list) or len(result) == 0:
+            logger.error(f"{symbol} | No daily candle data returned")
+            return None
+
+        # Find the candle whose IST calendar date matches yesterday exactly
+        match = None
+        for c in result:
+            candle_date = datetime.fromtimestamp(int(c["time"]) / 1000, IST).date()
+            if candle_date == yesterday_date:
+                match = c
+                break
+
+        if match is None:
+            # Fallback: closest date before today, in case yesterday had zero volume
+            # or wasn't returned (e.g. brand-new listing) — pick the most recent
+            # candle that is strictly before today's date.
+            candidates = [
+                c for c in result
+                if datetime.fromtimestamp(int(c["time"]) / 1000, IST).date() < now_ist.date()
+            ]
+            if candidates:
+                match = max(candidates, key=lambda c: int(c["time"]))
+                match_date = datetime.fromtimestamp(int(match["time"]) / 1000, IST).date()
+                logger.warning(f"{symbol} | Exact 'yesterday' candle not found — "
+                               f"using closest prior date {match_date.isoformat()} instead")
             else:
-                logger.error(f"{symbol} | No candle data returned")
+                logger.error(f"{symbol} | No usable prior-day candle found in response")
                 return None
 
-            pdh = float(c["high"])
-            pdl = float(c["low"])
-            logger.info(f"{symbol} | Previous day candle → H:{pdh} L:{pdl} V:{c.get('volume', 0)}")
+        pdh = float(match["high"])
+        pdl = float(match["low"])
+        logger.info(f"{symbol} | Previous day candle → H:{pdh} L:{pdl} V:{match.get('volume', 0)}")
 
-            return {
-                "open": float(c["open"]),
-                "high": pdh,
-                "low": pdl,
-                "close": float(c["close"]),
-                "volume": float(c.get("volume", 0)),
-                "time": c["time"]
-            }
-
-        logger.error(f"{symbol} | No daily candle data returned")
-        return None
+        return {
+            "open": float(match["open"]),
+            "high": pdh,
+            "low": pdl,
+            "close": float(match["close"]),
+            "volume": float(match.get("volume", 0)),
+            "time": match["time"]
+        }
 
     async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
         """
