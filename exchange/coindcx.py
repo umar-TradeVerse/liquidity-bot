@@ -55,16 +55,16 @@ class CoinDCXClient:
         """Make POST request to CoinDCX API with signature."""
         session = await self._get_session()
         url = self.base_url + endpoint
-        
+
         json_body = json.dumps(data, separators=(',', ':'))
-        
+
         signature = self._generate_signature(json_body)
         headers = {
             'Content-Type': 'application/json',
             'X-AUTH-APIKEY': self.api_key,
             'X-AUTH-SIGNATURE': signature
         }
-        
+
         try:
             async with session.post(url, data=json_body, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -165,23 +165,29 @@ class CoinDCXClient:
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
+            logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping")
             return None
 
         now_ts = int(time.time() * 1000)
-        start_ts = now_ts - (2700 * 1000)  # 45 minutes lookback (3 candles)
+        start_ts = now_ts - (7200 * 1000)  # widened to 2 hours lookback (8 candles)
 
         params = {
             "pair": coindcx_symbol,
             "interval": "15m",
             "from": start_ts,
             "to": now_ts,
-            "limit": 5
+            "limit": 10
         }
 
         result = await self._get("/market_data/candles", params=params)
+
+        # DIAGNOSTIC: log exactly what came back
+        logger.info(f"{symbol} | 15m candle raw response type={type(result)} "
+                    f"len={len(result) if isinstance(result, list) else 'n/a'} "
+                    f"value={result}")
+
         if result and isinstance(result, list) and len(result) >= 2:
             candles = result
-            # Take second-to-last = last FULLY completed 5m candle
             c = candles[-2]
             return {
                 "open": float(c["open"]),
@@ -191,14 +197,21 @@ class CoinDCXClient:
                 "volume": float(c.get("volume", 0)),
                 "time": c["time"]
             }
+        elif result and isinstance(result, list) and len(result) == 1:
+            logger.warning(f"{symbol} | Only 1 candle returned, need >=2")
+        elif result and not isinstance(result, list):
+            logger.warning(f"{symbol} | Unexpected response format (not a list)")
+        else:
+            logger.warning(f"{symbol} | Empty/None response from candles endpoint")
+
         return None
 
-    async def place_market_order(self, symbol: str, side: str, quantity: float, 
+    async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float) -> Optional[dict]:
         """
         Place a market order with integrated SL using stop_loss_price.
         This is a SINGLE order with built-in SL, not two separate orders.
-        
+
         Returns: order response dict on success, None on failure
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -207,7 +220,7 @@ class CoinDCXClient:
             return None
 
         timestamp = int(time.time() * 1000)
-        
+
         # Nested body structure as per CoinDCX API
         body = {
             "timestamp": timestamp,
@@ -239,7 +252,7 @@ class CoinDCXClient:
                 "type": "market_with_sl",
                 "leverage": 5
             }
-        
+
         logger.error(f"{symbol} | Failed to place market order with SL")
         return None
 
@@ -277,6 +290,6 @@ class CoinDCXClient:
         if result:
             logger.info(f"Order {order_id} cancelled")
             return True
-        
+
         logger.error(f"Failed to cancel order {order_id}")
         return False
