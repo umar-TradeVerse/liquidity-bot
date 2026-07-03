@@ -65,19 +65,26 @@ class MarketMonitor:
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-    async def _process_symbol(self, symbol: str):
-        try:
-            candle = await self.coindcx.get_latest_15m_candle(symbol)
-            if not candle:
-                return
+   async def _process_symbol(self, symbol: str):
+    try:
+        candle = await self.coindcx.get_latest_15m_candle(symbol)
+        if not candle:
+            logger.debug(f"{symbol} | No candle data")
+            return
+        
+        if self._last_candle_time[symbol] == candle['time']:
+            logger.debug(f"{symbol} | Candle already processed")
+            return
+        
+        self._last_candle_time[symbol] = candle['time']
+        logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} L={candle['low']:.4f} C={candle['close']:.4f}")
+        
+        signal = self.engine.process_candle(symbol, candle)
+        if signal:
+            await self._handle_signal(signal)
 
-            if self._last_candle_time[symbol] == candle['time']:
-                return
-            self._last_candle_time[symbol] = candle['time']
-
-            signal = self.engine.process_candle(symbol, candle)
-            if signal:
-                await self._handle_signal(signal)
+    except Exception as e:
+        logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
