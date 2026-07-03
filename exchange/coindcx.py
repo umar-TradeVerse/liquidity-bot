@@ -15,7 +15,8 @@ import aiohttp
 from datetime import datetime, timedelta
 import pytz
 
-logger = logging.getLogger("coindcx")
+from utils.logger import setup_logger
+logger = setup_logger("coindcx")
 IST = pytz.timezone("Asia/Kolkata")
 
 COINDCX_BASE_URL = "https://api.coindcx.com"
