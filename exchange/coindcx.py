@@ -27,7 +27,7 @@ SYMBOL_MAP = {
     "SOLUSD": "B-SOL_USDT",
     "XRPUSD": "B-XRP_USDT",
     "TAOUSD": "B-TAO_USDT",
-    "XAUTUSD": "B-XAU_USDT",
+    "AEROUSD": "B-AERO_USDT"
 }
 
 
