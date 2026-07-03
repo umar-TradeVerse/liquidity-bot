@@ -194,7 +194,11 @@ class CoinDCXClient:
     async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
         """
         Fetch the latest completed 15m candle.
-        Returns the second-to-last candle to ensure it's fully completed.
+        Sorts candles explicitly by timestamp (ascending) before picking the
+        second-to-last one — do not trust the API's return order, since it
+        may be newest-first rather than oldest-first (this caused a bug
+        where stale ~2hr-old candles were being used instead of the most
+        recently completed one).
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -202,7 +206,7 @@ class CoinDCXClient:
             return None
 
         now_ts = int(time.time() * 1000)
-        start_ts = now_ts - (7200 * 1000)  # widened to 2 hours lookback (8 candles)
+        start_ts = now_ts - (7200 * 1000)  # 2 hours lookback (8 candles)
 
         params = {
             "pair": coindcx_symbol,
@@ -214,30 +218,32 @@ class CoinDCXClient:
 
         result = await self._get("/market_data/candles", params=params)
 
-        # DIAGNOSTIC: log exactly what came back
-        logger.info(f"{symbol} | 15m candle raw response type={type(result)} "
-                    f"len={len(result) if isinstance(result, list) else 'n/a'} "
-                    f"value={result}")
+        if not result or not isinstance(result, list) or len(result) == 0:
+            logger.warning(f"{symbol} | Empty/None response from 15m candles endpoint")
+            return None
 
-        if result and isinstance(result, list) and len(result) >= 2:
-            candles = result
-            c = candles[-2]
-            return {
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-                "volume": float(c.get("volume", 0)),
-                "time": c["time"]
-            }
-        elif result and isinstance(result, list) and len(result) == 1:
-            logger.warning(f"{symbol} | Only 1 candle returned, need >=2")
-        elif result and not isinstance(result, list):
-            logger.warning(f"{symbol} | Unexpected response format (not a list)")
-        else:
-            logger.warning(f"{symbol} | Empty/None response from candles endpoint")
+        # Sort explicitly by timestamp ascending — never trust API order
+        try:
+            candles = sorted(result, key=lambda c: int(c["time"]))
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"{symbol} | Failed to sort 15m candles: {e}")
+            return None
 
-        return None
+        if len(candles) < 2:
+            logger.warning(f"{symbol} | Only {len(candles)} candle(s) returned, need >=2")
+            return None
+
+        # Second-to-last after sorting ascending = most recently FULLY completed candle
+        c = candles[-2]
+
+        return {
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+            "volume": float(c.get("volume", 0)),
+            "time": c["time"]
+        }
 
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float) -> Optional[dict]:
