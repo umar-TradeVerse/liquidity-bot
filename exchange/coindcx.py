@@ -157,9 +157,9 @@ class CoinDCXClient:
         logger.error(f"{symbol} | No daily candle data returned")
         return None
 
-    async def get_latest_5m_candle(self, symbol: str) -> Optional[dict]:
+    async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
         """
-        Fetch the latest completed 5m candle.
+        Fetch the latest completed 15m candle.
         Returns the second-to-last candle to ensure it's fully completed.
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -167,11 +167,11 @@ class CoinDCXClient:
             return None
 
         now_ts = int(time.time() * 1000)
-        start_ts = now_ts - (900 * 1000)  # 15 minutes lookback (3 candles)
+        start_ts = now_ts - (2700 * 1000)  # 45 minutes lookback (3 candles)
 
         params = {
             "pair": coindcx_symbol,
-            "interval": "5m",
+            "interval": "15m",
             "from": start_ts,
             "to": now_ts,
             "limit": 5
