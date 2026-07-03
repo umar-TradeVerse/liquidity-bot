@@ -1,12 +1,10 @@
 """
 BotState — single source of truth for daily counters, levels, and trade tracking.
 """
-
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 from datetime import date
 import threading
-
 
 SYMBOLS = [
     "ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "AEROUSD",
@@ -19,17 +17,22 @@ SYMBOLS = [
 class DailyLevel:
     pdh: float
     pdl: float
-    # Scenario tracking — once one fires, ignore second signal for same symbol
+
+    # Set to True after ANY signal fires for this symbol (sweep or breakout).
+    # Once True, no further signals are generated for this symbol until the
+    # next 5:30 AM daily reset. This enforces "one outcome per symbol per day."
     scenario_fired: bool = False
-    # Breakout tracking
-    pdh_broken: bool = False
-    pdl_broken: bool = False
-    # Sweep tracking
-    pdh_swept: bool = False  # price closed above PDH
-    pdl_swept: bool = False  # price closed below PDL
-    # Rejection candle tracking
-    rejection_candle: Optional[dict] = None  # {high, low, open, close, time}
-    rejection_side: Optional[str] = None     # 'above_pdh' or 'below_pdl'
+
+    # ── PDH side state machine ──
+    # NONE     -> no candle has closed above PDH yet
+    # SWEPT    -> a candle wicked above PDH but closed above it too (no rejection yet, watching next candle)
+    # REJECTED -> a candle closed back below PDH after a sweep (watching for confirmation break of its low)
+    pdh_state: str = "NONE"
+    pdh_rejection: Optional[dict] = None  # the candle dict that formed the rejection
+
+    # ── PDL side state machine (mirrored) ──
+    pdl_state: str = "NONE"
+    pdl_rejection: Optional[dict] = None
 
 
 @dataclass
@@ -80,18 +83,6 @@ class BotState:
         with self._lock:
             if self.levels.get(symbol):
                 self.levels[symbol].scenario_fired = True
-
-    def set_rejection_candle(self, symbol: str, candle: dict, side: str):
-        with self._lock:
-            if self.levels.get(symbol):
-                self.levels[symbol].rejection_candle = candle
-                self.levels[symbol].rejection_side = side
-
-    def clear_rejection_candle(self, symbol: str):
-        with self._lock:
-            if self.levels.get(symbol):
-                self.levels[symbol].rejection_candle = None
-                self.levels[symbol].rejection_side = None
 
     def levels_ready(self) -> bool:
         return bool(self.levels) and all(v is not None for v in self.levels.values())
