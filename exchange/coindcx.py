@@ -37,7 +37,6 @@ SYMBOL_MAP = {
     "AVAXUSD": "B-AVAX_USDT",
     "DOTUSD": "B-DOT_USDT",
     "LTCUSD": "B-LTC_USDT",
-    "BNBUSD": "B-BNB_USDT",
     "TRXUSD": "B-TRX_USDT",
     "SUIUSD": "B-SUI_USDT"
 }
@@ -394,8 +393,21 @@ class CoinDCXClient:
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
-            # CoinDCX returns order details including order_id
-            order_id = result.get("id")
+            # CoinDCX has been observed returning either a single order dict
+            # OR a list containing one order dict for this endpoint. Normalize
+            # to a dict before reading fields, instead of assuming one shape.
+            if isinstance(result, list):
+                if len(result) == 0:
+                    logger.error(f"{symbol} | Order response was an empty list — "
+                                 f"order may or may not have been placed, verify manually on CoinDCX")
+                    return {"id": None, "error": "Empty list response from order create — verify manually"}
+                order_obj = result[0]
+                logger.warning(f"{symbol} | Order response was a list, not a dict — "
+                               f"used first element. Raw response: {result}")
+            else:
+                order_obj = result
+
+            order_id = order_obj.get("id")
             logger.info(f"{symbol} {side} market order placed with SL @ {sl_price}: {order_id}")
             return {
                 "id": order_id,
@@ -423,6 +435,10 @@ class CoinDCXClient:
         }
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/list", body)
+        if isinstance(result, list):
+            # This endpoint may return the orders list directly rather than
+            # wrapped in {"orders": [...]}
+            return result
         if result:
             return result.get("orders", [])
         return None
@@ -447,4 +463,3 @@ class CoinDCXClient:
 
         logger.error(f"Failed to cancel order {order_id}")
         return False
-                                   
