@@ -304,17 +304,27 @@ class CoinDCXClient:
             "quantity_increment": float(inst.get("quantity_increment", 0) or 0),
             "min_quantity": float(inst.get("min_quantity", 0) or 0),
             "min_notional": float(inst.get("min_notional", 0) or 0),
+            "price_increment": float(inst.get("price_increment", 0) or 0),
         }
         self._instrument_cache[coindcx_symbol] = details
         logger.info(f"{coindcx_symbol} | Instrument details cached: {details}")
         return details
 
     @staticmethod
-    def _round_to_increment(quantity: float, increment: float) -> float:
-        """Round quantity DOWN to the nearest valid multiple of increment."""
+    def _round_to_increment(quantity: float, increment: float, mode: str = "floor") -> float:
+        """
+        Round to the nearest valid multiple of increment.
+        mode="floor"   -> round down (used for order quantity, so we never
+                           request more than the calculated size)
+        mode="nearest" -> round to closest (used for SL price, where over/under
+                           by half a tick doesn't matter, just needs to be valid)
+        """
         if not increment or increment <= 0:
             return quantity
-        steps = math.floor(quantity / increment + 1e-9)
+        if mode == "nearest":
+            steps = round(quantity / increment)
+        else:
+            steps = math.floor(quantity / increment + 1e-9)
         rounded = steps * increment
         # Determine decimal places from the increment itself to avoid
         # floating point noise like 0.30000000004
@@ -355,6 +365,13 @@ class CoinDCXClient:
             if instrument["min_notional"] and notional < instrument["min_notional"]:
                 logger.warning(f"{symbol} | Order notional ~{notional:.2f} may be below "
                                f"exchange minimum {instrument['min_notional']}")
+
+            if instrument["price_increment"] > 0:
+                original_sl = sl_price
+                sl_price = self._round_to_increment(sl_price, instrument["price_increment"], mode="nearest")
+                if sl_price != original_sl:
+                    logger.info(f"{symbol} | SL price rounded from {original_sl} to {sl_price} "
+                                f"(tick size {instrument['price_increment']})")
 
         timestamp = int(time.time() * 1000)
 
@@ -430,4 +447,4 @@ class CoinDCXClient:
 
         logger.error(f"Failed to cancel order {order_id}")
         return False
-    
+                                   
