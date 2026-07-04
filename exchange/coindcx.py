@@ -6,6 +6,7 @@ Single order placement with integrated stop_loss_price (no separate SL order).
 
 import asyncio
 import logging
+import math
 import time
 import hmac
 import hashlib
@@ -50,6 +51,7 @@ class CoinDCXClient:
         self.public_url = COINDCX_PUBLIC_URL
         self._session: Optional[aiohttp.ClientSession] = None
         self.last_error: Optional[str] = None
+        self._instrument_cache: dict = {}  # symbol -> {"quantity_increment": ..., "min_quantity": ..., "min_notional": ...}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -100,6 +102,28 @@ class CoinDCXClient:
         """Make GET request to public API."""
         session = await self._get_session()
         url = self.public_url + path
+        try:
+            async with session.get(url, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    text = await resp.text()
+                    logger.error(f"GET {path} → {resp.status}: {text}")
+                    return None
+        except asyncio.TimeoutError:
+            logger.error(f"GET {path} timeout")
+            return None
+        except Exception as e:
+            logger.error(f"GET {path} error: {e}")
+            return None
+
+    async def _get_base(self, path: str, params: dict = None) -> Optional[dict]:
+        """Make an unauthenticated GET request against api.coindcx.com
+        (as opposed to public.coindcx.com used by _get). Used for endpoints
+        like instrument details that live on the main API domain."""
+        session = await self._get_session()
+        url = self.base_url + path
         try:
             async with session.get(url, params=params,
                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -247,6 +271,57 @@ class CoinDCXClient:
             "time": c["time"]
         }
 
+    async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
+        """
+        Fetch and cache instrument details (quantity_increment, min_quantity,
+        min_notional) for a symbol. CoinDCX requires order quantity to be an
+        exact multiple of quantity_increment — this is fetched live instead
+        of hardcoded so it stays correct for all symbols automatically.
+        """
+        if coindcx_symbol in self._instrument_cache:
+            return self._instrument_cache[coindcx_symbol]
+
+        result = await self._get_base(
+            "/exchange/v1/derivatives/futures/data/instrument",
+            params={"pair": coindcx_symbol}
+        )
+
+        if not result or "instrument" not in result:
+            logger.warning(f"{coindcx_symbol} | Could not fetch instrument details — "
+                            f"quantity will NOT be rounded to step size")
+            return None
+
+        inst = result["instrument"]
+        # Sanity check: make sure the API actually returned details for the
+        # symbol we asked for, not a mismatched/default one.
+        if inst.get("pair") != coindcx_symbol:
+            logger.warning(f"{coindcx_symbol} | Instrument details returned for "
+                            f"mismatched pair {inst.get('pair')} — ignoring, "
+                            f"quantity will NOT be rounded to step size")
+            return None
+
+        details = {
+            "quantity_increment": float(inst.get("quantity_increment", 0) or 0),
+            "min_quantity": float(inst.get("min_quantity", 0) or 0),
+            "min_notional": float(inst.get("min_notional", 0) or 0),
+        }
+        self._instrument_cache[coindcx_symbol] = details
+        logger.info(f"{coindcx_symbol} | Instrument details cached: {details}")
+        return details
+
+    @staticmethod
+    def _round_to_increment(quantity: float, increment: float) -> float:
+        """Round quantity DOWN to the nearest valid multiple of increment."""
+        if not increment or increment <= 0:
+            return quantity
+        steps = math.floor(quantity / increment + 1e-9)
+        rounded = steps * increment
+        # Determine decimal places from the increment itself to avoid
+        # floating point noise like 0.30000000004
+        inc_str = f"{increment:.10f}".rstrip('0')
+        decimals = len(inc_str.split('.')[1]) if '.' in inc_str else 0
+        return round(rounded, decimals)
+
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float) -> Optional[dict]:
         """
@@ -259,6 +334,27 @@ class CoinDCXClient:
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
             return None
+
+        # Round quantity to the exchange's required step size before sending.
+        instrument = await self._get_instrument_details(coindcx_symbol)
+        if instrument and instrument["quantity_increment"] > 0:
+            original_quantity = quantity
+            quantity = self._round_to_increment(quantity, instrument["quantity_increment"])
+            if quantity != original_quantity:
+                logger.info(f"{symbol} | Quantity rounded from {original_quantity} to "
+                            f"{quantity} (step size {instrument['quantity_increment']})")
+
+            if quantity <= 0 or (instrument["min_quantity"] and quantity < instrument["min_quantity"]):
+                logger.error(f"{symbol} | Rounded quantity {quantity} is below minimum "
+                             f"{instrument['min_quantity']} — trade size too small for this "
+                             f"symbol's step size, order not sent")
+                return {"id": None, "error": f"Quantity {quantity} below exchange minimum "
+                                             f"{instrument['min_quantity']} after rounding"}
+
+            notional = quantity * sl_price  # rough check, entry price not available here
+            if instrument["min_notional"] and notional < instrument["min_notional"]:
+                logger.warning(f"{symbol} | Order notional ~{notional:.2f} may be below "
+                               f"exchange minimum {instrument['min_notional']}")
 
         timestamp = int(time.time() * 1000)
 
@@ -334,3 +430,4 @@ class CoinDCXClient:
 
         logger.error(f"Failed to cancel order {order_id}")
         return False
+    
