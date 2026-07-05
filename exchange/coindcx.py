@@ -34,12 +34,16 @@ SYMBOL_MAP = {
     "DOGEUSD": "B-DOGE_USDT",
     "ADAUSD": "B-ADA_USDT",
     "LINKUSD": "B-LINK_USDT",
-    "AVAXUSD": "B-AVAX_USDT",
-    "DOTUSD": "B-DOT_USDT",
     "LTCUSD": "B-LTC_USDT",
     "TRXUSD": "B-TRX_USDT",
     "SUIUSD": "B-SUI_USDT"
 }
+
+# Reverse lookup: CoinDCX pair -> our internal symbol name.
+# Used to translate the live positions response back into names the rest
+# of the bot understands, without the caller needing to know CoinDCX's
+# pair format at all.
+REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
 
 
 class CoinDCXClient:
@@ -332,7 +336,7 @@ class CoinDCXClient:
         return round(rounded, decimals)
 
     async def place_market_order(self, symbol: str, side: str, quantity: float,
-                                sl_price: float) -> Optional[dict]:
+                                sl_price: float, leverage: int = 5) -> Optional[dict]:
         """
         Place a market order with integrated SL using stop_loss_price.
         This is a SINGLE order with built-in SL, not two separate orders.
@@ -382,7 +386,7 @@ class CoinDCXClient:
                 "pair": coindcx_symbol,
                 "order_type": "market_order",
                 "total_quantity": quantity,
-                "leverage": 5,
+                "leverage": leverage,
                 "stop_loss_price": sl_price,  # Built-in SL
                 "notification": "email_notification",
                 "time_in_force": "good_till_cancel",
@@ -408,7 +412,8 @@ class CoinDCXClient:
                 order_obj = result
 
             order_id = order_obj.get("id")
-            logger.info(f"{symbol} {side} market order placed with SL @ {sl_price}: {order_id}")
+            logger.info(f"{symbol} {side} market order placed with SL @ {sl_price} "
+                       f"leverage={leverage}x: {order_id}")
             return {
                 "id": order_id,
                 "symbol": symbol,
@@ -416,11 +421,48 @@ class CoinDCXClient:
                 "quantity": quantity,
                 "sl_price": sl_price,
                 "type": "market_with_sl",
-                "leverage": 5
+                "leverage": leverage
             }
 
         logger.error(f"{symbol} | Failed to place market order with SL: {self.last_error}")
         return {"id": None, "error": self.last_error or "Unknown error"}
+
+    async def get_open_positions(self) -> dict:
+        """
+        Fetch all open futures positions from CoinDCX.
+        Returns a dict of {internal_symbol: active_pos} for any of our
+        tracked symbols that currently have a non-zero open position.
+        Symbols with no open position are simply absent from the dict.
+        """
+        timestamp = int(time.time() * 1000)
+        body = {"timestamp": timestamp}
+
+        result = await self._post("/exchange/v1/derivatives/futures/positions", body)
+
+        if isinstance(result, list):
+            entries = result
+        elif isinstance(result, dict) and "positions" in result:
+            entries = result["positions"]
+        else:
+            if result is not None:
+                logger.warning(f"Unexpected positions response shape: {type(result)}")
+            entries = []
+
+        positions = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pair = entry.get("pair")
+            active = entry.get("active_pos", 0) or 0
+            try:
+                active = float(active)
+            except (TypeError, ValueError):
+                active = 0.0
+            internal_symbol = REVERSE_SYMBOL_MAP.get(pair)
+            if internal_symbol and active != 0:
+                positions[internal_symbol] = active
+
+        return positions
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
         """Fetch open orders for a symbol."""
