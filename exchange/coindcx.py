@@ -36,7 +36,12 @@ SYMBOL_MAP = {
     "LINKUSD": "B-LINK_USDT",
     "LTCUSD": "B-LTC_USDT",
     "TRXUSD": "B-TRX_USDT",
-    "SUIUSD": "B-SUI_USDT"
+    "SUIUSD": "B-SUI_USDT",
+    "AAVEUSD": "B-AAVE_USDT",
+    "ICPUSD": "B-ICP_USDT",
+    "NEARUSD": "B-NEAR_USDT",
+    "RENDERUSD": "B-RENDER_USDT",
+    "KAITOUSD": "B-KAITO_USDT"
 }
 
 # Reverse lookup: CoinDCX pair -> our internal symbol name.
