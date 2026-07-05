@@ -1,11 +1,17 @@
 """
 StrategyEngine — Pure liquidity sweep reversal strategy. Nothing else.
 
-There is exactly one type of trade this bot takes: a liquidity sweep
-reversal, on either the PDH side (short) or PDL side (long). There is no
-breakout scenario. If a sweep never gets rejected, the bot simply never
-trades that symbol that day — it keeps watching, it does not fall back to
-any other logic.
+Event-driven: each side (PDH / PDL) of a symbol resets itself back to NONE
+immediately after producing a signal, regardless of whether that signal
+actually resulted in an executed trade. This means a fresh sweep can be
+caught right away rather than waiting for anything else to happen.
+
+The one thing that DOES fully block a symbol is in_trade — set by the
+caller (monitor.py) only once an order has actually been placed, and
+cleared only once a live position check confirms that position has closed
+(see BotState.reset_symbol_watch). This is what makes "one open position
+at a time per symbol" hold, while still allowing unlimited independent
+setups across the day once each position closes.
 
 BUY-SIDE SWEEP (bearish reversal — SHORT):
   1. Price sweeps above PDH (a candle's high > PDH)
@@ -22,14 +28,10 @@ SELL-SIDE SWEEP (bullish reversal — LONG):
   -> Enter LONG, SL just below the rejection candle's low
 
 No indicators, no pattern matching, no proximity filters, no breakout
-fallback. If a symbol never confirms, it simply doesn't trade that day —
-that is a valid, expected outcome, not an error.
+fallback. If a symbol never confirms, it simply doesn't trade — that is a
+valid, expected outcome, not an error.
 
-SL_BUFFER_PCT is the only numeric parameter beyond these conditions —
-a small buffer beyond the rejection candle's extreme so the stop isn't
-sitting exactly on a price that could be touched and reversed from
-without invalidating the trade. Set it to 0 for a fully literal
-implementation with no buffer.
+SL_BUFFER_PCT is the only numeric parameter beyond these conditions.
 """
 
 import logging
@@ -87,12 +89,11 @@ class StrategyEngine:
         """
         Process a new completed candle for a symbol.
         Returns a Signal only when a liquidity sweep fully confirms.
-        Returns None otherwise — including while a sweep is still being
-        watched for rejection, which is normal and can persist for many
-        candles.
+        Returns None if a symbol is currently in_trade (position open), or
+        if no sweep/rejection/confirmation sequence has completed yet.
         """
         level = self.state.get_level(symbol)
-        if not level or level.scenario_fired:
+        if not level or level.in_trade:
             return None
 
         pdh = level.pdh
@@ -105,7 +106,6 @@ class StrategyEngine:
         if level.pdh_state == "NONE":
             if candle['high'] > pdh:
                 if candle['close'] < pdh:
-                    # Swept and rejected within the same candle
                     level.pdh_state = "REJECTED"
                     level.pdh_rejection = candle
                     logger.info(f"{symbol} | PDH swept + rejected (same candle) | "
@@ -119,17 +119,19 @@ class StrategyEngine:
                 level.pdh_state = "REJECTED"
                 level.pdh_rejection = candle
                 logger.info(f"{symbol} | PDH rejection candle formed | L:{candle['low']:.4f}")
-            # else: still no rejection — keep waiting, no breakout fallback
 
         elif level.pdh_state == "REJECTED":
             rej = level.pdh_rejection
             if candle['close'] < rej['low']:
                 sl = rej['high'] * (1 + SL_BUFFER_PCT)
                 signal = Signal(symbol, 'SELL', candle['close'], sl, pdh, pdl)
-                level.scenario_fired = True
                 logger.info(f"{symbol} | SHORT signal (liquidity sweep) | "
                             f"Entry:{candle['close']:.4f} SL:{sl:.4f}")
-            # else: keep waiting for confirmation, no invalidation logic added
+                # This setup has concluded (fired) — reset immediately so a
+                # fresh sweep can be caught right away regardless of what
+                # happens to this signal (executed, skipped, or failed).
+                level.pdh_state = "NONE"
+                level.pdh_rejection = None
 
         # ══════════════════════════════════════════════════════════════
         # PDL SIDE — sell-side sweep -> bullish reversal (LONG)
@@ -152,16 +154,15 @@ class StrategyEngine:
                     level.pdl_state = "REJECTED"
                     level.pdl_rejection = candle
                     logger.info(f"{symbol} | PDL rejection candle formed | H:{candle['high']:.4f}")
-                # else: still no rejection — keep waiting, no breakout fallback
 
             elif level.pdl_state == "REJECTED":
                 rej = level.pdl_rejection
                 if candle['close'] > rej['high']:
                     sl = rej['low'] * (1 - SL_BUFFER_PCT)
                     signal = Signal(symbol, 'BUY', candle['close'], sl, pdh, pdl)
-                    level.scenario_fired = True
                     logger.info(f"{symbol} | LONG signal (liquidity sweep) | "
                                 f"Entry:{candle['close']:.4f} SL:{sl:.4f}")
-                # else: keep waiting for confirmation, no invalidation logic added
+                    level.pdl_state = "NONE"
+                    level.pdl_rejection = None
 
         return signal
