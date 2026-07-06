@@ -35,6 +35,11 @@ TRADE_LEVERAGE = 5
 # against the exchange before every new trade.
 MAX_CONCURRENT_POSITIONS = 2
 
+# Breakeven trailing: once a position's favorable move reaches this
+# fraction of its own initial risk (entry-to-SL distance, "R"), the SL is
+# moved to breakeven and held there — no further trailing beyond that.
+BREAKEVEN_TRIGGER_R = 0.5
+
 # TEMPORARY — set back to False once you're done testing over the weekend.
 TESTING_IGNORE_WEEKENDS = True
 
@@ -48,6 +53,7 @@ class MarketMonitor:
         self.telegram = telegram
         self._last_candle_time = {sym: None for sym in SYMBOLS}
         self._open_positions: dict = {}  # {symbol: active_pos}, refreshed each cycle
+        self._trailing: dict = {}  # {symbol: {side, entry, initial_sl, peak, breakeven_done}}
 
     def _is_trading_day(self) -> bool:
         if TESTING_IGNORE_WEEKENDS:
@@ -105,6 +111,7 @@ class MarketMonitor:
             level = self.state.get_level(symbol)
             if level and level.in_trade and symbol not in positions:
                 self.state.reset_symbol_watch(symbol)
+                self._trailing.pop(symbol, None)
                 logger.info(f"{symbol} | Position closed — resuming watch for fresh setups")
                 await self.telegram.send_alert(
                     f"🔄 *Position Closed*\n\n"
@@ -126,12 +133,61 @@ class MarketMonitor:
             self._last_candle_time[symbol] = candle['time']
             logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} L={candle['low']:.4f} C={candle['close']:.4f}")
 
+            if symbol in self._trailing:
+                await self._check_trailing_stop(symbol, candle)
+
             signal = self.engine.process_candle(symbol, candle)
             if signal:
                 await self._handle_signal(signal)
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
+
+    async def _check_trailing_stop(self, symbol: str, candle: dict):
+        """
+        Breakeven-then-hold trailing: once the position's favorable move
+        reaches BREAKEVEN_TRIGGER_R times its own initial risk, move the
+        SL to entry price and stop — no further trailing after that.
+        """
+        tr = self._trailing.get(symbol)
+        if not tr or tr["breakeven_done"]:
+            return
+
+        entry = tr["entry"]
+        initial_sl = tr["initial_sl"]
+        r = abs(entry - initial_sl)
+        if r <= 0:
+            return
+
+        if tr["side"] == "BUY":
+            tr["peak"] = max(tr["peak"], candle["high"])
+            trigger_price = entry + BREAKEVEN_TRIGGER_R * r
+            reached = tr["peak"] >= trigger_price
+        else:
+            tr["peak"] = min(tr["peak"], candle["low"])
+            trigger_price = entry - BREAKEVEN_TRIGGER_R * r
+            reached = tr["peak"] <= trigger_price
+
+        if reached:
+            logger.info(f"{symbol} | Breakeven trigger hit (peak {tr['peak']:.4f} vs "
+                       f"target {trigger_price:.4f}) — moving SL to entry {entry:.4f}")
+            success = await self.coindcx.update_stop_loss(symbol, entry)
+            tr["breakeven_done"] = True  # don't retry every cycle even if it failed
+
+            if success:
+                await self.telegram.send_alert(
+                    f"🔒 *Breakeven Triggered*\n\n"
+                    f"*Symbol:* {symbol}\n"
+                    f"*New SL:* {entry:.4f} (breakeven)\n\n"
+                    f"Position can no longer close at a loss from here."
+                )
+            else:
+                await self.telegram.send_alert(
+                    f"⚠️ *Breakeven Update Failed*\n\n"
+                    f"*Symbol:* {symbol}\n"
+                    f"Tried to move SL to {entry:.4f} but the exchange call failed. "
+                    f"Original SL ({initial_sl:.4f}) is still in place — check manually."
+                )
 
     async def _handle_signal(self, signal: Signal):
         symbol = signal.symbol
@@ -190,6 +246,13 @@ class MarketMonitor:
                 )
                 self.state.register_trade(record)
                 self.state.mark_in_trade(symbol)
+                self._trailing[symbol] = {
+                    "side": signal.side,
+                    "entry": signal.entry_price,
+                    "initial_sl": signal.sl_price,
+                    "peak": signal.entry_price,
+                    "breakeven_done": False,
+                }
                 # Optimistically reflect the new position immediately so a
                 # second signal in the same poll cycle doesn't overshoot the
                 # cap before the next reconciliation refreshes it for real.
