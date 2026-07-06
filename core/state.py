@@ -21,22 +21,21 @@ class DailyLevel:
 
     # in_trade = True once a signal from this symbol has actually resulted in
     # a placed order. While True, no new signals are generated for this
-    # symbol at all (either side). It's cleared back to False by
-    # BotState.reset_symbol_watch() once a live position check confirms the
-    # position has closed — at which point pdh_state/pdl_state also reset,
-    # so the symbol starts a completely fresh watch cycle.
+    # symbol at all (either side). Cleared by BotState.reset_symbol_watch()
+    # once a live position check confirms the position has closed.
     in_trade: bool = False
 
-    # ── PDH side state machine ──
-    # NONE     -> no candle has closed above PDH yet
-    # SWEPT    -> a candle wicked above PDH but closed above it too (no rejection yet, watching next candle)
-    # REJECTED -> a candle closed back below PDH after a sweep (watching for confirmation break of its low)
+    # ── PDH side (buy-side sweep -> bearish reversal / SHORT) ──
+    # NONE     -> no candle has broken above PDH yet
+    # TRACKING -> a reference candle exists; each new candle either rolls
+    #             the reference forward (new lower/higher extreme, no cap
+    #             on how far it can drift) or triggers entry
     pdh_state: str = "NONE"
-    pdh_rejection: Optional[dict] = None  # the candle dict that formed the rejection
+    pdh_reference: Optional[dict] = None  # the current reference candle dict
 
-    # ── PDL side state machine (mirrored) ──
+    # ── PDL side (sell-side sweep -> bullish reversal / LONG), mirrored ──
     pdl_state: str = "NONE"
-    pdl_rejection: Optional[dict] = None
+    pdl_reference: Optional[dict] = None
 
 
 @dataclass
@@ -89,15 +88,15 @@ class BotState:
         """Call once a live position check confirms this symbol's position
         has closed. Clears in_trade AND resets both sides' state machines
         back to NONE, so the symbol starts a completely fresh setup
-        lifecycle — matching 'previous trades have no impact once closed'."""
+        lifecycle."""
         with self._lock:
             level = self.levels.get(symbol)
             if level:
                 level.in_trade = False
                 level.pdh_state = "NONE"
-                level.pdh_rejection = None
+                level.pdh_reference = None
                 level.pdl_state = "NONE"
-                level.pdl_rejection = None
+                level.pdl_reference = None
 
     def levels_ready(self) -> bool:
         return bool(self.levels) and all(v is not None for v in self.levels.values())
