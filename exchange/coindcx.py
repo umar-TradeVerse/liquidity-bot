@@ -510,3 +510,75 @@ class CoinDCXClient:
 
         logger.error(f"Failed to cancel order {order_id}")
         return False
+
+    async def update_stop_loss(self, symbol: str, new_sl_price: float) -> bool:
+        """
+        Move an open position's stop-loss to a new price. Used for the
+        breakeven trailing mechanism.
+
+        NOTE: this uses CoinDCX's create_tpsl endpoint, the only documented
+        way found to attach/update a stop-loss on an existing position.
+        Its exact behavior when a stop-loss already exists on the position
+        (clean overwrite vs. an error) was not fully confirmed from
+        available docs. Watch the logs closely on the first live trigger —
+        if it errors instead of updating, this needs a follow-up fix.
+        """
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            logger.error(f"{symbol} | Unknown symbol, cannot update SL")
+            return False
+
+        timestamp = int(time.time() * 1000)
+
+        # Look up the position's id fresh — not cached anywhere else in
+        # this client, to avoid using a stale/wrong id.
+        positions_result = await self._post(
+            "/exchange/v1/derivatives/futures/positions",
+            {"timestamp": timestamp}
+        )
+        entries = positions_result if isinstance(positions_result, list) else []
+
+        position_id = None
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("pair") != coindcx_symbol:
+                continue
+            active = entry.get("active_pos", 0) or 0
+            try:
+                active = float(active)
+            except (TypeError, ValueError):
+                active = 0.0
+            if active != 0:
+                position_id = entry.get("id")
+                break
+
+        if not position_id:
+            logger.error(f"{symbol} | Could not find an open position id — SL not updated")
+            return False
+
+        # Round to the correct tick size, same as order placement
+        instrument = await self._get_instrument_details(coindcx_symbol)
+        if instrument and instrument["price_increment"] > 0:
+            new_sl_price = self._round_to_increment(
+                new_sl_price, instrument["price_increment"], mode="nearest"
+            )
+
+        body = {
+            "timestamp": timestamp,
+            "id": position_id,
+            "stop_loss": {
+                "stop_price": new_sl_price,
+                "limit_price": new_sl_price,
+                "order_type": "stop_market"
+            }
+        }
+
+        result = await self._post(
+            "/exchange/v1/derivatives/futures/positions/create_tpsl", body
+        )
+        if result:
+            logger.info(f"{symbol} | Stop-loss updated to {new_sl_price} "
+                       f"(position {position_id})")
+            return True
+
+        logger.error(f"{symbol} | Failed to update stop-loss: {self.last_error}")
+        return False
