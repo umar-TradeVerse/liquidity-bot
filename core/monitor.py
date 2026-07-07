@@ -40,6 +40,13 @@ MAX_CONCURRENT_POSITIONS = 2
 # moved to breakeven and held there — no further trailing beyond that.
 BREAKEVEN_TRIGGER_R = 0.5
 
+# Pure awareness, zero financial risk: if price gets within this % of
+# PDH/PDL without actually breaking it, send one informational alert per
+# symbol per side per day. Purely to give visibility into "noise" near
+# the level — never triggers a trade either way. Safe to tune freely
+# since nothing downstream depends on this number.
+NEAR_LEVEL_THRESHOLD_PCT = 0.0015
+
 # TEMPORARY — set back to False once you're done testing over the weekend.
 TESTING_IGNORE_WEEKENDS = True
 
@@ -133,6 +140,8 @@ class MarketMonitor:
             self._last_candle_time[symbol] = candle['time']
             logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} L={candle['low']:.4f} C={candle['close']:.4f}")
 
+            await self._check_near_miss(symbol, candle)
+
             if symbol in self._trailing:
                 await self._check_trailing_stop(symbol, candle)
 
@@ -142,6 +151,48 @@ class MarketMonitor:
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
+
+    async def _check_near_miss(self, symbol: str, candle: dict):
+        """
+        Pure awareness — never affects trading. If price gets close to
+        PDH/PDL without actually breaking it, send one alert per symbol
+        per side per day so there's visibility into "noise" near the
+        level. Only checked while no sweep is currently being tracked on
+        that side.
+        """
+        level = self.state.get_level(symbol)
+        if not level:
+            return
+
+        if (level.pdh_state == "NONE" and not level.pdh_near_alerted
+                and candle['high'] <= level.pdh
+                and candle['high'] >= level.pdh * (1 - NEAR_LEVEL_THRESHOLD_PCT)):
+            level.pdh_near_alerted = True
+            logger.info(f"{symbol} | Near miss: high {candle['high']:.4f} close to "
+                       f"PDH {level.pdh:.4f} without breaking it")
+            await self.telegram.send_alert(
+                f"ℹ️ *Near PDH, No Break*\n\n"
+                f"*Symbol:* {symbol}\n"
+                f"*Candle High:* {candle['high']:.4f}\n"
+                f"*PDH:* {level.pdh:.4f}\n\n"
+                f"Price touched close to PDH without actually breaking it. "
+                f"No sweep registered, no trade — just for your awareness."
+            )
+
+        if (level.pdl_state == "NONE" and not level.pdl_near_alerted
+                and candle['low'] >= level.pdl
+                and candle['low'] <= level.pdl * (1 + NEAR_LEVEL_THRESHOLD_PCT)):
+            level.pdl_near_alerted = True
+            logger.info(f"{symbol} | Near miss: low {candle['low']:.4f} close to "
+                       f"PDL {level.pdl:.4f} without breaking it")
+            await self.telegram.send_alert(
+                f"ℹ️ *Near PDL, No Break*\n\n"
+                f"*Symbol:* {symbol}\n"
+                f"*Candle Low:* {candle['low']:.4f}\n"
+                f"*PDL:* {level.pdl:.4f}\n\n"
+                f"Price touched close to PDL without actually breaking it. "
+                f"No sweep registered, no trade — just for your awareness."
+            )
 
     async def _check_trailing_stop(self, symbol: str, candle: dict):
         """
@@ -191,6 +242,23 @@ class MarketMonitor:
 
     async def _handle_signal(self, signal: Signal):
         symbol = signal.symbol
+
+        if signal.needs_review:
+            logger.info(f"{symbol} | Signal flagged for manual review — not auto-trading. "
+                       f"{signal.review_reason}")
+            await self.telegram.send_alert(
+                f"🔎 *Manual Review Needed*\n\n"
+                f"*Symbol:* {symbol}\n"
+                f"*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                f"*Would-be Entry:* {signal.entry_price:.4f}\n"
+                f"*Would-be SL:* {signal.sl_price:.4f}\n"
+                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}\n\n"
+                f"*Reason:* {signal.review_reason}\n\n"
+                f"No trade was placed automatically. Review and enter "
+                f"manually on CoinDCX if you agree with this setup."
+            )
+            return
+
         open_count = len(self._open_positions)
 
         if open_count >= MAX_CONCURRENT_POSITIONS:
