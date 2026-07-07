@@ -51,6 +51,21 @@ NEAR_LEVEL_THRESHOLD_PCT = 0.0015
 TESTING_IGNORE_WEEKENDS = True
 
 
+def _escape_md(text) -> str:
+    """
+    Escape characters that Telegram's legacy Markdown parser treats as
+    formatting (_, *, `, [) before embedding externally-sourced text
+    (API error messages, exception text) into an alert. Our own literal
+    template wording is fine as-is — this is only for text we didn't
+    write ourselves, which could contain an unmatched special character
+    and silently break delivery of the entire message.
+    """
+    text = str(text)
+    for ch in ('_', '*', '`', '['):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
 class MarketMonitor:
     def __init__(self, coindcx: CoinDCXClient, engine: StrategyEngine,
                  state: BotState, telegram: TelegramBot):
@@ -253,7 +268,7 @@ class MarketMonitor:
                 f"*Would-be Entry:* {signal.entry_price:.4f}\n"
                 f"*Would-be SL:* {signal.sl_price:.4f}\n"
                 f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}\n\n"
-                f"*Reason:* {signal.review_reason}\n\n"
+                f"*Reason:* {_escape_md(signal.review_reason)}\n\n"
                 f"No trade was placed automatically. Review and enter "
                 f"manually on CoinDCX if you agree with this setup."
             )
@@ -353,9 +368,9 @@ class MarketMonitor:
                     f"❌ *Order Failed*\n\n"
                     f"*Symbol:* {symbol}\n"
                     f"*Side:* {signal.side}\n"
-                    f"*Error:* {error_msg}\n\n"
+                    f"*Error:* {_escape_md(error_msg)}\n\n"
                     f"⚠️ Manual intervention may be required. This setup was NOT "
-                    f"marked in_trade — the bot will keep watching for fresh sweeps."
+                    f"marked in-trade — the bot will keep watching for fresh sweeps."
                 )
 
         except Exception as e:
@@ -363,7 +378,7 @@ class MarketMonitor:
             await self.telegram.send_alert(
                 f"❌ *Order Exception*\n\n"
                 f"*Symbol:* {symbol}\n"
-                f"*Error:* {str(e)}\n\n"
+                f"*Error:* {_escape_md(e)}\n\n"
                 f"⚠️ Manual intervention required. This setup was NOT marked "
-                f"in_trade — the bot will keep watching for fresh sweeps."
+                f"in-trade — the bot will keep watching for fresh sweeps."
             )
