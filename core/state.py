@@ -27,15 +27,22 @@ class DailyLevel:
 
     # ── PDH side (buy-side sweep -> bearish reversal / SHORT) ──
     # NONE     -> no candle has broken above PDH yet
-    # TRACKING -> a reference candle exists; each new candle either rolls
-    #             the reference forward (new lower/higher extreme, no cap
-    #             on how far it can drift) or triggers entry
+    # TRACKING -> a reference candle exists; the next candle either enters
+    #             (low breaks reference's low) or abandons this reference
+    #             entirely (high breaks reference's high, treated as
+    #             continuation, not reversal — see strategy.py)
     pdh_state: str = "NONE"
     pdh_reference: Optional[dict] = None  # the current reference candle dict
 
     # ── PDL side (sell-side sweep -> bullish reversal / LONG), mirrored ──
     pdl_state: str = "NONE"
     pdl_reference: Optional[dict] = None
+
+    # Pure awareness — never affects trading. Set True once we've sent one
+    # "hovering near the level without breaking it" alert for this side
+    # today, so we don't spam the same near-miss every 15 minutes.
+    pdh_near_alerted: bool = False
+    pdl_near_alerted: bool = False
 
 
 @dataclass
