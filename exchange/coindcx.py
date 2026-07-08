@@ -31,17 +31,12 @@ SYMBOL_MAP = {
     "TAOUSD": "B-TAO_USDT",
     "AEROUSD": "B-AERO_USDT",
     "BTCUSD": "B-BTC_USDT",
-    "DOGEUSD": "B-DOGE_USDT",
-    "ADAUSD": "B-ADA_USDT",
-    "LINKUSD": "B-LINK_USDT",
     "LTCUSD": "B-LTC_USDT",
-    "TRXUSD": "B-TRX_USDT",
-    "SUIUSD": "B-SUI_USDT",
     "AAVEUSD": "B-AAVE_USDT",
     "ICPUSD": "B-ICP_USDT",
-    "NEARUSD": "B-NEAR_USDT",
-    "RENDERUSD": "B-RENDER_USDT",
-    "KAITOUSD": "B-KAITO_USDT"
+    "KAITOUSD": "B-KAITO_USDT",
+    "GOLDUSD": "B-XAU_USDT",
+    "OILUSD": "B-CL_USDT"
 }
 
 # Reverse lookup: CoinDCX pair -> our internal symbol name.
