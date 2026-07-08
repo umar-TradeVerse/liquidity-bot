@@ -109,6 +109,12 @@ class StrategyEngine:
         or low (SHORT side) is breached. Returns None otherwise —
         including while a reference is being tracked/rolled, which is
         normal and can persist and drift for as long as it takes.
+
+        Once a signal fires from a side, that side locks (event_active)
+        until price closes back on the other side of the level — this
+        stops one continuous excursion beyond PDH/PDL from being
+        re-sliced into multiple "fresh" trades every time a previous one
+        closes or gets skipped.
         """
         level = self.state.get_level(symbol)
         if not level or level.in_trade:
@@ -118,62 +124,75 @@ class StrategyEngine:
         pdl = level.pdl
         signal = None
 
+        # Clear the lock once price genuinely returns to the normal range.
+        # Only then is this side eligible for a brand new, independent sweep.
+        if level.pdh_event_active and candle['close'] < pdh:
+            level.pdh_event_active = False
+            logger.info(f"{symbol} | PDH event resolved — price closed back below "
+                        f"PDH ({pdh:.4f}), ready for a fresh sweep")
+        if level.pdl_event_active and candle['close'] > pdl:
+            level.pdl_event_active = False
+            logger.info(f"{symbol} | PDL event resolved — price closed back above "
+                        f"PDL ({pdl:.4f}), ready for a fresh sweep")
+
         # ══════════════════════════════════════════════════════════════
         # PDH SIDE — sell-side sweep -> bearish reversal (SHORT)
         # ══════════════════════════════════════════════════════════════
-        if level.pdh_state == "NONE":
-            if candle['high'] > pdh:
-                level.pdh_state = "TRACKING"
-                level.pdh_reference = candle
-                if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
-                    level.pdh_session_high = candle['high']
-                logger.info(f"{symbol} | PDH swept — reference set | "
-                            f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
+        if not level.pdh_event_active:
+            if level.pdh_state == "NONE":
+                if candle['high'] > pdh:
+                    level.pdh_state = "TRACKING"
+                    level.pdh_reference = candle
+                    if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
+                        level.pdh_session_high = candle['high']
+                    logger.info(f"{symbol} | PDH swept — reference set | "
+                                f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
 
-        elif level.pdh_state == "TRACKING":
-            ref = level.pdh_reference
-            if candle['close'] < ref['low']:
-                # Use the persistent session-high (the true extent of this
-                # whole sweep sequence, across any abandon/re-reference
-                # cycles) for SL, not just the latest reference candle,
-                # which may be a shallower, later leg of the same move.
-                extreme_high = level.pdh_session_high if level.pdh_session_high is not None else ref['high']
-                sl = extreme_high * (1 + SL_BUFFER_PCT)
-                entry = candle['close']
-                if ref['low'] < pdh:
-                    signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                     needs_review=True,
-                                     review_reason=f"The reference candle's own low "
-                                                    f"({ref['low']:.4f}) already dipped below "
-                                                    f"PDH ({pdh:.4f}) before entry.")
-                    logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
-                                f"(reference low {ref['low']:.4f} below PDH {pdh:.4f}) | "
-                                f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
-                else:
-                    signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
-                    logger.info(f"{symbol} | SHORT signal (liquidity sweep) | "
-                                f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
-                level.pdh_state = "NONE"
-                level.pdh_reference = None
-                level.pdh_session_high = None  # this liquidity event has concluded
-            elif candle['high'] > ref['high']:
-                if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
-                    level.pdh_session_high = candle['high']
-                logger.info(f"{symbol} | PDH continuation — reference abandoned "
-                            f"(H:{candle['high']:.4f} broke ref H:{ref['high']:.4f}), "
-                            f"watching for a fresh sweep")
-                level.pdh_state = "NONE"
-                level.pdh_reference = None
-            elif candle['low'] < ref['low']:
-                logger.debug(f"{symbol} | PDH low wicked below ref low but close "
-                            f"({candle['close']:.4f}) didn't confirm — still waiting")
-            # else: neither breached — keep waiting with the same reference
+            elif level.pdh_state == "TRACKING":
+                ref = level.pdh_reference
+                if candle['close'] < ref['low']:
+                    # Use the persistent session-high (the true extent of this
+                    # whole sweep sequence, across any abandon/re-reference
+                    # cycles) for SL, not just the latest reference candle,
+                    # which may be a shallower, later leg of the same move.
+                    extreme_high = level.pdh_session_high if level.pdh_session_high is not None else ref['high']
+                    sl = extreme_high * (1 + SL_BUFFER_PCT)
+                    entry = candle['close']
+                    if ref['low'] < pdh:
+                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
+                                         needs_review=True,
+                                         review_reason=f"The reference candle's own low "
+                                                        f"({ref['low']:.4f}) already dipped below "
+                                                        f"PDH ({pdh:.4f}) before entry.")
+                        logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
+                                    f"(reference low {ref['low']:.4f} below PDH {pdh:.4f}) | "
+                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
+                    else:
+                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
+                        logger.info(f"{symbol} | SHORT signal (liquidity sweep) | "
+                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
+                    level.pdh_state = "NONE"
+                    level.pdh_reference = None
+                    level.pdh_session_high = None  # this liquidity event has concluded
+                    level.pdh_event_active = True  # lock — no new PDH signal until price closes back below PDH
+                elif candle['high'] > ref['high']:
+                    if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
+                        level.pdh_session_high = candle['high']
+                    logger.info(f"{symbol} | PDH continuation — reference abandoned "
+                                f"(H:{candle['high']:.4f} broke ref H:{ref['high']:.4f}), "
+                                f"watching for a fresh sweep")
+                    level.pdh_state = "NONE"
+                    level.pdh_reference = None
+                elif candle['low'] < ref['low']:
+                    logger.debug(f"{symbol} | PDH low wicked below ref low but close "
+                                f"({candle['close']:.4f}) didn't confirm — still waiting")
+                # else: neither breached — keep waiting with the same reference
 
         # ══════════════════════════════════════════════════════════════
         # PDL SIDE — buy-side sweep -> bullish reversal (LONG)
         # Only evaluated if PDH side didn't already fire a signal this candle.
         # ══════════════════════════════════════════════════════════════
-        if signal is None:
+        if signal is None and not level.pdl_event_active:
             if level.pdl_state == "NONE":
                 if candle['low'] < pdl:
                     level.pdl_state = "TRACKING"
@@ -205,6 +224,7 @@ class StrategyEngine:
                     level.pdl_state = "NONE"
                     level.pdl_reference = None
                     level.pdl_session_low = None  # this liquidity event has concluded
+                    level.pdl_event_active = True  # lock — no new PDL signal until price closes back above PDL
                 elif candle['low'] < ref['low']:
                     if level.pdl_session_low is None or candle['low'] < level.pdl_session_low:
                         level.pdl_session_low = candle['low']
