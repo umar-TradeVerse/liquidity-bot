@@ -9,8 +9,7 @@ import threading
 SYMBOLS = [
     "ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "AEROUSD",
     "BTCUSD", "LTCUSD",
-    "AAVEUSD", "ICPUSD", "KAITOUSD",
-    "GOLDUSD", "OILUSD"
+    "AAVEUSD", "ICPUSD", "KAITOUSD"
 ]
 
 
