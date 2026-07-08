@@ -125,13 +125,20 @@ class StrategyEngine:
             if candle['high'] > pdh:
                 level.pdh_state = "TRACKING"
                 level.pdh_reference = candle
+                if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
+                    level.pdh_session_high = candle['high']
                 logger.info(f"{symbol} | PDH swept — reference set | "
                             f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
 
         elif level.pdh_state == "TRACKING":
             ref = level.pdh_reference
             if candle['close'] < ref['low']:
-                sl = ref['high'] * (1 + SL_BUFFER_PCT)
+                # Use the persistent session-high (the true extent of this
+                # whole sweep sequence, across any abandon/re-reference
+                # cycles) for SL, not just the latest reference candle,
+                # which may be a shallower, later leg of the same move.
+                extreme_high = level.pdh_session_high if level.pdh_session_high is not None else ref['high']
+                sl = extreme_high * (1 + SL_BUFFER_PCT)
                 entry = candle['close']
                 if ref['low'] < pdh:
                     signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
@@ -141,14 +148,17 @@ class StrategyEngine:
                                                     f"PDH ({pdh:.4f}) before entry.")
                     logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
                                 f"(reference low {ref['low']:.4f} below PDH {pdh:.4f}) | "
-                                f"Entry:{entry:.4f} SL:{sl:.4f}")
+                                f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
                 else:
                     signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
                     logger.info(f"{symbol} | SHORT signal (liquidity sweep) | "
-                                f"Entry:{entry:.4f} SL:{sl:.4f}")
+                                f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
                 level.pdh_state = "NONE"
                 level.pdh_reference = None
+                level.pdh_session_high = None  # this liquidity event has concluded
             elif candle['high'] > ref['high']:
+                if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
+                    level.pdh_session_high = candle['high']
                 logger.info(f"{symbol} | PDH continuation — reference abandoned "
                             f"(H:{candle['high']:.4f} broke ref H:{ref['high']:.4f}), "
                             f"watching for a fresh sweep")
@@ -168,13 +178,16 @@ class StrategyEngine:
                 if candle['low'] < pdl:
                     level.pdl_state = "TRACKING"
                     level.pdl_reference = candle
+                    if level.pdl_session_low is None or candle['low'] < level.pdl_session_low:
+                        level.pdl_session_low = candle['low']
                     logger.info(f"{symbol} | PDL swept — reference set | "
                                 f"L:{candle['low']:.4f} H:{candle['high']:.4f}")
 
             elif level.pdl_state == "TRACKING":
                 ref = level.pdl_reference
                 if candle['close'] > ref['high']:
-                    sl = ref['low'] * (1 - SL_BUFFER_PCT)
+                    extreme_low = level.pdl_session_low if level.pdl_session_low is not None else ref['low']
+                    sl = extreme_low * (1 - SL_BUFFER_PCT)
                     entry = candle['close']
                     if ref['high'] > pdl:
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
@@ -184,14 +197,17 @@ class StrategyEngine:
                                                         f"PDL ({pdl:.4f}) before entry.")
                         logger.info(f"{symbol} | LONG signal FLAGGED FOR REVIEW "
                                     f"(reference high {ref['high']:.4f} above PDL {pdl:.4f}) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f}")
+                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session low {extreme_low:.4f})")
                     else:
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl)
                         logger.info(f"{symbol} | LONG signal (liquidity sweep) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f}")
+                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session low {extreme_low:.4f})")
                     level.pdl_state = "NONE"
                     level.pdl_reference = None
+                    level.pdl_session_low = None  # this liquidity event has concluded
                 elif candle['low'] < ref['low']:
+                    if level.pdl_session_low is None or candle['low'] < level.pdl_session_low:
+                        level.pdl_session_low = candle['low']
                     logger.info(f"{symbol} | PDL continuation — reference abandoned "
                                 f"(L:{candle['low']:.4f} broke ref L:{ref['low']:.4f}), "
                                 f"watching for a fresh sweep")
