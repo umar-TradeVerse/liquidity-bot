@@ -18,10 +18,9 @@ from utils.logger import setup_logger
 logger = setup_logger("main")
 IST = pytz.timezone("Asia/Kolkata")
 
-# TEMPORARY — set back to False once you're done weekend/off-hours testing.
-# When True, the bot fetches PDH/PDL immediately on startup regardless of
-# what time it is, instead of waiting for the 5:30 AM IST cron trigger.
-TESTING_FORCE_IMMEDIATE_FETCH = True
+# Set to True only if you want to force an immediate PDH/PDL fetch on
+# startup regardless of time (useful for off-hours testing).
+TESTING_FORCE_IMMEDIATE_FETCH = False
 
 
 async def daily_reset(state: BotState, engine: StrategyEngine, telegram: TelegramBot):
@@ -68,7 +67,7 @@ async def main():
         logger.error("Telegram connection failed — check BOT_TOKEN and CHAT_ID")
         sys.exit(1)
     await telegram.send_alert("🤖 Liquidity Bot started successfully.")
-    # Scheduler for 5:30 AM IST daily reset
+    # Scheduler for 5:30 AM IST daily reset (runs every day, weekends included)
     scheduler = AsyncIOScheduler(timezone=IST)
     scheduler.add_job(
         daily_reset,
