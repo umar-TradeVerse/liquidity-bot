@@ -1,6 +1,6 @@
 """
 MarketMonitor — continuously polls 15-minute candles and routes signals to execution.
-Runs Monday to Friday only, from 5:30 AM to 11:00 PM IST.
+Runs all 7 days a week, from 5:30 AM to 11:00 PM IST.
 
 Event-driven design: rather than a fixed daily trade count, the bot checks
 CoinDCX's live open positions before every new trade (max 2 concurrent,
@@ -47,8 +47,7 @@ BREAKEVEN_TRIGGER_R = 0.5
 # since nothing downstream depends on this number.
 NEAR_LEVEL_THRESHOLD_PCT = 0.0015
 
-# TEMPORARY — set back to False once you're done testing over the weekend.
-TESTING_IGNORE_WEEKENDS = True
+# Bot trades all 7 days — crypto markets don't close on weekends.
 
 
 def _escape_md(text) -> str:
@@ -77,12 +76,6 @@ class MarketMonitor:
         self._open_positions: dict = {}  # {symbol: active_pos}, refreshed each cycle
         self._trailing: dict = {}  # {symbol: {side, entry, initial_sl, peak, breakeven_done}}
 
-    def _is_trading_day(self) -> bool:
-        if TESTING_IGNORE_WEEKENDS:
-            return True
-        now = datetime.now(IST)
-        return now.weekday() < 5
-
     def _is_trading_hours(self) -> bool:
         now = datetime.now(IST)
         return dtime(5, 30) <= now.time() <= dtime(DAY_END_HOUR, DAY_END_MINUTE)
@@ -91,12 +84,6 @@ class MarketMonitor:
         logger.info("Market monitor started")
         while True:
             try:
-                if not self._is_trading_day():
-                    now = datetime.now(IST)
-                    logger.info(f"Weekend — skipping ({now.strftime('%A')})")
-                    await asyncio.sleep(3600)
-                    continue
-
                 if not self.state.levels_ready() or self.state.paused:
                     await asyncio.sleep(30)
                     continue
