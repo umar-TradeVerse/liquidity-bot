@@ -130,7 +130,7 @@ class StrategyEngine:
 
         elif level.pdh_state == "TRACKING":
             ref = level.pdh_reference
-            if candle['low'] < ref['low']:
+            if candle['close'] < ref['low']:
                 sl = ref['high'] * (1 + SL_BUFFER_PCT)
                 entry = candle['close']
                 if ref['low'] < pdh:
@@ -154,6 +154,9 @@ class StrategyEngine:
                             f"watching for a fresh sweep")
                 level.pdh_state = "NONE"
                 level.pdh_reference = None
+            elif candle['low'] < ref['low']:
+                logger.debug(f"{symbol} | PDH low wicked below ref low but close "
+                            f"({candle['close']:.4f}) didn't confirm — still waiting")
             # else: neither breached — keep waiting with the same reference
 
         # ══════════════════════════════════════════════════════════════
@@ -170,7 +173,7 @@ class StrategyEngine:
 
             elif level.pdl_state == "TRACKING":
                 ref = level.pdl_reference
-                if candle['high'] > ref['high']:
+                if candle['close'] > ref['high']:
                     sl = ref['low'] * (1 - SL_BUFFER_PCT)
                     entry = candle['close']
                     if ref['high'] > pdl:
@@ -194,6 +197,9 @@ class StrategyEngine:
                                 f"watching for a fresh sweep")
                     level.pdl_state = "NONE"
                     level.pdl_reference = None
+                elif candle['high'] > ref['high']:
+                    logger.debug(f"{symbol} | PDL high wicked above ref high but close "
+                                f"({candle['close']:.4f}) didn't confirm — still waiting")
                 # else: neither breached — keep waiting with the same reference
 
         return signal
