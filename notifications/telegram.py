@@ -70,5 +70,5 @@ class TelegramBot:
             f"⚠️ *Manual Intervention Required*\n\n"
             f"*Symbol:* {symbol}\n"
             f"*Reason:* {reason}\n\n"
-            f"Please check your Delta Exchange account."
+            f"Please check your CoinDCX account."
         )
