@@ -41,10 +41,19 @@ class DailyLevel:
     # reflects the true extent of the sweep, not just its final leg.
     pdh_session_high: Optional[float] = None
 
+    # Once a trade has FIRED from this side (executed, skipped, or flagged
+    # for review — any case where a Signal was actually generated), this
+    # locks the side entirely: no new reference, no new signal, until a
+    # candle closes back on the other side of PDH. This is what stops one
+    # continuous excursion beyond the level from being re-sliced into
+    # multiple "fresh" trades every time a previous one closes.
+    pdh_event_active: bool = False
+
     # ── PDL side (sell-side sweep -> bullish reversal / LONG), mirrored ──
     pdl_state: str = "NONE"
     pdl_reference: Optional[dict] = None
     pdl_session_low: Optional[float] = None
+    pdl_event_active: bool = False
 
     # Pure awareness — never affects trading. Set True once we've sent one
     # "hovering near the level without breaking it" alert for this side
