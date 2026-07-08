@@ -28,15 +28,23 @@ class DailyLevel:
     # ── PDH side (buy-side sweep -> bearish reversal / SHORT) ──
     # NONE     -> no candle has broken above PDH yet
     # TRACKING -> a reference candle exists; the next candle either enters
-    #             (low breaks reference's low) or abandons this reference
-    #             entirely (high breaks reference's high, treated as
-    #             continuation, not reversal — see strategy.py)
+    #             (low breaks reference's low, confirmed by CLOSE) or
+    #             abandons this reference entirely (high breaks reference's
+    #             high, treated as continuation, not reversal)
     pdh_state: str = "NONE"
     pdh_reference: Optional[dict] = None  # the current reference candle dict
+
+    # Persistent extreme across the WHOLE continuous sweep sequence for
+    # this side — survives abandon/re-reference cycles, only cleared once
+    # a trade actually confirms (or the day resets). Used for SL instead
+    # of just the latest (possibly shallower) reference, so the stop
+    # reflects the true extent of the sweep, not just its final leg.
+    pdh_session_high: Optional[float] = None
 
     # ── PDL side (sell-side sweep -> bullish reversal / LONG), mirrored ──
     pdl_state: str = "NONE"
     pdl_reference: Optional[dict] = None
+    pdl_session_low: Optional[float] = None
 
     # Pure awareness — never affects trading. Set True once we've sent one
     # "hovering near the level without breaking it" alert for this side
