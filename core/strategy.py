@@ -148,6 +148,31 @@ class StrategyEngine:
                     logger.info(f"{symbol} | PDH swept — reference set | "
                                 f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
 
+                    # Same-candle sweep + reject: this candle's own low already
+                    # breached PDH, meaning the reversal already happened within
+                    # the reference candle itself. Flag for review immediately
+                    # using this candle's own close, rather than waiting one
+                    # more candle and using a later, likely worse, entry price.
+                    if candle['low'] < pdh:
+                        extreme_high = level.pdh_session_high
+                        sl = extreme_high * (1 + SL_BUFFER_PCT)
+                        entry = candle['close']
+                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
+                                         needs_review=True,
+                                         review_reason=f"This candle's own low "
+                                                        f"({candle['low']:.4f}) already dipped below "
+                                                        f"PDH ({pdh:.4f}) within the same candle "
+                                                        f"that swept it — flagged immediately "
+                                                        f"instead of waiting another candle.")
+                        logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
+                                    f"(same-candle sweep+reject, low {candle['low']:.4f} "
+                                    f"below PDH {pdh:.4f}) | Entry:{entry:.4f} SL:{sl:.4f} "
+                                    f"(session high {extreme_high:.4f})")
+                        level.pdh_state = "NONE"
+                        level.pdh_reference = None
+                        level.pdh_session_high = None
+                        level.pdh_event_active = True
+
             elif level.pdh_state == "TRACKING":
                 ref = level.pdh_reference
                 if candle['close'] < ref['low']:
@@ -201,6 +226,31 @@ class StrategyEngine:
                         level.pdl_session_low = candle['low']
                     logger.info(f"{symbol} | PDL swept — reference set | "
                                 f"L:{candle['low']:.4f} H:{candle['high']:.4f}")
+
+                    # Same-candle sweep + reject: this candle's own high already
+                    # poked above PDL, meaning the reversal already happened
+                    # within the reference candle itself. Flag for review
+                    # immediately using this candle's own close, rather than
+                    # waiting one more candle for a later, likely worse entry.
+                    if candle['high'] > pdl:
+                        extreme_low = level.pdl_session_low
+                        sl = extreme_low * (1 - SL_BUFFER_PCT)
+                        entry = candle['close']
+                        signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
+                                         needs_review=True,
+                                         review_reason=f"This candle's own high "
+                                                        f"({candle['high']:.4f}) already poked above "
+                                                        f"PDL ({pdl:.4f}) within the same candle "
+                                                        f"that swept it — flagged immediately "
+                                                        f"instead of waiting another candle.")
+                        logger.info(f"{symbol} | LONG signal FLAGGED FOR REVIEW "
+                                    f"(same-candle sweep+reject, high {candle['high']:.4f} "
+                                    f"above PDL {pdl:.4f}) | Entry:{entry:.4f} SL:{sl:.4f} "
+                                    f"(session low {extreme_low:.4f})")
+                        level.pdl_state = "NONE"
+                        level.pdl_reference = None
+                        level.pdl_session_low = None
+                        level.pdl_event_active = True
 
             elif level.pdl_state == "TRACKING":
                 ref = level.pdl_reference
