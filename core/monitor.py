@@ -6,8 +6,12 @@ Event-driven design: rather than a fixed daily trade count, the bot checks
 CoinDCX's live open positions before every new trade (max 2 concurrent,
 across all symbols). It also periodically reconciles which locally
 "in_trade" symbols have actually closed on the exchange, and resets them
-to start a completely fresh watch cycle — so a symbol can trade multiple
-independent times per day, not just once.
+to start a completely fresh watch cycle.
+
+Rule 3 — one automatic trade per symbol per day: once a symbol has had
+one auto-placed trade today, any further clean setup on that symbol is
+sent as an alert only, never auto-placed, regardless of how that first
+trade closes (win or SL).
 """
 
 import asyncio
@@ -46,8 +50,6 @@ BREAKEVEN_TRIGGER_R = 0.5
 # the level — never triggers a trade either way. Safe to tune freely
 # since nothing downstream depends on this number.
 NEAR_LEVEL_THRESHOLD_PCT = 0.0015
-
-# Bot trades all 7 days — crypto markets don't close on weekends.
 
 
 def _escape_md(text) -> str:
@@ -244,20 +246,26 @@ class MarketMonitor:
 
     async def _handle_signal(self, signal: Signal):
         symbol = signal.symbol
+        level = self.state.get_level(symbol)
 
-        if signal.needs_review:
-            logger.info(f"{symbol} | Signal flagged for manual review — not auto-trading. "
-                       f"{signal.review_reason}")
+        # Rule 3 — one automatic trade per symbol per day. If this symbol
+        # has already had its one auto-trade today, every further clean
+        # setup is alert-only, never auto-placed.
+        if level and level.auto_traded_today:
+            logger.info(f"{symbol} | Fresh {signal.side} setup detected, but this symbol's "
+                       f"one auto-trade for today has already been used — alert only")
             await self.telegram.send_alert(
-                f"🔎 *Manual Review Needed*\n\n"
+                f"⚠️ *New Liquidity Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n"
-                f"*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                f"*Would-be Entry:* {signal.entry_price:.4f}\n"
-                f"*Would-be SL:* {signal.sl_price:.4f}\n"
-                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}\n\n"
-                f"*Reason:* {_escape_md(signal.review_reason)}\n\n"
-                f"No trade was placed automatically. Review and enter "
-                f"manually on CoinDCX if you agree with this setup."
+                f"*Time:* {datetime.now(IST).strftime('%H:%M IST')}\n"
+                f"*Direction:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                f"*Entry:* {signal.entry_price:.4f}\n"
+                f"*SL:* {signal.sl_price:.4f}\n\n"
+                f"*Reason:* Fresh {'buy' if signal.side == 'BUY' else 'sell'}-side liquidity "
+                f"sweep detected after this symbol's automatic trade for today has already "
+                f"been used.\n\n"
+                f"No auto-entry executed as per the one-trade-per-symbol-per-day rule. "
+                f"Review and enter manually on CoinDCX if you agree with this setup."
             )
             return
 
@@ -316,6 +324,7 @@ class MarketMonitor:
                 )
                 self.state.register_trade(record)
                 self.state.mark_in_trade(symbol)
+                self.state.mark_auto_traded(symbol)
                 self._trailing[symbol] = {
                     "side": signal.side,
                     "entry": signal.entry_price,
@@ -342,7 +351,8 @@ class MarketMonitor:
                     f"*Open positions:* {len(self._open_positions)}/{MAX_CONCURRENT_POSITIONS}\n\n"
                     f"⚠️ TP is manual — monitor your position.\n"
                     f"✅ SL is built-in — automatically triggered.\n"
-                    f"🔄 This symbol will resume watching once the position closes."
+                    f"🔄 This symbol will resume watching once the position closes, but today's "
+                    f"auto-trade for this symbol has now been used — further setups will be alert-only."
                 )
 
                 await self.telegram.send_alert(msg)
