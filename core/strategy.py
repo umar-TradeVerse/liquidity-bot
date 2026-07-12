@@ -1,42 +1,37 @@
 """
-StrategyEngine — Pure liquidity sweep reversal strategy, with rollover
-reference candles. Nothing else.
+StrategyEngine — Liquidity sweep + trigger-candle reversal strategy.
 
-BUY-SIDE SWEEP (sell-side liquidity taken -> bullish reversal -> LONG):
-  1. A candle's low breaks below PDL -> this candle becomes the reference
-     ("Liquidity N").
-  2. Every candle after that, compare against the CURRENT reference:
-       - If the new candle's high breaks above the reference's high,
-         enter LONG immediately. SL = the reference's low.
-       - If the new candle's low breaks below the reference's low, the
-         market is continuing the sweep, not reversing -> ABANDON this
-         reference entirely (reset to NONE). The bot goes back to
-         watching for a completely fresh touch of PDL to start a new
-         rollover — it does NOT keep tracking this candle as a new
-         reference. This is what keeps every eventual entry anchored
-         near the actual PDL, instead of drifting arbitrarily far from
-         it through repeated rolling.
-       - If neither happens, do nothing and keep waiting with the same
-         reference.
+Objective: not every breakout is traded. Only a liquidity sweep followed
+by a genuine rejection (trigger) candle, confirmed by a later candle
+breaking the trigger's range, qualifies.
 
-SELL-SIDE SWEEP (buy-side liquidity taken -> bearish reversal -> SHORT):
-  Mirrored exactly:
-  1. A candle's high breaks above PDH -> becomes the reference.
-  2. Each next candle:
-       - New low below reference's low -> enter SHORT immediately.
-         SL = the reference's high.
-       - New high above reference's high -> continuation, not reversal
-         -> ABANDON this reference (reset to NONE), watch for a fresh
-         touch of PDH.
+BUY-SIDE SETUP (sweep of PDL -> bullish reversal -> LONG):
+  1. Liquidity Sweep — a candle's low trades below PDL. This candle is
+     NOT the entry candle and NOT the reference. It only marks that a
+     sweep has occurred; the bot keeps monitoring.
+  2. Trigger Candle — the FIRST candle after the sweep whose close is
+     bullish (close > open) becomes the Trigger Candle. It does not need
+     to touch PDL again. Trigger High / Trigger Low = that candle's
+     high/low — this is the only reference from here on.
+  3. Entry — only when a later candle's CLOSE breaks above Trigger High.
+  4. Stop Loss — just below Trigger Low (not the sweep candle, not PDL).
+  5. Invalidation — if a candle's CLOSE breaks below Trigger Low before
+     any candle closes above Trigger High, the setup is scrapped. The
+     bot immediately resumes watching for a completely fresh sweep (even
+     if price is still below PDL) — this is not locked out.
 
-Entry is triggered by the candle's HIGH or LOW breaching the reference
-(not its close) — but since the bot only sees fully-closed candles, the
-actual execution price used is that candle's close, as the closest
-available price to "the moment the breach was seen."
+SELL-SIDE SETUP (sweep of PDH -> bearish reversal -> SHORT): mirrored
+exactly, using a bearish (close < open) Trigger Candle.
+
+Once a signal actually FIRES (auto-traded or alert-only per Rule 3),
+that side locks (event_active) until a candle closes back on the other
+side of the level — this stops one continuous excursion beyond PDH/PDL
+from being re-sliced into multiple "fresh" trades. This lock does NOT
+apply to invalidation, which is meant to re-arm immediately.
 
 No indicators, no pattern matching, no proximity filters. If a symbol
-never confirms, it simply doesn't trade — that is a valid, expected
-outcome, not an error.
+never produces a trigger candle, or the trigger never gets confirmed,
+it simply doesn't trade — a valid, expected outcome, not an error.
 
 SL_BUFFER_PCT is the only numeric parameter beyond these conditions.
 """
@@ -52,8 +47,7 @@ SL_BUFFER_PCT = 0.001
 
 
 class Signal:
-    def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
-                 needs_review=False, review_reason=None):
+    def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -62,15 +56,6 @@ class Signal:
         self.pattern = "Liquidity Sweep"
         self.pdh = pdh
         self.pdl = pdl
-        # needs_review=True means: don't auto-place this trade, just alert
-        # Telegram and let the person decide manually. Used for setups where
-        # the entry price ends up on the "wrong side" of the level it was
-        # supposed to be rejecting from — e.g. a SHORT whose entry is below
-        # PDH, because the reference candle's own low already dipped below
-        # PDH from a single wide wick (no rolling/drift needed for this to
-        # happen).
-        self.needs_review = needs_review
-        self.review_reason = review_reason
 
     def __repr__(self):
         return (f"Signal({self.symbol} {self.side} @ {self.entry_price:.4f} "
@@ -105,16 +90,12 @@ class StrategyEngine:
     def process_candle(self, symbol: str, candle: dict) -> Optional[Signal]:
         """
         Process a new completed candle for a symbol.
-        Returns a Signal only when a reference candle's high (LONG side)
-        or low (SHORT side) is breached. Returns None otherwise —
-        including while a reference is being tracked/rolled, which is
-        normal and can persist and drift for as long as it takes.
-
-        Once a signal fires from a side, that side locks (event_active)
-        until price closes back on the other side of the level — this
-        stops one continuous excursion beyond PDH/PDL from being
-        re-sliced into multiple "fresh" trades every time a previous one
-        closes or gets skipped.
+        Returns a Signal only when a Trigger Candle's high (SHORT side, via
+        a break below its low) or low (LONG side, via a break above its
+        high) is confirmed by a later candle's CLOSE. Returns None
+        otherwise — including while sweeping/waiting for a trigger, or
+        while a trigger is set and neither confirmed nor invalidated yet,
+        which is normal and can persist for as long as it takes.
         """
         level = self.state.get_level(symbol)
         if not level or level.in_trade:
@@ -123,6 +104,8 @@ class StrategyEngine:
         pdh = level.pdh
         pdl = level.pdl
         signal = None
+        is_bullish = candle['close'] > candle['open']
+        is_bearish = candle['close'] < candle['open']
 
         # Clear the lock once price genuinely returns to the normal range.
         # Only then is this side eligible for a brand new, independent sweep.
@@ -136,156 +119,80 @@ class StrategyEngine:
                         f"PDL ({pdl:.4f}), ready for a fresh sweep")
 
         # ══════════════════════════════════════════════════════════════
-        # PDH SIDE — sell-side sweep -> bearish reversal (SHORT)
+        # PDH SIDE — sweep of PDH -> bearish trigger -> SHORT
         # ══════════════════════════════════════════════════════════════
         if not level.pdh_event_active:
             if level.pdh_state == "NONE":
                 if candle['high'] > pdh:
-                    level.pdh_state = "TRACKING"
-                    level.pdh_reference = candle
-                    if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
-                        level.pdh_session_high = candle['high']
-                    logger.info(f"{symbol} | PDH swept — reference set | "
-                                f"H:{candle['high']:.4f} L:{candle['low']:.4f}")
+                    level.pdh_state = "SWEPT"
+                    logger.info(f"{symbol} | PDH swept (H:{candle['high']:.4f}) — "
+                                f"watching for the first bearish trigger candle")
 
-                    # Same-candle sweep + reject: this candle's own low already
-                    # breached PDH, meaning the reversal already happened within
-                    # the reference candle itself. Flag for review immediately
-                    # using this candle's own close, rather than waiting one
-                    # more candle and using a later, likely worse, entry price.
-                    if candle['low'] < pdh:
-                        extreme_high = level.pdh_session_high
-                        sl = extreme_high * (1 + SL_BUFFER_PCT)
-                        entry = candle['close']
-                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                         needs_review=True,
-                                         review_reason=f"This candle's own low "
-                                                        f"({candle['low']:.4f}) already dipped below "
-                                                        f"PDH ({pdh:.4f}) within the same candle "
-                                                        f"that swept it — flagged immediately "
-                                                        f"instead of waiting another candle.")
-                        logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
-                                    f"(same-candle sweep+reject, low {candle['low']:.4f} "
-                                    f"below PDH {pdh:.4f}) | Entry:{entry:.4f} SL:{sl:.4f} "
-                                    f"(session high {extreme_high:.4f})")
-                        level.pdh_state = "NONE"
-                        level.pdh_reference = None
-                        level.pdh_session_high = None
-                        level.pdh_event_active = True
+            elif level.pdh_state == "SWEPT":
+                if is_bearish:
+                    level.pdh_state = "TRIGGERED"
+                    level.pdh_trigger = candle
+                    logger.info(f"{symbol} | Bearish trigger candle formed | "
+                                f"Trigger H:{candle['high']:.4f} L:{candle['low']:.4f}")
+                # else: no bearish candle yet — keep waiting in SWEPT
 
-            elif level.pdh_state == "TRACKING":
-                ref = level.pdh_reference
-                if candle['close'] < ref['low']:
-                    # Use the persistent session-high (the true extent of this
-                    # whole sweep sequence, across any abandon/re-reference
-                    # cycles) for SL, not just the latest reference candle,
-                    # which may be a shallower, later leg of the same move.
-                    extreme_high = level.pdh_session_high if level.pdh_session_high is not None else ref['high']
-                    sl = extreme_high * (1 + SL_BUFFER_PCT)
+            elif level.pdh_state == "TRIGGERED":
+                trig = level.pdh_trigger
+                if candle['close'] < trig['low']:
                     entry = candle['close']
-                    if ref['low'] < pdh:
-                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                         needs_review=True,
-                                         review_reason=f"The reference candle's own low "
-                                                        f"({ref['low']:.4f}) already dipped below "
-                                                        f"PDH ({pdh:.4f}) before entry.")
-                        logger.info(f"{symbol} | SHORT signal FLAGGED FOR REVIEW "
-                                    f"(reference low {ref['low']:.4f} below PDH {pdh:.4f}) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
-                    else:
-                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
-                        logger.info(f"{symbol} | SHORT signal (liquidity sweep) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session high {extreme_high:.4f})")
+                    sl = trig['high'] * (1 + SL_BUFFER_PCT)
+                    signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
+                    logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
+                                f"Entry:{entry:.4f} SL:{sl:.4f} (trigger high {trig['high']:.4f})")
                     level.pdh_state = "NONE"
-                    level.pdh_reference = None
-                    level.pdh_session_high = None  # this liquidity event has concluded
+                    level.pdh_trigger = None
                     level.pdh_event_active = True  # lock — no new PDH signal until price closes back below PDH
-                elif candle['high'] > ref['high']:
-                    if level.pdh_session_high is None or candle['high'] > level.pdh_session_high:
-                        level.pdh_session_high = candle['high']
-                    logger.info(f"{symbol} | PDH continuation — reference abandoned "
-                                f"(H:{candle['high']:.4f} broke ref H:{ref['high']:.4f}), "
-                                f"watching for a fresh sweep")
+                elif candle['close'] > trig['high']:
+                    logger.info(f"{symbol} | PDH trigger INVALIDATED — close "
+                                f"{candle['close']:.4f} broke trigger high {trig['high']:.4f} "
+                                f"before trigger low — resuming watch for a fresh sweep")
                     level.pdh_state = "NONE"
-                    level.pdh_reference = None
-                elif candle['low'] < ref['low']:
-                    logger.debug(f"{symbol} | PDH low wicked below ref low but close "
-                                f"({candle['close']:.4f}) didn't confirm — still waiting")
-                # else: neither breached — keep waiting with the same reference
+                    level.pdh_trigger = None
+                    # no event_active lock — re-arm immediately, per spec
+                # else: neither breached — keep waiting with the same trigger
 
         # ══════════════════════════════════════════════════════════════
-        # PDL SIDE — buy-side sweep -> bullish reversal (LONG)
+        # PDL SIDE — sweep of PDL -> bullish trigger -> LONG
         # Only evaluated if PDH side didn't already fire a signal this candle.
         # ══════════════════════════════════════════════════════════════
         if signal is None and not level.pdl_event_active:
             if level.pdl_state == "NONE":
                 if candle['low'] < pdl:
-                    level.pdl_state = "TRACKING"
-                    level.pdl_reference = candle
-                    if level.pdl_session_low is None or candle['low'] < level.pdl_session_low:
-                        level.pdl_session_low = candle['low']
-                    logger.info(f"{symbol} | PDL swept — reference set | "
-                                f"L:{candle['low']:.4f} H:{candle['high']:.4f}")
+                    level.pdl_state = "SWEPT"
+                    logger.info(f"{symbol} | PDL swept (L:{candle['low']:.4f}) — "
+                                f"watching for the first bullish trigger candle")
 
-                    # Same-candle sweep + reject: this candle's own high already
-                    # poked above PDL, meaning the reversal already happened
-                    # within the reference candle itself. Flag for review
-                    # immediately using this candle's own close, rather than
-                    # waiting one more candle for a later, likely worse entry.
-                    if candle['high'] > pdl:
-                        extreme_low = level.pdl_session_low
-                        sl = extreme_low * (1 - SL_BUFFER_PCT)
-                        entry = candle['close']
-                        signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
-                                         needs_review=True,
-                                         review_reason=f"This candle's own high "
-                                                        f"({candle['high']:.4f}) already poked above "
-                                                        f"PDL ({pdl:.4f}) within the same candle "
-                                                        f"that swept it — flagged immediately "
-                                                        f"instead of waiting another candle.")
-                        logger.info(f"{symbol} | LONG signal FLAGGED FOR REVIEW "
-                                    f"(same-candle sweep+reject, high {candle['high']:.4f} "
-                                    f"above PDL {pdl:.4f}) | Entry:{entry:.4f} SL:{sl:.4f} "
-                                    f"(session low {extreme_low:.4f})")
-                        level.pdl_state = "NONE"
-                        level.pdl_reference = None
-                        level.pdl_session_low = None
-                        level.pdl_event_active = True
+            elif level.pdl_state == "SWEPT":
+                if is_bullish:
+                    level.pdl_state = "TRIGGERED"
+                    level.pdl_trigger = candle
+                    logger.info(f"{symbol} | Bullish trigger candle formed | "
+                                f"Trigger H:{candle['high']:.4f} L:{candle['low']:.4f}")
+                # else: no bullish candle yet — keep waiting in SWEPT
 
-            elif level.pdl_state == "TRACKING":
-                ref = level.pdl_reference
-                if candle['close'] > ref['high']:
-                    extreme_low = level.pdl_session_low if level.pdl_session_low is not None else ref['low']
-                    sl = extreme_low * (1 - SL_BUFFER_PCT)
+            elif level.pdl_state == "TRIGGERED":
+                trig = level.pdl_trigger
+                if candle['close'] > trig['high']:
                     entry = candle['close']
-                    if ref['high'] > pdl:
-                        signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
-                                         needs_review=True,
-                                         review_reason=f"The reference candle's own high "
-                                                        f"({ref['high']:.4f}) already poked above "
-                                                        f"PDL ({pdl:.4f}) before entry.")
-                        logger.info(f"{symbol} | LONG signal FLAGGED FOR REVIEW "
-                                    f"(reference high {ref['high']:.4f} above PDL {pdl:.4f}) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session low {extreme_low:.4f})")
-                    else:
-                        signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl)
-                        logger.info(f"{symbol} | LONG signal (liquidity sweep) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} (session low {extreme_low:.4f})")
+                    sl = trig['low'] * (1 - SL_BUFFER_PCT)
+                    signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl)
+                    logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
+                                f"Entry:{entry:.4f} SL:{sl:.4f} (trigger low {trig['low']:.4f})")
                     level.pdl_state = "NONE"
-                    level.pdl_reference = None
-                    level.pdl_session_low = None  # this liquidity event has concluded
+                    level.pdl_trigger = None
                     level.pdl_event_active = True  # lock — no new PDL signal until price closes back above PDL
-                elif candle['low'] < ref['low']:
-                    if level.pdl_session_low is None or candle['low'] < level.pdl_session_low:
-                        level.pdl_session_low = candle['low']
-                    logger.info(f"{symbol} | PDL continuation — reference abandoned "
-                                f"(L:{candle['low']:.4f} broke ref L:{ref['low']:.4f}), "
-                                f"watching for a fresh sweep")
+                elif candle['close'] < trig['low']:
+                    logger.info(f"{symbol} | PDL trigger INVALIDATED — close "
+                                f"{candle['close']:.4f} broke trigger low {trig['low']:.4f} "
+                                f"before trigger high — resuming watch for a fresh sweep")
                     level.pdl_state = "NONE"
-                    level.pdl_reference = None
-                elif candle['high'] > ref['high']:
-                    logger.debug(f"{symbol} | PDL high wicked above ref high but close "
-                                f"({candle['close']:.4f}) didn't confirm — still waiting")
-                # else: neither breached — keep waiting with the same reference
+                    level.pdl_trigger = None
+                    # no event_active lock — re-arm immediately, per spec
+                # else: neither breached — keep waiting with the same trigger
 
         return signal
