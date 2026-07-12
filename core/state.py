@@ -24,34 +24,35 @@ class DailyLevel:
     # once a live position check confirms the position has closed.
     in_trade: bool = False
 
+    # auto_traded_today = True once ONE automatic trade has been placed for
+    # this symbol today (win or SL, doesn't matter). Once True, any further
+    # clean setup on this symbol today is alert-only — never auto-placed.
+    # Reset only by the next day's fresh DailyLevel (via reset_daily).
+    auto_traded_today: bool = False
+
     # ── PDH side (buy-side sweep -> bearish reversal / SHORT) ──
-    # NONE     -> no candle has broken above PDH yet
-    # TRACKING -> a reference candle exists; the next candle either enters
-    #             (low breaks reference's low, confirmed by CLOSE) or
-    #             abandons this reference entirely (high breaks reference's
-    #             high, treated as continuation, not reversal)
+    # NONE      -> no candle has broken above PDH yet
+    # SWEPT     -> a candle's high broke above PDH; watching for the first
+    #              bearish (close < open) candle to become the Trigger Candle
+    # TRIGGERED -> a bearish Trigger Candle is set; watching for a later
+    #              candle's close to break the trigger's low (entry) or
+    #              its high (invalidation)
     pdh_state: str = "NONE"
-    pdh_reference: Optional[dict] = None  # the current reference candle dict
+    pdh_trigger: Optional[dict] = None  # the Trigger Candle dict
 
-    # Persistent extreme across the WHOLE continuous sweep sequence for
-    # this side — survives abandon/re-reference cycles, only cleared once
-    # a trade actually confirms (or the day resets). Used for SL instead
-    # of just the latest (possibly shallower) reference, so the stop
-    # reflects the true extent of the sweep, not just its final leg.
-    pdh_session_high: Optional[float] = None
-
-    # Once a trade has FIRED from this side (executed, skipped, or flagged
-    # for review — any case where a Signal was actually generated), this
-    # locks the side entirely: no new reference, no new signal, until a
-    # candle closes back on the other side of PDH. This is what stops one
+    # Once a trade has FIRED from this side (executed or alert-only per
+    # Rule 3), this locks the side entirely: no new sweep/trigger detection
+    # until a candle closes back on the other side of PDH. This stops one
     # continuous excursion beyond the level from being re-sliced into
     # multiple "fresh" trades every time a previous one closes.
+    # NOTE: this lock is NOT set on invalidation (Trigger Low broken before
+    # Trigger High) — per the strategy, invalidation should immediately
+    # resume watching for a fresh sweep, even if price is still beyond PDH.
     pdh_event_active: bool = False
 
     # ── PDL side (sell-side sweep -> bullish reversal / LONG), mirrored ──
     pdl_state: str = "NONE"
-    pdl_reference: Optional[dict] = None
-    pdl_session_low: Optional[float] = None
+    pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
 
     # Pure awareness — never affects trading. Set True once we've sent one
@@ -107,19 +108,29 @@ class BotState:
             if self.levels.get(symbol):
                 self.levels[symbol].in_trade = True
 
+    def mark_auto_traded(self, symbol: str):
+        """Call once an order has actually been placed for this symbol.
+        Marks today's one-auto-trade-per-symbol allowance as used —
+        stays True for the rest of the day regardless of position
+        closes/reopens, unlike in_trade."""
+        with self._lock:
+            if self.levels.get(symbol):
+                self.levels[symbol].auto_traded_today = True
+
     def reset_symbol_watch(self, symbol: str):
         """Call once a live position check confirms this symbol's position
         has closed. Clears in_trade AND resets both sides' state machines
         back to NONE, so the symbol starts a completely fresh setup
-        lifecycle."""
+        lifecycle. Does NOT clear auto_traded_today — that persists for
+        the rest of the day per Rule 3."""
         with self._lock:
             level = self.levels.get(symbol)
             if level:
                 level.in_trade = False
                 level.pdh_state = "NONE"
-                level.pdh_reference = None
+                level.pdh_trigger = None
                 level.pdl_state = "NONE"
-                level.pdl_reference = None
+                level.pdl_trigger = None
 
     def levels_ready(self) -> bool:
         return bool(self.levels) and all(v is not None for v in self.levels.values())
