@@ -347,7 +347,15 @@ class MarketMonitor:
                 self._open_positions[symbol] = quantity_filled
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
-                tp_set = await self.coindcx.update_position_tpsl(symbol, tp_price=tp_price)
+                tp_set = False
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(1.5)
+                    tp_set = await self.coindcx.update_position_tpsl(symbol, tp_price=tp_price)
+                    if tp_set:
+                        break
+                    logger.warning(f"{symbol} | TP set attempt {attempt + 1}/3 failed — "
+                                   f"position may not be registered on the exchange yet")
                 tp_note = (f"🎯 Resting take-profit set at {tp_price:.4f} (Priority 1 target)."
                           if tp_set else
                           f"⚠️ Could not set a resting take-profit order — Priority 1 will still "
