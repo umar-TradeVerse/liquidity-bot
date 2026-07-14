@@ -23,7 +23,6 @@ IST = pytz.timezone("Asia/Kolkata")
 COINDCX_BASE_URL = "https://api.coindcx.com"
 COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 
-# Symbol mapping: Delta symbol → CoinDCX USDT futures symbol
 SYMBOL_MAP = {
     "ETHUSD": "B-ETH_USDT",
     "SOLUSD": "B-SOL_USDT",
@@ -37,10 +36,6 @@ SYMBOL_MAP = {
     "KAITOUSD": "B-KAITO_USDT"
 }
 
-# Reverse lookup: CoinDCX pair -> our internal symbol name.
-# Used to translate the live positions response back into names the rest
-# of the bot understands, without the caller needing to know CoinDCX's
-# pair format at all.
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
 
 
@@ -52,7 +47,7 @@ class CoinDCXClient:
         self.public_url = COINDCX_PUBLIC_URL
         self._session: Optional[aiohttp.ClientSession] = None
         self.last_error: Optional[str] = None
-        self._instrument_cache: dict = {}  # symbol -> {"quantity_increment": ..., "min_quantity": ..., "min_notional": ...}
+        self._instrument_cache: dict = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -60,25 +55,20 @@ class CoinDCXClient:
         return self._session
 
     def _generate_signature(self, body: str) -> str:
-        """Generate HMAC-SHA256 signature for request body."""
         secret_bytes = bytes(self.api_secret, encoding='utf-8')
         signature = hmac.new(secret_bytes, body.encode(), hashlib.sha256).hexdigest()
         return signature
 
     async def _post(self, endpoint: str, data: dict) -> Optional[dict]:
-        """Make POST request to CoinDCX API with signature."""
         session = await self._get_session()
         url = self.base_url + endpoint
-
         json_body = json.dumps(data, separators=(',', ':'))
-
         signature = self._generate_signature(json_body)
         headers = {
             'Content-Type': 'application/json',
             'X-AUTH-APIKEY': self.api_key,
             'X-AUTH-SIGNATURE': signature
         }
-
         try:
             async with session.post(url, data=json_body, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -100,7 +90,6 @@ class CoinDCXClient:
             return None
 
     async def _get(self, path: str, params: dict = None) -> Optional[dict]:
-        """Make GET request to public API."""
         session = await self._get_session()
         url = self.public_url + path
         try:
@@ -120,9 +109,6 @@ class CoinDCXClient:
             return None
 
     async def _get_base(self, path: str, params: dict = None) -> Optional[dict]:
-        """Make an unauthenticated GET request against api.coindcx.com
-        (as opposed to public.coindcx.com used by _get). Used for endpoints
-        like instrument details that live on the main API domain."""
         session = await self._get_session()
         url = self.base_url + path
         try:
@@ -142,12 +128,6 @@ class CoinDCXClient:
             return None
 
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
-        """
-        Fetch the last completed daily candle for a symbol.
-        Matches candles by actual IST calendar date instead of assuming
-        array position/order — this avoids picking a stale candle if the
-        API returns results in an unexpected order or with gaps.
-        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
@@ -155,8 +135,6 @@ class CoinDCXClient:
 
         now_ist = datetime.now(IST)
         yesterday_date = (now_ist - timedelta(days=1)).date()
-
-        # Look back 10 days to comfortably cover weekends/gaps
         start_ts = int((now_ist - timedelta(days=10)).timestamp() * 1000)
         end_ts = int(now_ist.timestamp() * 1000)
 
@@ -170,7 +148,6 @@ class CoinDCXClient:
 
         result = await self._get("/market_data/candles", params=params)
 
-        # DIAGNOSTIC: show every candle's date so ordering/gaps are visible
         if result and isinstance(result, list):
             debug_dates = [
                 (datetime.fromtimestamp(int(c["time"]) / 1000, IST).date().isoformat(), c.get("high"), c.get("low"))
@@ -183,7 +160,6 @@ class CoinDCXClient:
             logger.error(f"{symbol} | No daily candle data returned")
             return None
 
-        # Find the candle whose IST calendar date matches yesterday exactly
         match = None
         for c in result:
             candle_date = datetime.fromtimestamp(int(c["time"]) / 1000, IST).date()
@@ -192,9 +168,6 @@ class CoinDCXClient:
                 break
 
         if match is None:
-            # Fallback: closest date before today, in case yesterday had zero volume
-            # or wasn't returned (e.g. brand-new listing) — pick the most recent
-            # candle that is strictly before today's date.
             candidates = [
                 c for c in result
                 if datetime.fromtimestamp(int(c["time"]) / 1000, IST).date() < now_ist.date()
@@ -222,18 +195,13 @@ class CoinDCXClient:
         }
 
     async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
-        """
-        Fetch the latest completed 15-minute candle.
-        Sorts candles explicitly by timestamp (ascending) before picking the
-        second-to-last one — do not trust the API's return order.
-        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping")
             return None
 
         now_ts = int(time.time() * 1000)
-        start_ts = now_ts - (7200 * 1000)  # 2 hours lookback (8 candles)
+        start_ts = now_ts - (7200 * 1000)
 
         params = {
             "pair": coindcx_symbol,
@@ -249,7 +217,6 @@ class CoinDCXClient:
             logger.warning(f"{symbol} | Empty/None response from 15m candles endpoint")
             return None
 
-        # Sort explicitly by timestamp ascending — never trust API order
         try:
             candles = sorted(result, key=lambda c: int(c["time"]))
         except (KeyError, ValueError, TypeError) as e:
@@ -260,7 +227,6 @@ class CoinDCXClient:
             logger.warning(f"{symbol} | Only {len(candles)} candle(s) returned, need >=2")
             return None
 
-        # Second-to-last after sorting ascending = most recently FULLY completed candle
         c = candles[-2]
 
         return {
@@ -273,12 +239,6 @@ class CoinDCXClient:
         }
 
     async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
-        """
-        Fetch and cache instrument details (quantity_increment, min_quantity,
-        min_notional) for a symbol. CoinDCX requires order quantity to be an
-        exact multiple of quantity_increment — this is fetched live instead
-        of hardcoded so it stays correct for all symbols automatically.
-        """
         if coindcx_symbol in self._instrument_cache:
             return self._instrument_cache[coindcx_symbol]
 
@@ -311,13 +271,6 @@ class CoinDCXClient:
 
     @staticmethod
     def _round_to_increment(quantity: float, increment: float, mode: str = "floor") -> float:
-        """
-        Round to the nearest valid multiple of increment.
-        mode="floor"   -> round down (used for order quantity, so we never
-                           request more than the calculated size)
-        mode="nearest" -> round to closest (used for SL price, where over/under
-                           by half a tick doesn't matter, just needs to be valid)
-        """
         if not increment or increment <= 0:
             return quantity
         if mode == "nearest":
@@ -331,12 +284,6 @@ class CoinDCXClient:
 
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float, leverage: int = 5) -> Optional[dict]:
-        """
-        Place a market order with integrated SL using stop_loss_price.
-        This is a SINGLE order with built-in SL, not two separate orders.
-
-        Returns: order response dict on success, None on failure
-        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
@@ -417,11 +364,6 @@ class CoinDCXClient:
         return {"id": None, "error": self.last_error or "Unknown error"}
 
     async def get_open_positions(self) -> dict:
-        """
-        Fetch all open futures positions from CoinDCX.
-        Returns a dict of {internal_symbol: active_pos} for any of our
-        tracked symbols that currently have a non-zero open position.
-        """
         timestamp = int(time.time() * 1000)
         body = {"timestamp": timestamp}
 
@@ -452,7 +394,7 @@ class CoinDCXClient:
 
         return positions
 
-async def get_position_details(self, symbol: str) -> Optional[dict]:
+    async def get_position_details(self, symbol: str) -> Optional[dict]:
         """
         Fetch this symbol's open position and compute ROE manually.
         CoinDCX's position response does NOT include a pre-computed ROE
@@ -498,9 +440,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
                                f"cannot compute ROE, raw entry: {entry}")
                 return {"id": entry.get("id"), "active_pos": active, "roe": None, "raw": entry}
 
-            # active_pos sign convention: positive = LONG, negative = SHORT
-            # (confirmed via side already known at call time isn't passed in,
-            # so infer direction from the sign of active_pos itself).
             if active > 0:
                 pnl = (mark_price - avg_price) * active
             else:
@@ -514,7 +453,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
         return None
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
-        """Fetch open orders for a symbol."""
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             return None
@@ -533,7 +471,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
         return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel an open order."""
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             return False
@@ -554,17 +491,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
         return False
 
     async def close_position_market(self, symbol: str, side: str, quantity: float) -> bool:
-        """
-        Close an open position via an opposite-side reduce-only market
-        order. `side` = the ORIGINAL position's side ('BUY' or 'SELL') —
-        this flips it automatically for the closing order.
-
-        NOTE: "reduce_only" support/behavior on CoinDCX's order-create
-        endpoint has not been confirmed from available docs. Watch the
-        first live close closely — if it doesn't fully flatten the
-        position (or opens opposite exposure instead), this needs a
-        follow-up fix.
-        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"Unknown symbol: {symbol}")
@@ -601,16 +527,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
         return False
 
     async def update_stop_loss(self, symbol: str, new_sl_price: float) -> bool:
-        """
-        Move an open position's stop-loss to a new price. Currently unused
-        (breakeven trail was removed), kept in case it's needed again.
-
-        NOTE: this uses CoinDCX's create_tpsl endpoint, the only documented
-        way found to attach/update a stop-loss on an existing position.
-        Its exact behavior when a stop-loss already exists on the position
-        (clean overwrite vs. an error) was not fully confirmed from
-        available docs.
-        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
             logger.error(f"{symbol} | Unknown symbol, cannot update SL")
@@ -670,17 +586,6 @@ async def get_position_details(self, symbol: str) -> Optional[dict]:
 
     async def update_position_tpsl(self, symbol: str, sl_price: Optional[float] = None,
                                     tp_price: Optional[float] = None) -> bool:
-        """
-        Set/update stop-loss and/or take-profit on an open position via
-        CoinDCX's create_tpsl endpoint. Pass only the price(s) you want to
-        set — the take_profit object's shape is mirrored from the working
-        stop_loss shape as the most likely format; NOT independently
-        confirmed. Watch the first live take-profit call's response
-        closely — if it errors or doesn't behave as expected, this needs
-        a follow-up fix. Priority-1 exits are still enforced as a backup
-        by the bot's own candle-close check either way (see monitor.py),
-        so a failure here doesn't leave the position unmanaged.
-        """
         if sl_price is None and tp_price is None:
             return False
 
