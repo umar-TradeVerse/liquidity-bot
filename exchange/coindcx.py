@@ -452,16 +452,17 @@ class CoinDCXClient:
 
         return positions
 
-    async def get_position_details(self, symbol: str) -> Optional[dict]:
+async def get_position_details(self, symbol: str) -> Optional[dict]:
         """
-        Fetch this symbol's open position details, including CoinDCX's own
-        ROE field (used for Priority-3 exits), rather than recomputing ROE
-        manually from stored entry price.
-
-        NOTE: the exact field name for ROE in CoinDCX's response has not
-        been confirmed from available docs — "roe" is the best guess based
-        on naming conventions. The raw entry is logged on first miss so you
-        can verify/correct the field name from real data if needed.
+        Fetch this symbol's open position and compute ROE manually.
+        CoinDCX's position response does NOT include a pre-computed ROE
+        field (confirmed from live data) — it must be derived the same
+        way CoinDCX's own UI does:
+            pnl = (mark_price - avg_price) * active_pos          [LONG]
+            pnl = (avg_price - mark_price) * active_pos          [SHORT]
+            roe_pct = (pnl / locked_user_margin) * 100
+        Verified against a live CoinDCX position screenshot — matches
+        CoinDCX's own displayed ROE% exactly.
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -480,18 +481,36 @@ class CoinDCXClient:
                 active = float(active)
             except (TypeError, ValueError):
                 active = 0.0
-            if active != 0:
-                roe_raw = entry.get("roe")
-                roe = None
-                if roe_raw is not None:
-                    try:
-                        roe = float(roe_raw)
-                    except (TypeError, ValueError):
-                        roe = None
-                if roe is None:
-                    logger.warning(f"{symbol} | 'roe' field missing/unparsable in position "
-                                   f"response — raw entry for verification: {entry}")
-                return {"id": entry.get("id"), "active_pos": active, "roe": roe, "raw": entry}
+            if active == 0:
+                continue
+
+            try:
+                avg_price = float(entry.get("avg_price", 0) or 0)
+                mark_price = float(entry.get("mark_price", 0) or 0)
+                margin = float(entry.get("locked_user_margin", 0) or 0)
+            except (TypeError, ValueError):
+                logger.warning(f"{symbol} | Could not parse avg_price/mark_price/margin "
+                               f"for ROE calc — raw entry: {entry}")
+                return {"id": entry.get("id"), "active_pos": active, "roe": None, "raw": entry}
+
+            if margin <= 0:
+                logger.warning(f"{symbol} | locked_user_margin is zero/missing — "
+                               f"cannot compute ROE, raw entry: {entry}")
+                return {"id": entry.get("id"), "active_pos": active, "roe": None, "raw": entry}
+
+            # active_pos sign convention: positive = LONG, negative = SHORT
+            # (confirmed via side already known at call time isn't passed in,
+            # so infer direction from the sign of active_pos itself).
+            if active > 0:
+                pnl = (mark_price - avg_price) * active
+            else:
+                pnl = (avg_price - mark_price) * abs(active)
+
+            roe = (pnl / margin) * 100
+
+            return {"id": entry.get("id"), "active_pos": active, "roe": roe,
+                    "pnl": pnl, "mark_price": mark_price, "raw": entry}
+
         return None
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
