@@ -9,7 +9,11 @@ BUY-SIDE SETUP (sweep of PDL -> bullish reversal -> LONG):
      logged and ignored, not treated as a fresh sweep.
   2. Trigger Candle — the FIRST candle after the sweep whose close is
      bullish becomes the Trigger Candle.
-  3. Entry — only when a later candle's CLOSE breaks above Trigger High.
+  3. Entry — only when a later candle's CLOSE breaks above Trigger High
+     AND that same candle itself closed bullish (its own shape must
+     agree with the direction being confirmed — a candle that crosses
+     the trigger but closes the "wrong" color does not confirm; it is
+     logged and the bot keeps waiting).
   4. Stop Loss — below the SWEEP extreme for this cycle (the lowest low
      reached from sweep through to confirm), buffered by SL_BUFFER_PCT.
   5. Invalidation — close breaks Trigger Low before Trigger High —
@@ -142,7 +146,7 @@ class StrategyEngine:
 
             elif level.pdh_state == "TRIGGERED":
                 trig = level.pdh_trigger
-                if candle['close'] < trig['low']:
+                if candle['close'] < trig['low'] and is_bearish:
                     entry = candle['close']
                     sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
                     signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl)
@@ -153,6 +157,10 @@ class StrategyEngine:
                     level.pdh_trigger = None
                     level.pdh_sweep_extreme = None
                     level.pdh_event_active = True
+                elif candle['close'] < trig['low'] and not is_bearish:
+                    logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger low "
+                                f"{trig['low']:.4f} but candle closed bullish — rejecting this "
+                                f"confirmation, still waiting for a bearish close")
                 elif candle['close'] > trig['high']:
                     logger.info(f"{symbol} | PDH trigger INVALIDATED — close "
                                 f"{candle['close']:.4f} broke trigger high {trig['high']:.4f} "
@@ -194,7 +202,7 @@ class StrategyEngine:
 
             elif level.pdl_state == "TRIGGERED":
                 trig = level.pdl_trigger
-                if candle['close'] > trig['high']:
+                if candle['close'] > trig['high'] and is_bullish:
                     entry = candle['close']
                     sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
                     signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl)
@@ -205,6 +213,10 @@ class StrategyEngine:
                     level.pdl_trigger = None
                     level.pdl_sweep_extreme = None
                     level.pdl_event_active = True
+                elif candle['close'] > trig['high'] and not is_bullish:
+                    logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger high "
+                                f"{trig['high']:.4f} but candle closed bearish — rejecting this "
+                                f"confirmation, still waiting for a bullish close")
                 elif candle['close'] < trig['low']:
                     logger.info(f"{symbol} | PDL trigger INVALIDATED — close "
                                 f"{candle['close']:.4f} broke trigger low {trig['low']:.4f} "
