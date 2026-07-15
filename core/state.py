@@ -27,11 +27,13 @@ class DailyLevel:
     pdh_trigger: Optional[dict] = None
     pdh_event_active: bool = False
     pdh_sweep_extreme: Optional[float] = None
+    pdh_day_extreme: Optional[float] = None
 
     pdl_state: str = "NONE"
     pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
+    pdl_day_extreme: Optional[float] = None
 
 
 @dataclass
