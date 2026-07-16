@@ -12,10 +12,16 @@ Rule 3 — one automatic trade per symbol per day: once a symbol has had
 one auto-placed trade today, any further clean setup on that symbol is
 alert-only, never auto-placed, regardless of how that first trade closes.
 
-BTC-regime filter: BTCUSD is never traded here (see core/state.py) but
-its own price action relative to its PDH/PDL classifies a daily regime
-(BULLISH/BEARISH/NEUTRAL) that blocks counter-regime auto-entries on the
-other 9 symbols (alert-only instead).
+BTC-regime tracking: BTCUSD is never traded here (see core/state.py) but
+its own price action relative to its PDH/PDL is classified into a daily
+regime (BULLISH/BEARISH/NEUTRAL) purely for logging/alert context.
+As of 2026-07-16 this no longer gates auto-entries on the other 9 symbols —
+repeated observation (SOL, KAITO, AERO, ICP) showed clean sweep-reversal
+setups getting suppressed while BTC regime itself was just chopping
+sideways rather than reflecting a real directional move. Regime is still
+computed and surfaced in every alert so this can be revisited later with
+a smarter (e.g. per-symbol correlation-aware, or extreme-move-only) gate
+if the data supports it.
 """
 
 import asyncio
@@ -128,7 +134,9 @@ class MarketMonitor:
 
     async def _update_regime(self):
         """Read-only — refreshes the BTC regime classification. BTC is
-        never scanned for its own setups and never traded here."""
+        never scanned for its own setups and never traded here. This
+        value is now informational only (see module docstring) and no
+        longer gates auto-entries."""
         try:
             candle = await self.coindcx.get_latest_15m_candle(REGIME_SYMBOL)
             if not candle or self._last_regime_candle_time == candle['time']:
@@ -287,23 +295,15 @@ class MarketMonitor:
             )
             return
 
-        # BTC-regime filter — block counter-regime auto-entries, alert only.
+        # BTC-regime — informational only, no longer gates execution (removed
+        # 2026-07-16 after repeated clean sweep-reversals on SOL/KAITO/AERO/ICP
+        # were suppressed while BTC regime was just chop, not a real trend).
         regime = self.state.get_regime()
-        if (signal.side == 'BUY' and regime == 'BEARISH') or (signal.side == 'SELL' and regime == 'BULLISH'):
-            logger.info(f"{symbol} | {signal.side} setup, but BTC regime is {regime} — alert only")
-            await self.telegram.send_alert(
-                f"⚠️ *New Liquidity Setup Detected*\n\n"
-                f"*Symbol:* {symbol}\n"
-                f"*Time:* {datetime.now(IST).strftime('%H:%M IST')}\n"
-                f"*Direction:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n"
-                f"*SL:* {signal.sl_price:.4f}\n\n"
-                f"*Reason:* BTC is currently in a {regime.lower()} regime, running counter to "
-                f"this {'LONG' if signal.side == 'BUY' else 'SHORT'} setup.\n\n"
-                f"No auto-entry executed as per the BTC-regime filter. "
-                f"Review and enter manually on CoinDCX if you agree with this setup."
-            )
-            return
+        counter_regime = (signal.side == 'BUY' and regime == 'BEARISH') or \
+                          (signal.side == 'SELL' and regime == 'BULLISH')
+        if counter_regime:
+            logger.info(f"{symbol} | {signal.side} setup — BTC regime is {regime} "
+                       f"(informational only, proceeding with entry)")
 
         open_count = len(self._open_positions)
         if open_count >= MAX_CONCURRENT_POSITIONS:
@@ -315,11 +315,14 @@ class MarketMonitor:
             )
             return
 
+        regime_line = (f"\n*BTC Regime:* {regime} (counter-regime — proceeding anyway)"
+                       if counter_regime else "")
+
         await self.telegram.send_alert(
             f"🔍 *Setup Detected*\n\n"
             f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
             f"*Pattern:* {signal.pattern}\n*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-            f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}\n\n⏳ Placing order..."
+            f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{regime_line}\n\n⏳ Placing order..."
         )
 
         try:
