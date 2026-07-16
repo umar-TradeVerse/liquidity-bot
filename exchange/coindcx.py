@@ -31,7 +31,6 @@ SYMBOL_MAP = {
     "AEROUSD": "B-AERO_USDT",
     "BTCUSD": "B-BTC_USDT",
     "LTCUSD": "B-LTC_USDT",
-    "AAVEUSD": "B-AAVE_USDT",
     "ICPUSD": "B-ICP_USDT",
     "KAITOUSD": "B-KAITO_USDT"
 }
