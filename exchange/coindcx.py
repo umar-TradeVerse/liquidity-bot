@@ -513,14 +513,18 @@ class CoinDCXClient:
                 "notification": "email_notification",
                 "time_in_force": "good_till_cancel",
                 "hidden": False,
-                "post_only": False,
-                "reduce_only": True
+                "post_only": False
+                # reduce_only intentionally omitted: CoinDCX rejects
+                # reduce_only on market orders with 400 "Reduce Only Order
+                # is only applicable for Limit Order". A plain opposite-side
+                # market order for the exact open quantity closes the
+                # position correctly without needing this flag.
             }
         }
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
-            logger.info(f"{symbol} | Position closed via reduce-only {close_side} market order")
+            logger.info(f"{symbol} | Position closed via {close_side} market order")
             return True
 
         logger.error(f"{symbol} | Failed to close position: {self.last_error}")
