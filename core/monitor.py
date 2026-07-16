@@ -14,14 +14,14 @@ alert-only, never auto-placed, regardless of how that first trade closes.
 
 BTC-regime tracking: BTCUSD is never traded here (see core/state.py) but
 its own price action relative to its PDH/PDL is classified into a daily
-regime (BULLISH/BEARISH/NEUTRAL) purely for logging/alert context.
-As of 2026-07-16 this no longer gates auto-entries on the other 9 symbols —
-repeated observation (SOL, KAITO, AERO, ICP) showed clean sweep-reversal
-setups getting suppressed while BTC regime itself was just chopping
-sideways rather than reflecting a real directional move. Regime is still
-computed and surfaced in every alert so this can be revisited later with
-a smarter (e.g. per-symbol correlation-aware, or extreme-move-only) gate
-if the data supports it.
+regime (BULLISH/BEARISH/NEUTRAL) purely for logging/alert context. This
+no longer gates auto-entries (removed 2026-07-16) — regime is still
+computed and surfaced in every alert for future reference.
+
+Concurrency: all symbols are polled and processed concurrently via
+asyncio.gather every cycle. Checking-then-reserving a MAX_CONCURRENT_POSITIONS
+slot is guarded by self._position_lock so two symbols signaling in the
+same poll cycle can't both slip past the cap before either registers.
 """
 
 import asyncio
@@ -104,6 +104,7 @@ class MarketMonitor:
         self._last_regime_candle_time = None
         self._open_positions: dict = {}
         self._trailing: dict = {}  # {symbol: {side, entry, sl}} — open positions awaiting exit
+        self._position_lock = asyncio.Lock()  # guards the check-and-reserve of a MAX_CONCURRENT_POSITIONS slot
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(IST)
@@ -135,8 +136,7 @@ class MarketMonitor:
     async def _update_regime(self):
         """Read-only — refreshes the BTC regime classification. BTC is
         never scanned for its own setups and never traded here. This
-        value is now informational only (see module docstring) and no
-        longer gates auto-entries."""
+        value is informational only and no longer gates auto-entries."""
         try:
             candle = await self.coindcx.get_latest_15m_candle(REGIME_SYMBOL)
             if not candle or self._last_regime_candle_time == candle['time']:
@@ -248,7 +248,30 @@ class MarketMonitor:
     async def _exit_position(self, symbol: str, tr: dict, exit_price: float, reason: str,
                               label: str, roe: Optional[float] = None):
         side = tr["side"]
-        quantity = self._open_positions.get(symbol, 0)
+
+        # Fetch the live position size directly from the exchange rather
+        # than trusting the locally cached _open_positions value, which is
+        # only refreshed once per loop and can drift from the true
+        # exchange-side quantity. This matters more now that close orders
+        # are plain market orders (no reduce_only cap) — they'll execute
+        # at whatever quantity they're given, even if that overshoots the
+        # real position and flips it to the opposite side.
+        try:
+            live_positions = await self.coindcx.get_open_positions()
+        except Exception as e:
+            logger.error(f"{symbol} | Failed to fetch live position before close: {e}", exc_info=True)
+            live_positions = {}
+
+        quantity = abs(live_positions.get(symbol, 0))
+
+        if quantity <= 0:
+            logger.warning(f"{symbol} | No live position found on exchange at exit time "
+                           f"(reason={reason}) — skipping close call, resetting local state only")
+            self.state.reset_symbol_watch(symbol)
+            self._trailing.pop(symbol, None)
+            self._open_positions.pop(symbol, None)
+            return
+
         success = await self.coindcx.close_position_market(symbol, side, quantity)
 
         roe_line = f"\n*ROE:* {roe:.2f}%" if roe is not None else ""
@@ -261,7 +284,7 @@ class MarketMonitor:
                 f"*Exit:* {exit_price:.4f}{roe_line}\n\n"
                 f"Position closed automatically."
             )
-            logger.info(f"{symbol} | Exited via {reason} at {exit_price:.4f}")
+            logger.info(f"{symbol} | Exited via {reason} at {exit_price:.4f} (qty {quantity})")
         else:
             await self.telegram.send_alert(
                 f"⚠️ *{label} — Close Failed*\n\n"
@@ -295,9 +318,7 @@ class MarketMonitor:
             )
             return
 
-        # BTC-regime — informational only, no longer gates execution (removed
-        # 2026-07-16 after repeated clean sweep-reversals on SOL/KAITO/AERO/ICP
-        # were suppressed while BTC regime was just chop, not a real trend).
+        # BTC-regime — informational only, no longer gates execution.
         regime = self.state.get_regime()
         counter_regime = (signal.side == 'BUY' and regime == 'BEARISH') or \
                           (signal.side == 'SELL' and regime == 'BULLISH')
@@ -305,28 +326,57 @@ class MarketMonitor:
             logger.info(f"{symbol} | {signal.side} setup — BTC regime is {regime} "
                        f"(informational only, proceeding with entry)")
 
-        open_count = len(self._open_positions)
-        if open_count >= MAX_CONCURRENT_POSITIONS:
-            logger.info(f"SKIPPED {symbol} — {open_count}/{MAX_CONCURRENT_POSITIONS} positions already open")
-            await self.telegram.send_alert(
-                f"⏭️ *Setup Skipped* — Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})\n\n"
-                f"*Symbol:* {symbol}\n*Side:* {signal.side}\n*Pattern:* {signal.pattern}\n"
-                f"*Would-be Entry:* {signal.entry_price:.4f}\n*Would-be SL:* {signal.sl_price:.4f}"
-            )
-            return
+        # Atomically check-and-reserve a MAX_CONCURRENT_POSITIONS slot.
+        # Without this lock, two symbols signaling in the same poll cycle
+        # (all symbols are processed concurrently via asyncio.gather) could
+        # both read the same open_count, both pass the check, and both
+        # place orders — exceeding the intended cap.
+        async with self._position_lock:
+            open_count = len(self._open_positions)
+            if open_count >= MAX_CONCURRENT_POSITIONS:
+                logger.info(f"SKIPPED {symbol} — {open_count}/{MAX_CONCURRENT_POSITIONS} positions already open")
+                await self.telegram.send_alert(
+                    f"⏭️ *Setup Skipped* — Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})\n\n"
+                    f"*Symbol:* {symbol}\n*Side:* {signal.side}\n*Pattern:* {signal.pattern}\n"
+                    f"*Would-be Entry:* {signal.entry_price:.4f}\n*Would-be SL:* {signal.sl_price:.4f}"
+                )
+                return
+            # Reserve the slot immediately with a placeholder so any other
+            # symbol's concurrent signal sees this slot as taken before the
+            # (async, possibly slow) order placement below completes.
+            self._open_positions[symbol] = 0
 
         regime_line = (f"\n*BTC Regime:* {regime} (counter-regime — proceeding anyway)"
                        if counter_regime else "")
 
-        await self.telegram.send_alert(
-            f"🔍 *Setup Detected*\n\n"
-            f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-            f"*Pattern:* {signal.pattern}\n*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-            f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{regime_line}\n\n⏳ Placing order..."
-        )
-
         try:
             margin_usd = float(os.getenv('TRADE_SIZE_USD', 30))
+
+            # Insufficient-funds pre-check — avoids wasting a valid signal
+            # on an order that will fail exchange-side (observed repeatedly
+            # on TAOUSD). Fails open: if balance can't be determined, the
+            # order is still attempted as before.
+            available = await self.coindcx.get_futures_wallet_balance()
+            if available is not None and available < margin_usd:
+                logger.warning(f"{symbol} | Skipping order — insufficient balance "
+                               f"(available ${available:.2f} < required ${margin_usd:.2f})")
+                await self.telegram.send_alert(
+                    f"⚠️ *Order Skipped — Insufficient Balance*\n\n"
+                    f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                    f"*Required Margin:* ${margin_usd:.2f}\n*Available:* ${available:.2f}\n\n"
+                    f"Setup was valid but there isn't enough free margin to open this trade. "
+                    f"Add funds or free up margin, then review manually on CoinDCX if you still want in."
+                )
+                self._open_positions.pop(symbol, None)  # release the reserved slot
+                return
+
+            await self.telegram.send_alert(
+                f"🔍 *Setup Detected*\n\n"
+                f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                f"*Pattern:* {signal.pattern}\n*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{regime_line}\n\n⏳ Placing order..."
+            )
+
             quantity = (margin_usd * TRADE_LEVERAGE) / signal.entry_price
 
             order_result = await self.coindcx.place_market_order(
@@ -347,7 +397,7 @@ class MarketMonitor:
                 self.state.mark_in_trade(symbol)
                 self.state.mark_auto_traded(symbol)
                 self._trailing[symbol] = {"side": signal.side, "entry": signal.entry_price, "sl": signal.sl_price}
-                self._open_positions[symbol] = quantity_filled
+                self._open_positions[symbol] = quantity_filled  # replace reservation with real filled quantity
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
                 tp_set = False
@@ -387,6 +437,7 @@ class MarketMonitor:
                     f"❌ *Order Failed*\n\n*Symbol:* {symbol}\n*Side:* {signal.side}\n"
                     f"*Error:* {_escape_md(error_msg)}\n\n⚠️ Manual intervention may be required."
                 )
+                self._open_positions.pop(symbol, None)  # release the reserved slot — order never went through
 
         except Exception as e:
             logger.error(f"{symbol} | Order exception: {e}", exc_info=True)
@@ -394,3 +445,4 @@ class MarketMonitor:
                 f"❌ *Order Exception*\n\n*Symbol:* {symbol}\n*Error:* {_escape_md(e)}\n\n"
                 f"⚠️ Manual intervention required."
             )
+            self._open_positions.pop(symbol, None)  # release the reserved slot on any failure path
