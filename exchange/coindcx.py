@@ -282,6 +282,57 @@ class CoinDCXClient:
         decimals = len(inc_str.split('.')[1]) if '.' in inc_str else 0
         return round(rounded, decimals)
 
+    async def get_futures_wallet_balance(self) -> Optional[float]:
+        """
+        Fetch available (free/unused) margin balance in USDT from the
+        futures wallet. Used as a pre-flight check before placing new
+        orders so a valid signal isn't wasted on an order that will
+        fail with 'Insufficient funds' (observed repeatedly on TAOUSD).
+
+        NOTE: field names below (available_balance / balance,
+        currency_short_name / currency) are a best-effort guess at
+        CoinDCX's futures wallet response shape and have NOT been
+        verified against a live response. If this logs the "could not
+        fetch" warning on every call, the parsing below needs to be
+        corrected to match the actual JSON keys CoinDCX returns —
+        check a raw response once and adjust. Until then this fails
+        open (returns None -> pre-check is skipped, trading proceeds
+        as before), it never blocks trading due to a parsing mismatch.
+        """
+        timestamp = int(time.time() * 1000)
+        body = {"timestamp": timestamp}
+        result = await self._post("/exchange/v1/derivatives/futures/wallets", body)
+
+        if not result:
+            logger.warning("Could not fetch futures wallet balance — "
+                           "proceeding without an insufficient-funds pre-check")
+            return None
+
+        if isinstance(result, list):
+            entries = result
+        elif isinstance(result, dict):
+            entries = result.get("wallets", result.get("data", []))
+        else:
+            entries = []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            currency = entry.get("currency_short_name") or entry.get("currency") or entry.get("asset")
+            if currency and currency.upper() == "USDT":
+                for key in ("available_balance", "available_margin", "free_balance", "balance"):
+                    if key in entry and entry[key] is not None:
+                        try:
+                            return float(entry[key])
+                        except (TypeError, ValueError):
+                            continue
+                logger.warning(f"USDT wallet entry found but no recognizable balance field: {entry}")
+                return None
+
+        logger.warning("USDT wallet entry not found in futures wallet response — "
+                       "proceeding without an insufficient-funds pre-check")
+        return None
+
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float, leverage: int = 5) -> Optional[dict]:
         coindcx_symbol = SYMBOL_MAP.get(symbol)
@@ -516,15 +567,16 @@ class CoinDCXClient:
                 "post_only": False
                 # reduce_only intentionally omitted: CoinDCX rejects
                 # reduce_only on market orders with 400 "Reduce Only Order
-                # is only applicable for Limit Order". A plain opposite-side
-                # market order for the exact open quantity closes the
-                # position correctly without needing this flag.
+                # is only applicable for Limit Order". Caller is now
+                # responsible for passing an accurate, freshly-fetched
+                # quantity (see monitor.py _exit_position) since there's
+                # no exchange-side cap protecting against overshoot.
             }
         }
 
         result = await self._post("/exchange/v1/derivatives/futures/orders/create", body)
         if result:
-            logger.info(f"{symbol} | Position closed via {close_side} market order")
+            logger.info(f"{symbol} | Position closed via {close_side} market order (qty {quantity})")
             return True
 
         logger.error(f"{symbol} | Failed to close position: {self.last_error}")
