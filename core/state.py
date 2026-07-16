@@ -9,7 +9,7 @@ import threading
 SYMBOLS = [
     "ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "AEROUSD",
     "LTCUSD",
-    "AAVEUSD", "ICPUSD", "KAITOUSD"
+    "ICPUSD", "KAITOUSD"
 ]
 
 REGIME_SYMBOL = "BTCUSD"
@@ -19,16 +19,13 @@ REGIME_SYMBOL = "BTCUSD"
 class DailyLevel:
     pdh: float
     pdl: float
-
     in_trade: bool = False
     auto_traded_today: bool = False
-
     pdh_state: str = "NONE"
     pdh_trigger: Optional[dict] = None
     pdh_event_active: bool = False
     pdh_sweep_extreme: Optional[float] = None
     pdh_day_extreme: Optional[float] = None
-
     pdl_state: str = "NONE"
     pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
