@@ -182,13 +182,16 @@ class CoinDCXClient:
 
         pdh = float(match["high"])
         pdl = float(match["low"])
-        logger.info(f"{symbol} | Previous day candle → H:{pdh} L:{pdl} V:{match.get('volume', 0)}")
+        po = float(match["open"])
+        pc = float(match["close"])
+        logger.info(f"{symbol} | Previous day candle → O:{po} H:{pdh} L:{pdl} C:{pc} "
+                    f"V:{match.get('volume', 0)}")
 
         return {
-            "open": float(match["open"]),
+            "open": po,
             "high": pdh,
             "low": pdl,
-            "close": float(match["close"]),
+            "close": pc,
             "volume": float(match.get("volume", 0)),
             "time": match["time"]
         }
@@ -283,20 +286,13 @@ class CoinDCXClient:
 
     async def get_futures_wallet_balance(self) -> Optional[float]:
         """
-        Fetch available (free/unused) margin balance in USDT from the
-        futures wallet. Used as a pre-flight check before placing new
-        orders so a valid signal isn't wasted on an order that will
-        fail with 'Insufficient funds' (observed repeatedly on TAOUSD).
-
-        NOTE: field names below (available_balance / balance,
-        currency_short_name / currency) are a best-effort guess at
-        CoinDCX's futures wallet response shape and have NOT been
-        verified against a live response. If this logs the "could not
-        fetch" warning on every call, the parsing below needs to be
-        corrected to match the actual JSON keys CoinDCX returns —
-        check a raw response once and adjust. Until then this fails
-        open (returns None -> pre-check is skipped, trading proceeds
-        as before), it never blocks trading due to a parsing mismatch.
+        Fetch available margin balance in USDT from the futures wallet.
+        KNOWN ISSUE (confirmed 2026-07-17): the endpoint below returns a 404
+        every time it's been called live. It fails open (returns None, the
+        insufficient-funds pre-check is skipped, trading proceeds as before)
+        so it causes no harm — left as-is per instruction, not yet fixed.
+        The correct endpoint/response shape still needs to be found from
+        CoinDCX's own docs or support before this will ever actually work.
         """
         timestamp = int(time.time() * 1000)
         body = {"timestamp": timestamp}
@@ -331,6 +327,38 @@ class CoinDCXClient:
         logger.warning("USDT wallet entry not found in futures wallet response — "
                        "proceeding without an insufficient-funds pre-check")
         return None
+
+    async def get_last_fill(self, symbol: str) -> Optional[dict]:
+        """
+        Fetch the most recent executed fill for this symbol's pair, used to
+        classify why a position closed (SL vs TP) when it was closed by a
+        resting exchange-side order rather than the bot's own _exit_position
+        call. Uses CoinDCX's documented /exchange/v1/derivatives/futures/trades
+        endpoint. Not yet exercised live — if it returns nothing useful,
+        check the actual response shape and adjust the parsing below.
+        """
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            return None
+
+        timestamp = int(time.time() * 1000)
+        body = {"pair": coindcx_symbol, "timestamp": timestamp}
+        result = await self._post("/exchange/v1/derivatives/futures/trades", body)
+
+        if not isinstance(result, list) or len(result) == 0:
+            return None
+
+        try:
+            trades = sorted(result, key=lambda t: float(t.get("timestamp", 0)), reverse=True)
+        except (TypeError, ValueError):
+            trades = result
+
+        latest = trades[0]
+        try:
+            return {"price": float(latest.get("price")), "side": latest.get("side"),
+                    "timestamp": latest.get("timestamp")}
+        except (TypeError, ValueError):
+            return None
 
     async def place_market_order(self, symbol: str, side: str, quantity: float,
                                 sl_price: float, leverage: int = 5) -> Optional[dict]:
@@ -564,12 +592,10 @@ class CoinDCXClient:
                 "time_in_force": "good_till_cancel",
                 "hidden": False,
                 "post_only": False
-                # reduce_only intentionally omitted: CoinDCX rejects
-                # reduce_only on market orders with 400 "Reduce Only Order
-                # is only applicable for Limit Order". Caller is now
-                # responsible for passing an accurate, freshly-fetched
-                # quantity (see monitor.py _exit_position) since there's
-                # no exchange-side cap protecting against overshoot.
+                # reduce_only intentionally omitted: CoinDCX rejects reduce_only
+                # on market orders with 400 "Reduce Only Order is only
+                # applicable for Limit Order". Caller must pass an accurate,
+                # freshly-fetched quantity (see monitor.py _exit_position).
             }
         }
 
