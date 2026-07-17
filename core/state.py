@@ -31,6 +31,16 @@ class DailyLevel:
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
     pdl_day_extreme: Optional[float] = None
+    # Trend bias, set once at the daily reset from yesterday's daily candle.
+    # "NONE" = sideways, keep the original dual-sided sweep-reversal logic.
+    # "DOWNTREND" = hunt sell-side liquidity (SHORT auto-trades, LONG alert-only).
+    # "UPTREND" = hunt buy-side liquidity (LONG auto-trades, SHORT alert-only).
+    trend_bias: str = "NONE"
+    # Dynamic re-anchored reference levels used only when trend_bias is set.
+    # Seeded from the counter-trend side's own confirmation candle the moment
+    # it fires, then tracked exactly like pdh_sweep_extreme/pdl_sweep_extreme.
+    trend_ref_high: Optional[float] = None
+    trend_ref_low: Optional[float] = None
 
 
 @dataclass
@@ -122,6 +132,10 @@ class BotState:
                 level.pdl_state = "NONE"
                 level.pdl_trigger = None
                 level.pdl_sweep_extreme = None
+                # trend_bias / trend_ref_high / trend_ref_low deliberately NOT
+                # reset here — they're a daily classification, not per-trade
+                # state, and must persist across position closes within the
+                # same day.
 
     def levels_ready(self) -> bool:
         return bool(self.levels) and all(v is not None for v in self.levels.values())
