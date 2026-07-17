@@ -4,19 +4,28 @@ Runs all 7 days a week, from 5:30 AM to 11:00 PM IST.
 
 Exit hierarchy for open positions, evaluated in strict priority order on
 every closed candle — first true condition wins:
-  1. Target reached (PDH for LONG / PDL for SHORT)           -> full close
-  2. Rejection candle within REJECTION_PROXIMITY_PCT of target -> full close
-  3. ROE (CoinDCX-reported) >= ROE_TARGET_PCT                 -> full close
+  1. Target reached (PDH for LONG / PDL for SHORT) -> full close.
+     SKIPPED for trend-mode (flip) trades — see note below.
+  2. Rejection candle within REJECTION_PROXIMITY_PCT of target -> full close.
+     Also skipped for trend-mode trades (depends on the same target).
+  3. ROE (CoinDCX-reported) >= ROE_TARGET_PCT -> full close.
+
+Trend-mode trades (the sell-side/buy-side liquidity flip, see strategy.py)
+deliberately skip priorities 1 and 2: their entry often already sits past
+the fixed daily PDH/PDL by design, so a fixed-target check would trigger
+a bogus near-immediate exit. These trades run on stop-loss + ROE only.
+This is a judgement call made when tracing 2026-07-17's real numbers —
+worth revisiting once there's more live data on how these trades behave.
 
 Rule 3 — one automatic trade per symbol per day: once a symbol has had
 one auto-placed trade today, any further clean setup on that symbol is
 alert-only, never auto-placed, regardless of how that first trade closes.
 
-BTC-regime tracking: BTCUSD is never traded here (see core/state.py) but
-its own price action relative to its PDH/PDL is classified into a daily
-regime (BULLISH/BEARISH/NEUTRAL) purely for logging/alert context. This
-no longer gates auto-entries (removed 2026-07-16) — regime is still
-computed and surfaced in every alert for future reference.
+Counter-trend signals (fighting today's trend_bias) are always alert-only,
+regardless of Rule 3.
+
+BTC-regime is informational only, logged and surfaced in alerts, no longer
+gates execution.
 
 Concurrency: all symbols are polled and processed concurrently via
 asyncio.gather every cycle. Checking-then-reserving a MAX_CONCURRENT_POSITIONS
@@ -45,10 +54,7 @@ DAY_END_MINUTE = 0
 TRADE_LEVERAGE = 5
 MAX_CONCURRENT_POSITIONS = 2
 
-# Priority 2 — how close to PDH/PDL counts as "approaching" the target.
 REJECTION_PROXIMITY_PCT = 0.01  # 1.0%
-
-# Priority 3 — CoinDCX's own reported ROE (% return on margin).
 ROE_TARGET_PCT = 7.0
 
 
@@ -60,8 +66,6 @@ def _escape_md(text) -> str:
 
 
 def _is_bearish_rejection(candle: dict) -> bool:
-    """Shooting Star / Bearish Pin Bar — long upper wick, small body near
-    the bottom of the range, bearish close. Used to exit a LONG."""
     body = abs(candle['close'] - candle['open'])
     upper_wick = candle['high'] - max(candle['open'], candle['close'])
     lower_wick = min(candle['open'], candle['close']) - candle['low']
@@ -71,7 +75,6 @@ def _is_bearish_rejection(candle: dict) -> bool:
 
 
 def _is_bullish_rejection(candle: dict) -> bool:
-    """Hammer / Bullish Pin Bar — mirror of the above. Used to exit a SHORT."""
     body = abs(candle['close'] - candle['open'])
     upper_wick = candle['high'] - max(candle['open'], candle['close'])
     lower_wick = min(candle['open'], candle['close']) - candle['low']
@@ -100,11 +103,11 @@ class MarketMonitor:
         self.state = state
         self.telegram = telegram
         self._last_candle_time = {sym: None for sym in SYMBOLS}
-        self._last_candle: dict = {}  # {symbol: last processed candle dict}, for engulfing checks
+        self._last_candle: dict = {}
         self._last_regime_candle_time = None
         self._open_positions: dict = {}
-        self._trailing: dict = {}  # {symbol: {side, entry, sl}} — open positions awaiting exit
-        self._position_lock = asyncio.Lock()  # guards the check-and-reserve of a MAX_CONCURRENT_POSITIONS slot
+        self._trailing: dict = {}
+        self._position_lock = asyncio.Lock()
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(IST)
@@ -134,9 +137,6 @@ class MarketMonitor:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def _update_regime(self):
-        """Read-only — refreshes the BTC regime classification. BTC is
-        never scanned for its own setups and never traded here. This
-        value is informational only and no longer gates auto-entries."""
         try:
             candle = await self.coindcx.get_latest_15m_candle(REGIME_SYMBOL)
             if not candle or self._last_regime_candle_time == candle['time']:
@@ -147,6 +147,31 @@ class MarketMonitor:
                        f"Regime now: {self.state.get_regime()}")
         except Exception as e:
             logger.error(f"{REGIME_SYMBOL} (regime ref) | update error: {e}", exc_info=True)
+
+    async def _classify_reconciled_exit(self, symbol: str) -> str:
+        tr = self._trailing.get(symbol)
+        if not tr:
+            return "reason unknown (no trailing data)"
+
+        try:
+            fill = await self.coindcx.get_last_fill(symbol)
+        except Exception as e:
+            logger.error(f"{symbol} | Failed to fetch last fill for exit classification: {e}")
+            return "reason unknown (fill lookup failed)"
+
+        if not fill or fill.get("price") is None:
+            return "reason unknown (no fill data returned)"
+
+        price = fill["price"]
+        sl = tr.get("sl")
+        tp = tr.get("tp")
+        tolerance = 0.005
+
+        if sl and abs(price - sl) / sl <= tolerance:
+            return f"Stop Loss hit (fill ~{price:.4f} vs SL {sl:.4f})"
+        if tp and abs(price - tp) / tp <= tolerance:
+            return f"Take Profit hit (fill ~{price:.4f} vs TP {tp:.4f})"
+        return f"unclear — fill ~{price:.4f} (entry {tr.get('entry')}, SL {sl}, TP {tp})"
 
     async def _reconcile_positions(self):
         try:
@@ -160,12 +185,14 @@ class MarketMonitor:
         for symbol in SYMBOLS:
             level = self.state.get_level(symbol)
             if level and level.in_trade and symbol not in positions:
+                reason_line = await self._classify_reconciled_exit(symbol)
                 self.state.reset_symbol_watch(symbol)
                 self._trailing.pop(symbol, None)
-                logger.info(f"{symbol} | Position closed — resuming watch for fresh setups")
+                logger.info(f"{symbol} | Position closed ({reason_line}) — resuming watch for fresh setups")
                 await self.telegram.send_alert(
                     f"🔄 *Position Closed*\n\n"
                     f"*Symbol:* {symbol}\n"
+                    f"*Likely reason:* {reason_line}\n\n"
                     f"Resuming watch for fresh liquidity setups on this symbol."
                 )
 
@@ -197,8 +224,6 @@ class MarketMonitor:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
     async def _check_exit_conditions(self, symbol: str, candle: dict, prev_candle: Optional[dict]):
-        """Priority 1 -> 2 -> 3, first true condition wins, checked in
-        that exact order every closed candle."""
         tr = self._trailing.get(symbol)
         if not tr:
             return
@@ -208,36 +233,35 @@ class MarketMonitor:
 
         side = tr["side"]
         target = level.pdh if side == 'BUY' else level.pdl
+        skip_target_priorities = tr.get("trend_mode", False)
 
-        # Priority 1 — target reached
-        if side == 'BUY' and candle['high'] >= target:
-            await self._exit_position(symbol, tr, exit_price=target, reason="target_achieved",
-                                       label="Take Profit – Target Achieved")
-            return
-        if side == 'SELL' and candle['low'] <= target:
-            await self._exit_position(symbol, tr, exit_price=target, reason="target_achieved",
-                                       label="Take Profit – Target Achieved")
-            return
-
-        # Priority 2 — rejection candle, only while within proximity of target
-        near_target = (candle['high'] >= target * (1 - REJECTION_PROXIMITY_PCT) if side == 'BUY'
-                       else candle['low'] <= target * (1 + REJECTION_PROXIMITY_PCT))
-
-        if near_target:
-            rejection = False
-            if side == 'BUY':
-                rejection = _is_bearish_rejection(candle) or (
-                    prev_candle is not None and _is_bearish_engulfing(prev_candle, candle))
-            else:
-                rejection = _is_bullish_rejection(candle) or (
-                    prev_candle is not None and _is_bullish_engulfing(prev_candle, candle))
-
-            if rejection:
-                await self._exit_position(symbol, tr, exit_price=candle['close'],
-                                           reason="rejection_exit", label="Take Profit – Rejection Exit")
+        if not skip_target_priorities:
+            if side == 'BUY' and candle['high'] >= target:
+                await self._exit_position(symbol, tr, exit_price=target, reason="target_achieved",
+                                           label="Take Profit – Target Achieved")
+                return
+            if side == 'SELL' and candle['low'] <= target:
+                await self._exit_position(symbol, tr, exit_price=target, reason="target_achieved",
+                                           label="Take Profit – Target Achieved")
                 return
 
-        # Priority 3 — CoinDCX-reported ROE
+            near_target = (candle['high'] >= target * (1 - REJECTION_PROXIMITY_PCT) if side == 'BUY'
+                           else candle['low'] <= target * (1 + REJECTION_PROXIMITY_PCT))
+
+            if near_target:
+                rejection = False
+                if side == 'BUY':
+                    rejection = _is_bearish_rejection(candle) or (
+                        prev_candle is not None and _is_bearish_engulfing(prev_candle, candle))
+                else:
+                    rejection = _is_bullish_rejection(candle) or (
+                        prev_candle is not None and _is_bullish_engulfing(prev_candle, candle))
+
+                if rejection:
+                    await self._exit_position(symbol, tr, exit_price=candle['close'],
+                                               reason="rejection_exit", label="Take Profit – Rejection Exit")
+                    return
+
         details = await self.coindcx.get_position_details(symbol)
         if details and details.get("roe") is not None and details["roe"] >= ROE_TARGET_PCT:
             await self._exit_position(symbol, tr, exit_price=candle['close'],
@@ -249,13 +273,6 @@ class MarketMonitor:
                               label: str, roe: Optional[float] = None):
         side = tr["side"]
 
-        # Fetch the live position size directly from the exchange rather
-        # than trusting the locally cached _open_positions value, which is
-        # only refreshed once per loop and can drift from the true
-        # exchange-side quantity. This matters more now that close orders
-        # are plain market orders (no reduce_only cap) — they'll execute
-        # at whatever quantity they're given, even if that overshoots the
-        # real position and flips it to the opposite side.
         try:
             live_positions = await self.coindcx.get_open_positions()
         except Exception as e:
@@ -302,7 +319,6 @@ class MarketMonitor:
         symbol = signal.symbol
         level = self.state.get_level(symbol)
 
-        # Rule 3 — one automatic trade per symbol per day.
         if level and level.auto_traded_today:
             logger.info(f"{symbol} | Fresh {signal.side} setup, but today's auto-trade "
                        f"already used — alert only")
@@ -318,19 +334,25 @@ class MarketMonitor:
             )
             return
 
-        # BTC-regime — informational only, no longer gates execution.
+        if signal.counter_trend:
+            logger.info(f"{symbol} | {signal.side} setup fights today's {level.trend_bias} "
+                       f"bias — alert only")
+            await self.telegram.send_alert(
+                f"⚠️ *New Liquidity Setup Detected*\n\n"
+                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
+                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n\n"
+                f"*Reason:* Today's bias is {level.trend_bias} — this setup fights that bias. "
+                f"No auto-entry executed."
+            )
+            return
+
         regime = self.state.get_regime()
-        counter_regime = (signal.side == 'BUY' and regime == 'BEARISH') or \
-                          (signal.side == 'SELL' and regime == 'BULLISH')
-        if counter_regime:
+        btc_counter = (signal.side == 'BUY' and regime == 'BEARISH') or \
+                      (signal.side == 'SELL' and regime == 'BULLISH')
+        if btc_counter:
             logger.info(f"{symbol} | {signal.side} setup — BTC regime is {regime} "
                        f"(informational only, proceeding with entry)")
 
-        # Atomically check-and-reserve a MAX_CONCURRENT_POSITIONS slot.
-        # Without this lock, two symbols signaling in the same poll cycle
-        # (all symbols are processed concurrently via asyncio.gather) could
-        # both read the same open_count, both pass the check, and both
-        # place orders — exceeding the intended cap.
         async with self._position_lock:
             open_count = len(self._open_positions)
             if open_count >= MAX_CONCURRENT_POSITIONS:
@@ -341,21 +363,13 @@ class MarketMonitor:
                     f"*Would-be Entry:* {signal.entry_price:.4f}\n*Would-be SL:* {signal.sl_price:.4f}"
                 )
                 return
-            # Reserve the slot immediately with a placeholder so any other
-            # symbol's concurrent signal sees this slot as taken before the
-            # (async, possibly slow) order placement below completes.
             self._open_positions[symbol] = 0
 
-        regime_line = (f"\n*BTC Regime:* {regime} (counter-regime — proceeding anyway)"
-                       if counter_regime else "")
+        trend_line = f"\n*Trend bias:* {level.trend_bias}" if level.trend_bias != "NONE" else ""
 
         try:
             margin_usd = float(os.getenv('TRADE_SIZE_USD', 30))
 
-            # Insufficient-funds pre-check — avoids wasting a valid signal
-            # on an order that will fail exchange-side (observed repeatedly
-            # on TAOUSD). Fails open: if balance can't be determined, the
-            # order is still attempted as before.
             available = await self.coindcx.get_futures_wallet_balance()
             if available is not None and available < margin_usd:
                 logger.warning(f"{symbol} | Skipping order — insufficient balance "
@@ -364,17 +378,17 @@ class MarketMonitor:
                     f"⚠️ *Order Skipped — Insufficient Balance*\n\n"
                     f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Required Margin:* ${margin_usd:.2f}\n*Available:* ${available:.2f}\n\n"
-                    f"Setup was valid but there isn't enough free margin to open this trade. "
-                    f"Add funds or free up margin, then review manually on CoinDCX if you still want in."
+                    f"Setup was valid but there isn't enough free margin to open this trade."
                 )
-                self._open_positions.pop(symbol, None)  # release the reserved slot
+                self._open_positions.pop(symbol, None)
                 return
 
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                f"*Pattern:* {signal.pattern}\n*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{regime_line}\n\n⏳ Placing order..."
+                f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}\n"
+                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{trend_line}\n\n⏳ Placing order..."
             )
 
             quantity = (margin_usd * TRADE_LEVERAGE) / signal.entry_price
@@ -396,35 +410,42 @@ class MarketMonitor:
                 self.state.register_trade(record)
                 self.state.mark_in_trade(symbol)
                 self.state.mark_auto_traded(symbol)
-                self._trailing[symbol] = {"side": signal.side, "entry": signal.entry_price, "sl": signal.sl_price}
-                self._open_positions[symbol] = quantity_filled  # replace reservation with real filled quantity
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
+                self._trailing[symbol] = {"side": signal.side, "entry": signal.entry_price,
+                                           "sl": signal.sl_price, "tp": tp_price,
+                                           "trend_mode": signal.trend_mode}
+                self._open_positions[symbol] = quantity_filled
+
                 tp_set = False
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(1.5)
-                    tp_set = await self.coindcx.update_position_tpsl(symbol, tp_price=tp_price)
-                    if tp_set:
-                        break
-                    logger.warning(f"{symbol} | TP set attempt {attempt + 1}/3 failed — "
-                                   f"position may not be registered on the exchange yet")
-                tp_note = (f"🎯 Resting take-profit set at {tp_price:.4f} (Priority 1 target)."
-                          if tp_set else
-                          f"⚠️ Could not set a resting take-profit order — Priority 1 will still "
-                          f"be enforced by the bot on each closed candle, with possible minor "
-                          f"slippage. Check CoinDCX manually if concerned.")
+                if not signal.trend_mode:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(1.5)
+                        tp_set = await self.coindcx.update_position_tpsl(symbol, tp_price=tp_price)
+                        if tp_set:
+                            break
+                        logger.warning(f"{symbol} | TP set attempt {attempt + 1}/3 failed — "
+                                       f"position may not be registered on the exchange yet")
+
+                if signal.trend_mode:
+                    tp_note = ("🎯 Trend-aligned trade — no fixed resting TP set (target would sit "
+                              "behind entry). Exit runs on stop-loss + ROE protection only.")
+                else:
+                    tp_note = (f"🎯 Resting take-profit set at {tp_price:.4f} (Priority 1 target)."
+                              if tp_set else
+                              f"⚠️ Could not set a resting take-profit order — Priority 1 will still "
+                              f"be enforced by the bot on each closed candle, with possible minor "
+                              f"slippage. Check CoinDCX manually if concerned.")
 
                 msg = (
                     f"✅ *Trade Executed*\n\n"
                     f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                    f"*Target (PDH/PDL):* {tp_price:.4f}\n"
                     f"*Margin:* ${margin_usd:.2f}\n*Leverage:* {TRADE_LEVERAGE}x\n"
                     f"*Exposure:* ${margin_usd * TRADE_LEVERAGE:.2f}\n*Quantity:* {quantity_filled}\n"
                     f"*Order ID:* `{order_id}`\n*Open positions:* {len(self._open_positions)}/{MAX_CONCURRENT_POSITIONS}\n\n"
                     f"{tp_note}\n\n"
-                    f"Exit hierarchy active: Target → Rejection Candle → 7% ROE.\n"
                     f"🔄 Today's auto-trade for this symbol has now been used — further setups will be alert-only."
                 )
                 await self.telegram.send_alert(msg)
@@ -437,7 +458,7 @@ class MarketMonitor:
                     f"❌ *Order Failed*\n\n*Symbol:* {symbol}\n*Side:* {signal.side}\n"
                     f"*Error:* {_escape_md(error_msg)}\n\n⚠️ Manual intervention may be required."
                 )
-                self._open_positions.pop(symbol, None)  # release the reserved slot — order never went through
+                self._open_positions.pop(symbol, None)
 
         except Exception as e:
             logger.error(f"{symbol} | Order exception: {e}", exc_info=True)
@@ -445,4 +466,4 @@ class MarketMonitor:
                 f"❌ *Order Exception*\n\n*Symbol:* {symbol}\n*Error:* {_escape_md(e)}\n\n"
                 f"⚠️ Manual intervention required."
             )
-            self._open_positions.pop(symbol, None)  # release the reserved slot on any failure path
+            self._open_positions.pop(symbol, None)
