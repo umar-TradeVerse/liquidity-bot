@@ -31,10 +31,13 @@ class DailyLevel:
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
     pdl_day_extreme: Optional[float] = None
-    # Trend bias, set once at the daily reset from yesterday's daily candle.
-    # "NONE" = sideways, keep the original dual-sided sweep-reversal logic.
-    # "DOWNTREND" = hunt sell-side liquidity (SHORT auto-trades, LONG alert-only).
-    # "UPTREND" = hunt buy-side liquidity (LONG auto-trades, SHORT alert-only).
+    # Trend bias, set once at the daily reset from the last 3 daily candles.
+    # "NONE" = sideways OR a matured/exhausted trend (2+ consecutive same-
+    # direction days) — keep the original dual-sided sweep-reversal logic.
+    # "DOWNTREND" = a single fresh bearish day — hunt sell-side liquidity
+    # (SHORT auto-trades, LONG alert-only).
+    # "UPTREND" = a single fresh bullish day — hunt buy-side liquidity
+    # (LONG auto-trades, SHORT alert-only).
     trend_bias: str = "NONE"
     # Dynamic re-anchored reference levels used only when trend_bias is set.
     # Seeded from the counter-trend side's own confirmation candle the moment
