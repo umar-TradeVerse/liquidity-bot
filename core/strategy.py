@@ -26,6 +26,10 @@ BASE MECHANICS (unchanged from the original design), applied against
   5. Invalidation — close breaks back through the trigger's other side
      first — scrapped, re-arms immediately.
 
+  If price never breaks PDH or PDL at all — stays inside the previous
+  day's range — no sweep ever arms on either side, and no trade is
+  taken. This is inherent to the mechanics above, not a separate rule.
+
 FRESH-SWEEP QUALITY GATES (apply only to the NONE->SWEPT transition,
 not to the seeding of a trend-flip, which bypasses these deliberately
 since it's a direct hand-off from an already-validated confirmation):
@@ -35,14 +39,25 @@ since it's a direct hand-off from an already-validated confirmation):
     candle's range never arms a fresh sweep (low conviction).
 
 TREND-FLIP MECHANIC (validated against 2026-07-17 real trades — ETH,
-SOL, XRP all traced to ~2.8-3R winners using this exact logic, and the
-mirror shape confirmed visually against LTC's 2026-07-14 uptrend):
+SOL, XRP all traced to ~2.8-3R winners using this exact logic):
 
   trend_bias is classified once per symbol at the daily reset, from
-  yesterday's own daily candle body relative to its full range
-  (TREND_BODY_RATIO_THRESHOLD). A decisively bearish daily candle sets
-  DOWNTREND; decisively bullish sets UPTREND; anything smaller-bodied
-  stays NONE (sideways — original dual-sided logic, untouched).
+  the last 3 COMPLETE daily candles (today's in-progress candle
+  excluded). Each of the 3 days is classified UP / DOWN / SIDEWAYS by
+  the same decisive-body-ratio test (TREND_BODY_RATIO_THRESHOLD).
+
+  If the most recent complete day (day-1) is decisively UP or DOWN,
+  AND the day before it (day-2) was the SAME direction — i.e. 2+
+  consecutive same-direction trend days — the move is treated as
+  likely maturing/exhausted, and trend_bias is set to NONE: the
+  original dual-sided sweep-reversal logic handles today, which is
+  exactly the case this correction was built for (see the 2026-07-19
+  ICPUSD failure: two consecutive bullish days were followed by a
+  genuine reversal day that the single-day version misread as a
+  continuation).
+
+  If day-1 is decisive and day-2 differs (or isn't decisive itself),
+  this is a single FRESH trend day, and the flip is applied:
 
   In DOWNTREND: the PDL (buy-side) sweep-reversal machinery still runs
   exactly as before and still requires all the same gates — but its
@@ -60,7 +75,9 @@ mirror shape confirmed visually against LTC's 2026-07-14 uptrend):
   moment it confirms, its own low seeds trend_ref_low, kick-starting the
   PDL-side (buy-side liquidity / LONG) hunt from there.
 
-No indicators, no pattern matching beyond what's described above.
+No indicators, no pattern matching beyond what's described above. No
+breakout logic of any kind — this engine only ever trades liquidity
+sweeps, on either the fixed daily level or a trend-re-anchored one.
 """
 
 import logging
@@ -76,6 +93,10 @@ REJECTION_WICK_RATIO = 2.0           # wick must be >= 2x body to fast-path the 
 TREND_BODY_RATIO_THRESHOLD = 0.5     # UNVALIDATED placeholder — daily body must
                                      # cover >= 50% of the day's full range to
                                      # count as a decisive trend day
+TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
+                                     # for classification (day-1/day-2 are the
+                                     # ones actually used right now; day-3 is
+                                     # fetched and available for future tuning)
 
 
 class Signal:
@@ -105,6 +126,18 @@ def _is_inside_bar(candle: dict, prev_candle: Optional[dict]) -> bool:
     return candle['high'] <= prev_candle['high'] and candle['low'] >= prev_candle['low']
 
 
+def _classify_day(c: dict) -> str:
+    """UP / DOWN / SIDEWAYS for one completed daily candle."""
+    body = abs(c['close'] - c['open'])
+    day_range = c['high'] - c['low']
+    ratio = (body / day_range) if day_range > 0 else 0
+    if c['close'] < c['open'] and ratio >= TREND_BODY_RATIO_THRESHOLD:
+        return "DOWN"
+    elif c['close'] > c['open'] and ratio >= TREND_BODY_RATIO_THRESHOLD:
+        return "UP"
+    return "SIDEWAYS"
+
+
 class StrategyEngine:
     def __init__(self, coindcx: CoinDCXClient, state: BotState):
         self.coindcx = coindcx
@@ -124,19 +157,33 @@ class StrategyEngine:
                     )
                     level = self.state.get_level(symbol)
 
-                    body = abs(prev_candle['close'] - prev_candle['open'])
-                    day_range = prev_candle['high'] - prev_candle['low']
-                    body_ratio = (body / day_range) if day_range > 0 else 0
+                    recent_days = await self.coindcx.get_recent_daily_candles(
+                        symbol, n=TREND_LOOKBACK_DAYS
+                    )
+                    classifications = [_classify_day(c) for c in recent_days]
+                    day1 = classifications[-1] if len(classifications) >= 1 else "SIDEWAYS"
+                    day2 = classifications[-2] if len(classifications) >= 2 else None
 
-                    if prev_candle['close'] < prev_candle['open'] and body_ratio >= TREND_BODY_RATIO_THRESHOLD:
-                        level.trend_bias = "DOWNTREND"
-                    elif prev_candle['close'] > prev_candle['open'] and body_ratio >= TREND_BODY_RATIO_THRESHOLD:
+                    if day1 in ("UP", "DOWN") and day2 == day1:
+                        # 2+ consecutive same-direction trend days — likely
+                        # maturing/exhausted. Revert to NONE so the ordinary
+                        # dual-sided liquidity-sweep logic handles today,
+                        # rather than extrapolating the trend forward again.
+                        level.trend_bias = "NONE"
+                        bias_note = f"{day1},{day1} consecutive — treating as matured/exhausted, reverting to NONE"
+                    elif day1 == "UP":
                         level.trend_bias = "UPTREND"
+                        bias_note = "single fresh UP day — flip active"
+                    elif day1 == "DOWN":
+                        level.trend_bias = "DOWNTREND"
+                        bias_note = "single fresh DOWN day — flip active"
                     else:
                         level.trend_bias = "NONE"
+                        bias_note = "day-1 not decisive — sideways"
 
                     logger.info(f"{symbol} | PDH: {prev_candle['high']} | PDL: {prev_candle['low']} "
-                                f"| Trend bias: {level.trend_bias} (body_ratio={body_ratio:.2f})")
+                                f"| Trend bias: {level.trend_bias} ({bias_note}) "
+                                f"| last {len(classifications)} days: {classifications}")
                     success_count += 1
                 else:
                     logger.error(f"{symbol} | Failed to get previous day candle")
@@ -168,8 +215,6 @@ class StrategyEngine:
 
         pdh = level.pdh
         pdl = level.pdl
-        # Effective levels: dynamic re-anchored reference when a trend is
-        # active on that side, otherwise the fixed daily level.
         effective_pdh = level.trend_ref_high if (level.trend_bias == "DOWNTREND" and level.trend_ref_high is not None) else pdh
         effective_pdl = level.trend_ref_low if (level.trend_bias == "UPTREND" and level.trend_ref_low is not None) else pdl
 
@@ -258,10 +303,6 @@ class StrategyEngine:
 
                         # UPTREND mirror: this counter-trend SHORT confirmation
                         # is the seed for the buy-side liquidity LONG hunt.
-                        # The confirming candle just made a fresh low by
-                        # definition — kick-start the PDL-side state machine
-                        # against it directly, bypassing the normal fresh-sweep
-                        # depth/inside-bar gates (hand-off, not a new sweep).
                         if counter and level.trend_bias == "UPTREND":
                             seed_low = candle['low']
                             if level.trend_ref_low is None or seed_low < level.trend_ref_low:
@@ -358,12 +399,8 @@ class StrategyEngine:
                         level.pdl_sweep_extreme = None
                         level.pdl_event_active = True
 
-                        # DOWNTREND: this counter-trend LONG confirmation is the
-                        # seed for the sell-side liquidity SHORT hunt. The
-                        # confirming candle just made a fresh high by
-                        # definition — kick-start the PDH-side state machine
-                        # against it directly, bypassing the normal fresh-sweep
-                        # depth/inside-bar gates (hand-off, not a new sweep).
+                        # DOWNTREND: this counter-trend LONG confirmation is
+                        # the seed for the sell-side liquidity SHORT hunt.
                         if counter and level.trend_bias == "DOWNTREND":
                             seed_high = candle['high']
                             if level.trend_ref_high is None or seed_high > level.trend_ref_high:
