@@ -6,7 +6,12 @@ Exit hierarchy for open positions, evaluated in strict priority order on
 every closed candle — first true condition wins:
   1. Target reached (PDH for LONG / PDL for SHORT) -> full close.
      SKIPPED for trend-mode (flip) trades — see note below.
-  2. Rejection candle within REJECTION_PROXIMITY_PCT of target -> full close.
+  2. Rejection candle within REJECTION_PROXIMITY_PCT of target, AND the
+     close is actually favorable versus entry -> full close. The
+     profitability check was added after a real case (XRPUSD,
+     2026-07-19) where this fired as a "Take Profit" while the position
+     was actually underwater — the old logic only checked proximity and
+     candle shape, never whether the trade was in profit at all.
      Also skipped for trend-mode trades (depends on the same target).
   3. ROE (CoinDCX-reported) >= ROE_TARGET_PCT -> full close.
 
@@ -14,8 +19,6 @@ Trend-mode trades (the sell-side/buy-side liquidity flip, see strategy.py)
 deliberately skip priorities 1 and 2: their entry often already sits past
 the fixed daily PDH/PDL by design, so a fixed-target check would trigger
 a bogus near-immediate exit. These trades run on stop-loss + ROE only.
-This is a judgement call made when tracing 2026-07-17's real numbers —
-worth revisiting once there's more live data on how these trades behave.
 
 Rule 3 — one automatic trade per symbol per day: once a symbol has had
 one auto-placed trade today, any further clean setup on that symbol is
@@ -26,6 +29,13 @@ regardless of Rule 3.
 
 BTC-regime is informational only, logged and surfaced in alerts, no longer
 gates execution.
+
+Margin cap: CoinDCX's futures wallet-balance endpoint has been confirmed
+broken (404) since 2026-07-17, so the insufficient-funds pre-check no
+longer depends on it. Instead the bot tracks its own committed margin
+(positions already open x margin per trade) against an optional,
+manually-configured TOTAL_ACCOUNT_MARGIN_USD env var. Unset or 0 disables
+the check entirely.
 
 Concurrency: all symbols are polled and processed concurrently via
 asyncio.gather every cycle. Checking-then-reserving a MAX_CONCURRENT_POSITIONS
@@ -257,7 +267,14 @@ class MarketMonitor:
                     rejection = _is_bullish_rejection(candle) or (
                         prev_candle is not None and _is_bullish_engulfing(prev_candle, candle))
 
-                if rejection:
+                # Only fire as a profit-taking exit if the close is actually
+                # favorable versus entry — otherwise it's just a rejection
+                # candle near the target while underwater, not a real "Take
+                # Profit" event. Fall through to ROE/stop-loss instead.
+                is_profitable = (candle['close'] > tr['entry'] if side == 'BUY'
+                                  else candle['close'] < tr['entry'])
+
+                if rejection and is_profitable:
                     await self._exit_position(symbol, tr, exit_price=candle['close'],
                                                reason="rejection_exit", label="Take Profit – Rejection Exit")
                     return
@@ -370,18 +387,25 @@ class MarketMonitor:
         try:
             margin_usd = float(os.getenv('TRADE_SIZE_USD', 30))
 
-            available = await self.coindcx.get_futures_wallet_balance()
-            if available is not None and available < margin_usd:
-                logger.warning(f"{symbol} | Skipping order — insufficient balance "
-                               f"(available ${available:.2f} < required ${margin_usd:.2f})")
-                await self.telegram.send_alert(
-                    f"⚠️ *Order Skipped — Insufficient Balance*\n\n"
-                    f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                    f"*Required Margin:* ${margin_usd:.2f}\n*Available:* ${available:.2f}\n\n"
-                    f"Setup was valid but there isn't enough free margin to open this trade."
-                )
-                self._open_positions.pop(symbol, None)
-                return
+            # Margin cap — internally tracked, does NOT depend on the broken
+            # CoinDCX wallet-balance endpoint. Set TOTAL_ACCOUNT_MARGIN_USD in
+            # Railway env vars to enable; unset or 0 disables this check.
+            total_margin_cap = float(os.getenv('TOTAL_ACCOUNT_MARGIN_USD', 0))
+            if total_margin_cap > 0:
+                committed_margin = len(self._open_positions) * margin_usd
+                if committed_margin > total_margin_cap:
+                    logger.warning(f"{symbol} | Skipping order — would exceed configured "
+                                   f"margin cap (committed ${committed_margin:.2f} > "
+                                   f"cap ${total_margin_cap:.2f})")
+                    await self.telegram.send_alert(
+                        f"⚠️ *Order Skipped — Margin Cap Reached*\n\n"
+                        f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                        f"*Committed if opened:* ${committed_margin:.2f}\n"
+                        f"*Configured cap:* ${total_margin_cap:.2f}\n\n"
+                        f"Setup was valid but would exceed your configured TOTAL_ACCOUNT_MARGIN_USD."
+                    )
+                    self._open_positions.pop(symbol, None)
+                    return
 
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
