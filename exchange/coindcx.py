@@ -196,49 +196,61 @@ class CoinDCXClient:
             "time": match["time"]
         }
 
-    async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
+    async def get_recent_daily_candles(self, symbol: str, n: int = 3) -> list:
+        """
+        Returns the last n COMPLETE daily candles (today's in-progress candle
+        excluded), oldest first, for multi-day trend classification. Reuses
+        the same endpoint/params as get_previous_day_candle rather than making
+        a second kind of call — just keeps more of the response instead of
+        discarding everything but "yesterday".
+        """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
-            logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping")
-            return None
+            logger.error(f"Unknown symbol: {symbol}")
+            return []
 
-        now_ts = int(time.time() * 1000)
-        start_ts = now_ts - (7200 * 1000)
+        now_ist = datetime.now(IST)
+        start_ts = int((now_ist - timedelta(days=15)).timestamp() * 1000)
+        end_ts = int(now_ist.timestamp() * 1000)
 
         params = {
             "pair": coindcx_symbol,
-            "interval": "15m",
+            "interval": "1d",
             "from": start_ts,
-            "to": now_ts,
-            "limit": 10
+            "to": end_ts,
+            "limit": 20
         }
 
         result = await self._get("/market_data/candles", params=params)
-
         if not result or not isinstance(result, list) or len(result) == 0:
-            logger.warning(f"{symbol} | Empty/None response from 15m candles endpoint")
-            return None
+            logger.error(f"{symbol} | No daily candle data returned for trend classification")
+            return []
 
-        try:
-            candles = sorted(result, key=lambda c: int(c["time"]))
-        except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"{symbol} | Failed to sort 15m candles: {e}")
-            return None
+        today_date = now_ist.date()
+        parsed = []
+        for c in result:
+            try:
+                c_date = datetime.fromtimestamp(int(c["time"]) / 1000, IST).date()
+                if c_date >= today_date:
+                    continue  # exclude today's still-forming candle
+                parsed.append({
+                    "date": c_date,
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low": float(c["low"]),
+                    "close": float(c["close"]),
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
 
-        if len(candles) < 2:
-            logger.warning(f"{symbol} | Only {len(candles)} candle(s) returned, need >=2")
-            return None
+        parsed.sort(key=lambda c: c["date"])
+        recent = parsed[-n:] if len(parsed) >= n else parsed
 
-        c = candles[-2]
+        if len(recent) < n:
+            logger.warning(f"{symbol} | Only {len(recent)}/{n} complete daily candles "
+                           f"available for trend classification")
 
-        return {
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"]),
-            "volume": float(c.get("volume", 0)),
-            "time": c["time"]
-        }
+        return recent
 
     async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
         if coindcx_symbol in self._instrument_cache:
@@ -288,11 +300,10 @@ class CoinDCXClient:
         """
         Fetch available margin balance in USDT from the futures wallet.
         KNOWN ISSUE (confirmed 2026-07-17): the endpoint below returns a 404
-        every time it's been called live. It fails open (returns None, the
-        insufficient-funds pre-check is skipped, trading proceeds as before)
-        so it causes no harm — left as-is per instruction, not yet fixed.
-        The correct endpoint/response shape still needs to be found from
-        CoinDCX's own docs or support before this will ever actually work.
+        every time it's been called live. No longer called from monitor.py —
+        replaced there by an internally-tracked margin cap that doesn't
+        depend on this endpoint at all. Left in place unused in case the
+        correct endpoint/shape is ever found and this becomes usable again.
         """
         timestamp = int(time.time() * 1000)
         body = {"timestamp": timestamp}
@@ -334,8 +345,7 @@ class CoinDCXClient:
         classify why a position closed (SL vs TP) when it was closed by a
         resting exchange-side order rather than the bot's own _exit_position
         call. Uses CoinDCX's documented /exchange/v1/derivatives/futures/trades
-        endpoint. Not yet exercised live — if it returns nothing useful,
-        check the actual response shape and adjust the parsing below.
+        endpoint.
         """
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
