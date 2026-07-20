@@ -201,6 +201,38 @@ class StrategyEngine:
             except Exception as e:
                 logger.error(f"{symbol} | fetch_and_set_levels error: {e}")
 
+        # Reconcile against ANY real open positions on the exchange, so a
+        # position still open across today's reset (or a mid-day restart) is
+        # not treated as a blank slate — which would let the bot place a
+        # duplicate trade on top of it (this happened for real on 2026-07-20:
+        # a redeploy wiped BotState while KAITOUSD and XRPUSD were still open).
+        # IMPORTANT LIMITATION: this only prevents a duplicate ENTRY. It does
+        # NOT restore this bot's own exit-hierarchy tracking (ROE protection,
+        # rejection-exit, trend-mode target-skip) for a carried-over position
+        # — that tracking lives in monitor.py's in-memory _trailing dict,
+        # which a reset also wipes, and reconstructing it would need the
+        # original entry/SL/TP/trend_mode, which aren't reliably recoverable
+        # from the exchange alone. Only the exchange-side resting stop-loss
+        # protects a carried-over position going forward.
+        try:
+            open_positions = await self.coindcx.get_open_positions()
+            for symbol, qty in open_positions.items():
+                level = self.state.get_level(symbol)
+                if level and qty != 0:
+                    level.in_trade = True
+                    level.auto_traded_today = True
+                    logger.warning(f"{symbol} | Real open position found at reset "
+                                   f"(qty {qty}) — marked in_trade/auto_traded_today "
+                                   f"to prevent a duplicate order today. This bot's "
+                                   f"own ROE-protection/rejection-exit tracking is NOT "
+                                   f"restored for this position — only its exchange-side "
+                                   f"stop-loss is currently protecting it.")
+        except Exception as e:
+            logger.error(f"Failed to reconcile open positions at reset: {e} — if any "
+                        f"symbol has a real open position right now, it may be treated "
+                        f"as flat today and could receive a duplicate trade. Check "
+                        f"CoinDCX manually.")
+
         try:
             btc_candle = await self.coindcx.get_previous_day_candle(REGIME_SYMBOL)
             if btc_candle:
