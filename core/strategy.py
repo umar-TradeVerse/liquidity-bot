@@ -101,7 +101,7 @@ TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
 
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
-                 counter_trend=False, trend_mode=False):
+                 counter_trend=False, trend_mode=False, swept_level=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -114,6 +114,17 @@ class Signal:
         self.trend_mode = trend_mode        # True = this IS the trend-aligned flip
                                              # trade — exit hierarchy skips the
                                              # fixed-target priority for these
+        # The level actually swept to produce this signal — the FIXED daily
+        # PDH/PDL for a normal-regime trade, or the DYNAMIC re-anchored
+        # trend_ref_high/trend_ref_low for a trend-flip trade. This is what
+        # alerts should display, not always self.pdh/self.pdl, which stay
+        # fixed even when a flip trade is actually hunting a different,
+        # re-anchored level entirely (this was the source of real confusion
+        # on 2026-07-20 — ICP and KAITO alerts showed the untouched fixed
+        # PDH while the actual swept level was the dynamic reference).
+        self.swept_level = swept_level if swept_level is not None else (
+            pdh if side == 'SELL' else pdl
+        )
 
     def __repr__(self):
         return (f"Signal({self.symbol} {self.side} @ {self.entry_price:.4f} "
@@ -291,7 +302,8 @@ class StrategyEngine:
                         is_flip = level.trend_bias == "DOWNTREND"
                         counter = level.trend_bias == "UPTREND"
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=is_flip)
+                                         counter_trend=counter, trend_mode=is_flip,
+                                         swept_level=effective_pdh)
                         logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
                                     f"Entry:{entry:.4f} SL:{sl:.4f} "
                                     f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
@@ -389,7 +401,8 @@ class StrategyEngine:
                         is_flip = level.trend_bias == "UPTREND"
                         counter = level.trend_bias == "DOWNTREND"
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=is_flip)
+                                         counter_trend=counter, trend_mode=is_flip,
+                                         swept_level=effective_pdl)
                         logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
                                     f"Entry:{entry:.4f} SL:{sl:.4f} "
                                     f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
