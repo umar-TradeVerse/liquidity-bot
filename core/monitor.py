@@ -66,6 +66,18 @@ MAX_CONCURRENT_POSITIONS = 2
 
 REJECTION_PROXIMITY_PCT = 0.01  # 1.0%
 ROE_TARGET_PCT = 7.0
+MIN_ROE_FOR_REJECTION_EXIT_PCT = 3.0  # JUDGMENT CALL, unvalidated — half of
+                                       # ROE_TARGET_PCT. Priority 2 (rejection
+                                       # exit) now requires the position to
+                                       # already be at this much profit before
+                                       # it's allowed to fire — added after a
+                                       # real case (ETHUSD, 2026-07-20) where
+                                       # a marginal-profit rejection candle
+                                       # closed the trade just before a much
+                                       # larger continuation move. This keeps
+                                       # the reversal-protection intent while
+                                       # requiring more conviction than "any
+                                       # profit at all" before bailing early.
 
 
 def _escape_md(text) -> str:
@@ -244,6 +256,7 @@ class MarketMonitor:
         side = tr["side"]
         target = level.pdh if side == 'BUY' else level.pdl
         skip_target_priorities = tr.get("trend_mode", False)
+        details = None  # fetched at most once per candle, reused across priorities
 
         if not skip_target_priorities:
             if side == 'BUY' and candle['high'] >= target:
@@ -275,11 +288,25 @@ class MarketMonitor:
                                   else candle['close'] < tr['entry'])
 
                 if rejection and is_profitable:
-                    await self._exit_position(symbol, tr, exit_price=candle['close'],
-                                               reason="rejection_exit", label="Take Profit – Rejection Exit")
-                    return
+                    # Additionally require a meaningful ROE before allowing
+                    # this early exit — see MIN_ROE_FOR_REJECTION_EXIT_PCT
+                    # comment above. A marginal-profit rejection candle no
+                    # longer bails out of a trade that might still run.
+                    details = await self.coindcx.get_position_details(symbol)
+                    roe = details.get("roe") if details else None
+                    if roe is not None and roe >= MIN_ROE_FOR_REJECTION_EXIT_PCT:
+                        await self._exit_position(symbol, tr, exit_price=candle['close'],
+                                                   reason="rejection_exit",
+                                                   label="Take Profit – Rejection Exit")
+                        return
+                    else:
+                        logger.info(f"{symbol} | Rejection-exit conditions met but ROE "
+                                   f"({roe if roe is not None else 'unknown'}%) is below the "
+                                   f"{MIN_ROE_FOR_REJECTION_EXIT_PCT}% minimum — holding for more "
+                                   f"confirmation instead of exiting early")
 
-        details = await self.coindcx.get_position_details(symbol)
+        if details is None:
+            details = await self.coindcx.get_position_details(symbol)
         if details and details.get("roe") is not None and details["roe"] >= ROE_TARGET_PCT:
             await self._exit_position(symbol, tr, exit_price=candle['close'],
                                        reason="roe_protection", label="Take Profit – ROE Protection",
@@ -345,7 +372,8 @@ class MarketMonitor:
                 f"*Time:* {datetime.now(IST).strftime('%H:%M IST')}\n"
                 f"*Direction:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n"
-                f"*SL:* {signal.sl_price:.4f}\n\n"
+                f"*SL:* {signal.sl_price:.4f}\n"
+                f"*Level swept:* {signal.swept_level:.4f}\n\n"
                 f"*Reason:* This symbol's one automatic trade for today has already been used.\n\n"
                 f"No auto-entry executed. Review and enter manually on CoinDCX if you agree."
             )
@@ -357,7 +385,8 @@ class MarketMonitor:
             await self.telegram.send_alert(
                 f"⚠️ *New Liquidity Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n\n"
+                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                f"*Level swept:* {signal.swept_level:.4f}\n\n"
                 f"*Reason:* Today's bias is {level.trend_bias} — this setup fights that bias. "
                 f"No auto-entry executed."
             )
@@ -377,7 +406,8 @@ class MarketMonitor:
                 await self.telegram.send_alert(
                     f"⏭️ *Setup Skipped* — Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})\n\n"
                     f"*Symbol:* {symbol}\n*Side:* {signal.side}\n*Pattern:* {signal.pattern}\n"
-                    f"*Would-be Entry:* {signal.entry_price:.4f}\n*Would-be SL:* {signal.sl_price:.4f}"
+                    f"*Would-be Entry:* {signal.entry_price:.4f}\n*Would-be SL:* {signal.sl_price:.4f}\n"
+                    f"*Level swept:* {signal.swept_level:.4f}"
                 )
                 return
             self._open_positions[symbol] = 0
@@ -407,12 +437,18 @@ class MarketMonitor:
                     self._open_positions.pop(symbol, None)
                     return
 
+            level_line = (f"*Level swept:* {signal.swept_level:.4f} (dynamic re-anchor, "
+                          f"not the fixed daily PDH/PDL below)\n*Fixed PDH:* {signal.pdh:.4f} | "
+                          f"*Fixed PDL:* {signal.pdl:.4f}"
+                          if signal.trend_mode else
+                          f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}")
+
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                 f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}{trend_line}\n\n⏳ Placing order..."
+                f"{level_line}{trend_line}\n\n⏳ Placing order..."
             )
 
             quantity = (margin_usd * TRADE_LEVERAGE) / signal.entry_price
