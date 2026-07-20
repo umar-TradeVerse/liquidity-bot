@@ -196,6 +196,50 @@ class CoinDCXClient:
             "time": match["time"]
         }
 
+    async def get_latest_15m_candle(self, symbol: str) -> Optional[dict]:
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping")
+            return None
+
+        now_ts = int(time.time() * 1000)
+        start_ts = now_ts - (7200 * 1000)
+
+        params = {
+            "pair": coindcx_symbol,
+            "interval": "15m",
+            "from": start_ts,
+            "to": now_ts,
+            "limit": 10
+        }
+
+        result = await self._get("/market_data/candles", params=params)
+
+        if not result or not isinstance(result, list) or len(result) == 0:
+            logger.warning(f"{symbol} | Empty/None response from 15m candles endpoint")
+            return None
+
+        try:
+            candles = sorted(result, key=lambda c: int(c["time"]))
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"{symbol} | Failed to sort 15m candles: {e}")
+            return None
+
+        if len(candles) < 2:
+            logger.warning(f"{symbol} | Only {len(candles)} candle(s) returned, need >=2")
+            return None
+
+        c = candles[-2]
+
+        return {
+            "open": float(c["open"]),
+            "high": float(c["high"]),
+            "low": float(c["low"]),
+            "close": float(c["close"]),
+            "volume": float(c.get("volume", 0)),
+            "time": c["time"]
+        }
+
     async def get_recent_daily_candles(self, symbol: str, n: int = 3) -> list:
         """
         Returns the last n COMPLETE daily candles (today's in-progress candle
