@@ -317,7 +317,7 @@ class StrategyEngine:
                     else:
                         logger.info(f"{symbol} | PDH-side re-tested (H:{candle['high']:.4f}) but "
                                     f"did not clear the {MIN_SWEEP_DEPTH_PCT*100:.1f}% minimum "
-                                    f"depth past {level.pdh_day_extreme:.4f} — ignoring")
+                                    f"depth past {baseline:.4f} — ignoring")
                 elif candle['high'] > effective_pdh and inside_bar:
                     logger.info(f"{symbol} | PDH-side breach on an inside bar — skipping, "
                                 f"no fresh sweep armed this candle")
@@ -417,7 +417,7 @@ class StrategyEngine:
                     else:
                         logger.info(f"{symbol} | PDL-side re-tested (L:{candle['low']:.4f}) but "
                                     f"did not clear the {MIN_SWEEP_DEPTH_PCT*100:.1f}% minimum "
-                                    f"depth past {level.pdl_day_extreme:.4f} — ignoring")
+                                    f"depth past {baseline:.4f} — ignoring")
                 elif candle['low'] < effective_pdl and inside_bar:
                     logger.info(f"{symbol} | PDL-side breach on an inside bar — skipping, "
                                 f"no fresh sweep armed this candle")
