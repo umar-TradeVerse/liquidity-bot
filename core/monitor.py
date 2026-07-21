@@ -61,8 +61,15 @@ POLL_INTERVAL_SECONDS = 15
 DAY_END_HOUR = 23
 DAY_END_MINUTE = 0
 
-TRADE_LEVERAGE = 5
+TRADE_LEVERAGE = 10
 MAX_CONCURRENT_POSITIONS = 2
+STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
+                                     # counter-trend confirmations on a
+                                     # symbol today, the day's trend
+                                     # classification is treated as no
+                                     # longer reliable, and BOTH sides go
+                                     # alert-only for the rest of the day,
+                                     # not just the counter-trend one.
 
 REJECTION_PROXIMITY_PCT = 0.01  # 1.0%
 ROE_TARGET_PCT = 7.0
@@ -379,6 +386,21 @@ class MarketMonitor:
             )
             return
 
+        if level.counter_trend_confirms >= STABILITY_MAX_COUNTER_CONFIRMS:
+            logger.info(f"{symbol} | {signal.side} setup — {level.counter_trend_confirms} "
+                       f"counter-trend confirmations already seen today, day's "
+                       f"{level.trend_bias} classification no longer trusted — alert only")
+            await self.telegram.send_alert(
+                f"⚠️ *New Liquidity Setup Detected*\n\n"
+                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
+                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                f"*Level swept:* {signal.swept_level:.4f}\n\n"
+                f"*Reason:* This symbol has had {level.counter_trend_confirms} counter-trend "
+                f"confirmations today — today's {level.trend_bias} bias is no longer treated "
+                f"as reliable. No auto-entry executed."
+            )
+            return
+
         if signal.counter_trend:
             logger.info(f"{symbol} | {signal.side} setup fights today's {level.trend_bias} "
                        f"bias — alert only")
@@ -415,7 +437,7 @@ class MarketMonitor:
         trend_line = f"\n*Trend bias:* {level.trend_bias}" if level.trend_bias != "NONE" else ""
 
         try:
-            margin_usd = float(os.getenv('TRADE_SIZE_USD', 30))
+            margin_usd = float(os.getenv('TRADE_SIZE_USD', 40))
 
             # Margin cap — internally tracked, does NOT depend on the broken
             # CoinDCX wallet-balance endpoint. Set TOTAL_ACCOUNT_MARGIN_USD in
