@@ -44,6 +44,12 @@ class DailyLevel:
     # it fires, then tracked exactly like pdh_sweep_extreme/pdl_sweep_extreme.
     trend_ref_high: Optional[float] = None
     trend_ref_low: Optional[float] = None
+    # Trend Stability counter — counts how many times the COUNTER-trend side
+    # has confirmed today. Two or more means the day's trend classification
+    # has already been contradicted twice, which is real evidence the
+    # classification itself may be wrong or the trend is reversing intraday
+    # — not just noise. See monitor.py's STABILITY_MAX_COUNTER_CONFIRMS.
+    counter_trend_confirms: int = 0
 
 
 @dataclass
