@@ -287,10 +287,16 @@ class StrategyEngine:
 
             if level.pdh_state == "NONE":
                 if candle['high'] > effective_pdh and not inside_bar:
-                    deep_enough = (
-                        level.pdh_day_extreme is None or
-                        candle['high'] >= level.pdh_day_extreme * (1 + MIN_SWEEP_DEPTH_PCT)
-                    )
+                    # FIX (2026-07-21): previously, when this was the day's
+                    # very first sweep attempt (pdh_day_extreme still None),
+                    # the depth check was skipped entirely — any breach, even
+                    # a fraction of a percent above the level, registered as
+                    # valid. Real case: ETHUSD swept PDH by just 0.001% and
+                    # still triggered a full signal. Now the FIRST sweep of
+                    # the day is held to the same MIN_SWEEP_DEPTH_PCT
+                    # standard, measured against effective_pdh itself.
+                    baseline = level.pdh_day_extreme if level.pdh_day_extreme is not None else effective_pdh
+                    deep_enough = candle['high'] >= baseline * (1 + MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
                         level.pdh_state = "SWEPT"
                         level.pdh_sweep_extreme = candle['high']
@@ -344,6 +350,8 @@ class StrategyEngine:
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_event_active = True
+                        if counter:
+                            level.counter_trend_confirms += 1
 
                         # UPTREND mirror: this counter-trend SHORT confirmation
                         # is the seed for the buy-side liquidity LONG hunt.
@@ -386,10 +394,9 @@ class StrategyEngine:
 
             if level.pdl_state == "NONE":
                 if candle['low'] < effective_pdl and not inside_bar:
-                    deep_enough = (
-                        level.pdl_day_extreme is None or
-                        candle['low'] <= level.pdl_day_extreme * (1 - MIN_SWEEP_DEPTH_PCT)
-                    )
+                    # See matching PDH-side comment above — same fix.
+                    baseline = level.pdl_day_extreme if level.pdl_day_extreme is not None else effective_pdl
+                    deep_enough = candle['low'] <= baseline * (1 - MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
                         level.pdl_state = "SWEPT"
                         level.pdl_sweep_extreme = candle['low']
@@ -443,6 +450,8 @@ class StrategyEngine:
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_event_active = True
+                        if counter:
+                            level.counter_trend_confirms += 1
 
                         # DOWNTREND: this counter-trend LONG confirmation is
                         # the seed for the sell-side liquidity SHORT hunt.
