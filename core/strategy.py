@@ -89,6 +89,16 @@ logger = setup_logger("strategy")
 
 SL_BUFFER_PCT = 0.002               # 0.2% buffer beyond the sweep extreme
 MIN_SWEEP_DEPTH_PCT = 0.002          # UNVALIDATED placeholder — 0.2%
+MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
+                                       # the reclaim check (close must be back
+                                       # on the correct side of the fixed
+                                       # PDH/PDL) now requires clearing it by
+                                       # this margin, not just technically
+                                       # passing. Real cases supporting this:
+                                       # XRP (0.06% margin, loss), SOL (0.026%
+                                       # margin, loss), LTC (0.17% margin, SL
+                                       # hit) — all thin reclaims followed by
+                                       # a stop-out.
 REJECTION_WICK_RATIO = 2.0           # wick must be >= 2x body to fast-path the trigger
 TREND_BODY_RATIO_THRESHOLD = 0.5     # UNVALIDATED placeholder — daily body must
                                      # cover >= 50% of the day's full range to
@@ -333,7 +343,7 @@ class StrategyEngine:
             elif level.pdh_state == "TRIGGERED":
                 trig = level.pdh_trigger
                 if candle['close'] < trig['low'] and is_bearish:
-                    reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] < pdh
+                    reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= pdh * (1 - MIN_RECLAIM_MARGIN_PCT)
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
@@ -433,7 +443,7 @@ class StrategyEngine:
             elif level.pdl_state == "TRIGGERED":
                 trig = level.pdl_trigger
                 if candle['close'] > trig['high'] and is_bullish:
-                    reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] > pdl
+                    reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= pdl * (1 + MIN_RECLAIM_MARGIN_PCT)
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
