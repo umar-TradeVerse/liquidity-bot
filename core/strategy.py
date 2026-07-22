@@ -100,6 +100,28 @@ MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
                                        # hit) — all thin reclaims followed by
                                        # a stop-out.
 REJECTION_WICK_RATIO = 2.0           # wick must be >= 2x body to fast-path the trigger
+USE_CISD_FOR_DEEP_SWEEPS = True      # STANDBY SWITCH — flip to False to fully
+                                       # revert to the fixed-level reclaim check
+                                       # for every trade, no code changes needed
+                                       # beyond this one line.
+DEEP_SWEEP_THRESHOLD_PCT = 0.005      # UNVALIDATED placeholder — 0.5%. A sweep
+                                       # whose extreme sits at least this far
+                                       # beyond the fixed PDH/PDL is treated as
+                                       # "deep" and uses CISD (reclaim the open
+                                       # of the last opposite-colour candle
+                                       # before the trigger) instead of the
+                                       # fixed-level reclaim. Shallow sweeps
+                                       # (below this threshold) keep the
+                                       # existing fixed-level reclaim + margin
+                                       # check unchanged — this is the exact
+                                       # case that originally caught KAITO's
+                                       # bad SHORT (entry 2.5% on the wrong
+                                       # side of the level). Real cases behind
+                                       # the deep-sweep side: ICP (sweep ~1%
+                                       # past fixed PDL, CISD would have fired
+                                       # ~8h earlier) and KAITO (sweep ~1.5%
+                                       # past fixed PDL, CISD would have fired
+                                       # ~1.5h earlier) — both 2026-07-22.
 TREND_BODY_RATIO_THRESHOLD = 0.5     # UNVALIDATED placeholder — daily body must
                                      # cover >= 50% of the day's full range to
                                      # count as a decisive trend day
@@ -336,6 +358,7 @@ class StrategyEngine:
                 if is_bearish:
                     level.pdh_state = "TRIGGERED"
                     level.pdh_trigger = candle
+                    level.pdh_cisd_ref = prev_candle['open'] if prev_candle is not None else None
                     logger.info(f"{symbol} | Bearish trigger candle formed | "
                                 f"Trigger H:{candle['high']:.4f} L:{candle['low']:.4f} "
                                 f"(sweep extreme so far: {level.pdh_sweep_extreme:.4f})")
@@ -343,7 +366,12 @@ class StrategyEngine:
             elif level.pdh_state == "TRIGGERED":
                 trig = level.pdh_trigger
                 if candle['close'] < trig['low'] and is_bearish:
-                    reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= pdh * (1 - MIN_RECLAIM_MARGIN_PCT)
+                    sweep_depth_from_pdh = ((level.pdh_sweep_extreme - pdh) / pdh) if pdh > 0 else 0
+                    is_deep_sweep = sweep_depth_from_pdh >= DEEP_SWEEP_THRESHOLD_PCT
+                    if USE_CISD_FOR_DEEP_SWEEPS and is_deep_sweep and level.pdh_cisd_ref is not None:
+                        reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= level.pdh_cisd_ref
+                    else:
+                        reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= pdh * (1 - MIN_RECLAIM_MARGIN_PCT)
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
@@ -360,6 +388,7 @@ class StrategyEngine:
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_event_active = True
+                        level.pdh_cisd_ref = None
                         if counter:
                             level.counter_trend_confirms += 1
 
@@ -391,6 +420,7 @@ class StrategyEngine:
                     level.pdh_state = "NONE"
                     level.pdh_trigger = None
                     level.pdh_sweep_extreme = None
+                    level.pdh_cisd_ref = None
 
         # ══════════════════════════════════════════════════════════════
         # PDL SIDE — sweep of effective_pdl -> bullish trigger -> LONG
@@ -436,6 +466,7 @@ class StrategyEngine:
                 if is_bullish:
                     level.pdl_state = "TRIGGERED"
                     level.pdl_trigger = candle
+                    level.pdl_cisd_ref = prev_candle['open'] if prev_candle is not None else None
                     logger.info(f"{symbol} | Bullish trigger candle formed | "
                                 f"Trigger H:{candle['high']:.4f} L:{candle['low']:.4f} "
                                 f"(sweep extreme so far: {level.pdl_sweep_extreme:.4f})")
@@ -443,7 +474,12 @@ class StrategyEngine:
             elif level.pdl_state == "TRIGGERED":
                 trig = level.pdl_trigger
                 if candle['close'] > trig['high'] and is_bullish:
-                    reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= pdl * (1 + MIN_RECLAIM_MARGIN_PCT)
+                    sweep_depth_from_pdl = ((pdl - level.pdl_sweep_extreme) / pdl) if pdl > 0 else 0
+                    is_deep_sweep = sweep_depth_from_pdl >= DEEP_SWEEP_THRESHOLD_PCT
+                    if USE_CISD_FOR_DEEP_SWEEPS and is_deep_sweep and level.pdl_cisd_ref is not None:
+                        reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= level.pdl_cisd_ref
+                    else:
+                        reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= pdl * (1 + MIN_RECLAIM_MARGIN_PCT)
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
@@ -460,6 +496,7 @@ class StrategyEngine:
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_event_active = True
+                        level.pdl_cisd_ref = None
                         if counter:
                             level.counter_trend_confirms += 1
 
@@ -490,6 +527,7 @@ class StrategyEngine:
                                 f"before trigger high — resuming watch for a fresh sweep")
                     level.pdl_state = "NONE"
                     level.pdl_trigger = None
+                    level.pdl_cisd_ref = None
                     level.pdl_sweep_extreme = None
 
         return signal
