@@ -44,6 +44,15 @@ class DailyLevel:
     # it fires, then tracked exactly like pdh_sweep_extreme/pdl_sweep_extreme.
     trend_ref_high: Optional[float] = None
     trend_ref_low: Optional[float] = None
+    # CISD (Change In State of Delivery) reference — the open of the
+    # candle immediately preceding the trigger candle. Used as the
+    # reclaim reference INSTEAD OF the fixed PDH/PDL when a sweep is
+    # "deep" (see DEEP_SWEEP_THRESHOLD_PCT in strategy.py). Added
+    # 2026-07-22 after real cases (ICP, KAITO) where demanding a full
+    # reclaim back to a fixed level that was already far from the
+    # actual reversal cost hours of delay on a genuinely valid entry.
+    pdh_cisd_ref: Optional[float] = None
+    pdl_cisd_ref: Optional[float] = None
     # Trend Stability counter — counts how many times the COUNTER-trend side
     # has confirmed today. Two or more means the day's trend classification
     # has already been contradicted twice, which is real evidence the
