@@ -2,12 +2,15 @@
 StrategyEngine — Liquidity sweep + trigger-candle reversal strategy, with
 three-way trend classification layered on top.
 
-BASE MECHANICS (unchanged from the original design), applied against
-"effective" levels that are either the fixed daily PDH/PDL (trend_bias
-== NONE) or a dynamically re-anchored reference (trend_bias set):
+BASE MECHANICS, applied against "effective" levels that are either the
+fixed daily PDH/PDL (trend_bias == NONE) or a dynamically re-anchored
+reference (trend_bias set):
 
   1. Liquidity Sweep — a candle's low/high breaks new ground past the
-     effective level and past today's deepest prior sweep on that side.
+     effective level and past today's deepest prior sweep on that side,
+     clearing MIN_SWEEP_DEPTH_PCT. This gate is now enforced identically
+     whether the effective level is the fixed daily PDH/PDL OR a
+     trend-flip's dynamic reference — see the 2026-07-26 fix note below.
   2. Trigger Candle — the first opposite-colour candle after the sweep,
      UNLESS the sweep candle itself already shows a rejection shape
      (wick >= REJECTION_WICK_RATIO * body, and its own close already
@@ -16,11 +19,12 @@ BASE MECHANICS (unchanged from the original design), applied against
   3. Entry — close breaks the trigger's high/low AND that candle is
      itself the confirming colour AND (for the ORIGINAL, non-flip
      sweep only) the close is back on the correct side of the FIXED
-     daily PDH/PDL — the "reclaim" requirement. This reclaim check is
-     against the fixed level always, which makes it a no-op for
-     trend-flip trades (price is already well past the fixed level by
-     definition of being in a trend) while remaining a real filter for
-     genuine sideways-market reversals.
+     daily PDH/PDL by at least MIN_RECLAIM_MARGIN_PCT — OR, for a
+     "deep" sweep (see CISD section below), reclaims the CISD reference
+     instead. This reclaim check is a no-op for trend-flip trades
+     (price is already well past the fixed level by definition of
+     being in a trend) while remaining a real filter for genuine
+     sideways-market reversals.
   4. Stop Loss — beyond the sweep extreme for this cycle, buffered by
      SL_BUFFER_PCT.
   5. Invalidation — close breaks back through the trigger's other side
@@ -30,11 +34,12 @@ BASE MECHANICS (unchanged from the original design), applied against
   day's range — no sweep ever arms on either side, and no trade is
   taken. This is inherent to the mechanics above, not a separate rule.
 
-FRESH-SWEEP QUALITY GATES (apply only to the NONE->SWEPT transition,
-not to the seeding of a trend-flip, which bypasses these deliberately
-since it's a direct hand-off from an already-validated confirmation):
+FRESH-SWEEP QUALITY GATES (apply to every NONE->SWEPT transition,
+including a trend-flip's seeded second leg as of the 2026-07-26 fix):
   - MIN_SWEEP_DEPTH_PCT — the new extreme must clear the prior deepest
-    sweep by at least this fraction, not just by any tiny amount.
+    sweep (or, for the very first sweep of a cycle, the effective
+    level itself) by at least this fraction, not just by any tiny
+    amount.
   - Inside-bar skip — a candle that's fully inside the previous
     candle's range never arms a fresh sweep (low conviction).
 
@@ -50,11 +55,7 @@ SOL, XRP all traced to ~2.8-3R winners using this exact logic):
   AND the day before it (day-2) was the SAME direction — i.e. 2+
   consecutive same-direction trend days — the move is treated as
   likely maturing/exhausted, and trend_bias is set to NONE: the
-  original dual-sided sweep-reversal logic handles today, which is
-  exactly the case this correction was built for (see the 2026-07-19
-  ICPUSD failure: two consecutive bullish days were followed by a
-  genuine reversal day that the single-day version misread as a
-  continuation).
+  original dual-sided sweep-reversal logic handles today.
 
   If day-1 is decisive and day-2 differs (or isn't decisive itself),
   this is a single FRESH trend day, and the flip is applied:
@@ -62,18 +63,45 @@ SOL, XRP all traced to ~2.8-3R winners using this exact logic):
   In DOWNTREND: the PDL (buy-side) sweep-reversal machinery still runs
   exactly as before and still requires all the same gates — but its
   resulting LONG signal is marked counter_trend and is alert-only, not
-  auto-traded (see monitor.py). The MOMENT that LONG signal confirms,
-  its own confirmation candle's high seeds trend_ref_high, and the
-  PDH-side (sell-side liquidity / SHORT) state machine is manually
-  kick-started into SWEPT against that seed — no separate "sweep
-  beyond a level" step needed, since the seed candle, by definition,
-  just made a fresh high. From there the SHORT side runs the identical
-  trigger/confirm logic as a normal PDH sweep, just anchored dynamically.
+  auto-traded. The MOMENT that LONG signal confirms, its own
+  confirmation candle's high becomes a candidate reference
+  (trend_ref_high) for the sell-side liquidity SHORT hunt.
 
-  UPTREND is the exact mirror: the PDH (sell-side) machinery still runs,
-  its resulting SHORT signal is counter_trend/alert-only, and the
-  moment it confirms, its own low seeds trend_ref_low, kick-starting the
-  PDL-side (buy-side liquidity / LONG) hunt from there.
+  *** FIX (2026-07-26) ***: this candidate reference does NOT
+  automatically arm the PDH-side state machine into "SWEPT" anymore.
+  Real cases (ETHUSD and KAITOUSD, both 2026-07-26) showed the old
+  behaviour — force-setting pdh_state="SWEPT" directly from the seed —
+  let a trade fire even when price never independently swept past that
+  reference by any meaningful margin (ETH: seed 1876.53, actual peak
+  only 1878.50, just 0.10% — far short of the same 0.2% bar every
+  other sweep has to clear; KAITO: entry landed at essentially the
+  seed price itself, 1.0106 vs seed 1.0108). Now the seed only updates
+  trend_ref_high/trend_ref_low, which becomes the new effective_pdh/
+  effective_pdl automatically — the EXISTING NONE-state sweep-arming
+  logic (depth gate, inside-bar gate) then has to independently detect
+  a real sweep past it on a LATER candle, exactly like any other
+  sweep, before anything arms. Checked against real data: this change
+  correctly still allows ICPUSD's validated win (real sweep, 0.70%
+  past its seed) while blocking both disputed ETH and KAITO trades at
+  the source.
+
+  UPTREND is the exact mirror: the PDH (sell-side) machinery still
+  runs, its resulting SHORT signal is counter_trend/alert-only, and
+  the moment it confirms, its own low becomes a candidate reference
+  (trend_ref_low) for the buy-side liquidity LONG hunt — same fix
+  applies, no automatic arming.
+
+CISD HYBRID (2026-07-22): for a "deep" sweep (sweep extreme sits at
+least DEEP_SWEEP_THRESHOLD_PCT beyond the fixed PDH/PDL), the reclaim
+check uses the CISD reference (the open of the candle immediately
+before the trigger) instead of demanding a full reclaim of the fixed
+level, which real cases (ICP, KAITO) showed could cost many hours of
+delay on an otherwise valid entry. Shallow sweeps are unaffected and
+still use the fixed-level reclaim + margin, unchanged — this is the
+exact case that originally caught KAITO's very first bad SHORT entry
+weeks ago (2.5% on the wrong side of the level). USE_CISD_FOR_DEEP_SWEEPS
+is a single-line standby switch to fully revert to the old fixed-level
+reclaim everywhere if needed, no other code changes required.
 
 No indicators, no pattern matching beyond what's described above. No
 breakout logic of any kind — this engine only ever trades liquidity
@@ -151,9 +179,7 @@ class Signal:
         # trend_ref_high/trend_ref_low for a trend-flip trade. This is what
         # alerts should display, not always self.pdh/self.pdl, which stay
         # fixed even when a flip trade is actually hunting a different,
-        # re-anchored level entirely (this was the source of real confusion
-        # on 2026-07-20 — ICP and KAITO alerts showed the untouched fixed
-        # PDH while the actual swept level was the dynamic reference).
+        # re-anchored level entirely.
         self.swept_level = swept_level if swept_level is not None else (
             pdh if side == 'SELL' else pdl
         )
@@ -233,38 +259,6 @@ class StrategyEngine:
             except Exception as e:
                 logger.error(f"{symbol} | fetch_and_set_levels error: {e}")
 
-        # Reconcile against ANY real open positions on the exchange, so a
-        # position still open across today's reset (or a mid-day restart) is
-        # not treated as a blank slate — which would let the bot place a
-        # duplicate trade on top of it (this happened for real on 2026-07-20:
-        # a redeploy wiped BotState while KAITOUSD and XRPUSD were still open).
-        # IMPORTANT LIMITATION: this only prevents a duplicate ENTRY. It does
-        # NOT restore this bot's own exit-hierarchy tracking (ROE protection,
-        # rejection-exit, trend-mode target-skip) for a carried-over position
-        # — that tracking lives in monitor.py's in-memory _trailing dict,
-        # which a reset also wipes, and reconstructing it would need the
-        # original entry/SL/TP/trend_mode, which aren't reliably recoverable
-        # from the exchange alone. Only the exchange-side resting stop-loss
-        # protects a carried-over position going forward.
-        try:
-            open_positions = await self.coindcx.get_open_positions()
-            for symbol, qty in open_positions.items():
-                level = self.state.get_level(symbol)
-                if level and qty != 0:
-                    level.in_trade = True
-                    level.auto_traded_today = True
-                    logger.warning(f"{symbol} | Real open position found at reset "
-                                   f"(qty {qty}) — marked in_trade/auto_traded_today "
-                                   f"to prevent a duplicate order today. This bot's "
-                                   f"own ROE-protection/rejection-exit tracking is NOT "
-                                   f"restored for this position — only its exchange-side "
-                                   f"stop-loss is currently protecting it.")
-        except Exception as e:
-            logger.error(f"Failed to reconcile open positions at reset: {e} — if any "
-                        f"symbol has a real open position right now, it may be treated "
-                        f"as flat today and could receive a duplicate trade. Check "
-                        f"CoinDCX manually.")
-
         try:
             btc_candle = await self.coindcx.get_previous_day_candle(REGIME_SYMBOL)
             if btc_candle:
@@ -319,14 +313,14 @@ class StrategyEngine:
 
             if level.pdh_state == "NONE":
                 if candle['high'] > effective_pdh and not inside_bar:
-                    # FIX (2026-07-21): previously, when this was the day's
-                    # very first sweep attempt (pdh_day_extreme still None),
-                    # the depth check was skipped entirely — any breach, even
-                    # a fraction of a percent above the level, registered as
-                    # valid. Real case: ETHUSD swept PDH by just 0.001% and
-                    # still triggered a full signal. Now the FIRST sweep of
-                    # the day is held to the same MIN_SWEEP_DEPTH_PCT
-                    # standard, measured against effective_pdh itself.
+                    # FIX (2026-07-21): the day's very first sweep attempt now
+                    # must also clear MIN_SWEEP_DEPTH_PCT, measured against
+                    # effective_pdh itself when no day_extreme exists yet —
+                    # previously this check was skipped entirely on the first
+                    # attempt. This same check now also governs a trend-flip's
+                    # seeded reference (effective_pdh resolves to
+                    # trend_ref_high automatically), per the 2026-07-26 fix —
+                    # see module docstring.
                     baseline = level.pdh_day_extreme if level.pdh_day_extreme is not None else effective_pdh
                     deep_enough = candle['high'] >= baseline * (1 + MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
@@ -393,18 +387,20 @@ class StrategyEngine:
                             level.counter_trend_confirms += 1
 
                         # UPTREND mirror: this counter-trend SHORT confirmation
-                        # is the seed for the buy-side liquidity LONG hunt.
+                        # sets a CANDIDATE reference for the buy-side liquidity
+                        # LONG hunt. FIX (2026-07-26): no longer force-arms
+                        # pdl_state — a later candle must independently sweep
+                        # past this reference through the normal NONE-state
+                        # gates (depth + inside-bar) before anything arms.
+                        # See module docstring for the real cases that made
+                        # this necessary.
                         if counter and level.trend_bias == "UPTREND":
                             seed_low = candle['low']
                             if level.trend_ref_low is None or seed_low < level.trend_ref_low:
                                 level.trend_ref_low = seed_low
-                            level.pdl_state = "SWEPT"
-                            level.pdl_sweep_extreme = level.trend_ref_low
-                            level.pdl_day_extreme = level.trend_ref_low
-                            level.pdl_trigger = None
-                            level.pdl_event_active = False
-                            logger.info(f"{symbol} | UPTREND — seeding buy-side liquidity "
-                                        f"hunt at {level.trend_ref_low:.4f} from this dip")
+                            logger.info(f"{symbol} | UPTREND — buy-side reference set at "
+                                        f"{level.trend_ref_low:.4f} from this dip; still needs "
+                                        f"a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger "
                                     f"but did not reclaim below the fixed PDH {pdh:.4f} — "
@@ -434,7 +430,10 @@ class StrategyEngine:
 
             if level.pdl_state == "NONE":
                 if candle['low'] < effective_pdl and not inside_bar:
-                    # See matching PDH-side comment above — same fix.
+                    # See matching PDH-side comment above — same fix, and
+                    # this now also governs a trend-flip's seeded reference
+                    # for the same reason (effective_pdl resolves to
+                    # trend_ref_low automatically).
                     baseline = level.pdl_day_extreme if level.pdl_day_extreme is not None else effective_pdl
                     deep_enough = candle['low'] <= baseline * (1 - MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
@@ -500,19 +499,18 @@ class StrategyEngine:
                         if counter:
                             level.counter_trend_confirms += 1
 
-                        # DOWNTREND: this counter-trend LONG confirmation is
-                        # the seed for the sell-side liquidity SHORT hunt.
+                        # DOWNTREND: this counter-trend LONG confirmation sets
+                        # a CANDIDATE reference for the sell-side liquidity
+                        # SHORT hunt. FIX (2026-07-26): no longer force-arms
+                        # pdh_state — see module docstring and the mirrored
+                        # comment in the PDH-side block above.
                         if counter and level.trend_bias == "DOWNTREND":
                             seed_high = candle['high']
                             if level.trend_ref_high is None or seed_high > level.trend_ref_high:
                                 level.trend_ref_high = seed_high
-                            level.pdh_state = "SWEPT"
-                            level.pdh_sweep_extreme = level.trend_ref_high
-                            level.pdh_day_extreme = level.trend_ref_high
-                            level.pdh_trigger = None
-                            level.pdh_event_active = False
-                            logger.info(f"{symbol} | DOWNTREND — seeding sell-side liquidity "
-                                        f"hunt at {level.trend_ref_high:.4f} from this bounce")
+                            logger.info(f"{symbol} | DOWNTREND — sell-side reference set at "
+                                        f"{level.trend_ref_high:.4f} from this bounce; still "
+                                        f"needs a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger "
                                     f"but did not reclaim above the fixed PDL {pdl:.4f} — "
@@ -528,6 +526,5 @@ class StrategyEngine:
                     level.pdl_state = "NONE"
                     level.pdl_trigger = None
                     level.pdl_cisd_ref = None
-                    level.pdl_sweep_extreme = None
 
         return signal
