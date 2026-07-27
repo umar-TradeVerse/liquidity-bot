@@ -31,8 +31,10 @@ SYMBOL_MAP = {
     "AEROUSD": "B-AERO_USDT",
     "BTCUSD": "B-BTC_USDT",
     "LTCUSD": "B-LTC_USDT",
-    "ICPUSD": "B-ICP_USDT",
-    "KAITOUSD": "B-KAITO_USDT"
+    "KAITOUSD": "B-KAITO_USDT",
+    "DEXEUSD": "B-DEXE_USDT",
+    "RIFUSD": "B-RIF_USDT",
+    "ZAMAUSD": "B-ZAMA_USDT"
 }
 
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
