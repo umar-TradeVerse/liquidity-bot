@@ -72,3 +72,56 @@ class TelegramBot:
             f"*Reason:* {reason}\n\n"
             f"Please check your CoinDCX account."
         )
+
+    async def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> list:
+        """Long-poll for new incoming messages. Returns raw Telegram 'result' list."""
+        if not self.token:
+            return []
+        url = f"{TELEGRAM_API}/bot{self.token}/getUpdates"
+        params = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout + 10)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("result", [])
+                    logger.warning(f"getUpdates returned {resp.status}")
+        except asyncio.TimeoutError:
+            pass  # normal for long-polling with no new messages
+        except Exception as e:
+            logger.error(f"getUpdates error: {e}")
+        return []
+
+    async def send_document(self, file_path: str, caption: Optional[str] = None) -> bool:
+        """Send a file as a Telegram document. Returns True on success."""
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram not configured — can't send document")
+            return False
+        if not os.path.exists(file_path):
+            await self.send_alert(f"⚠️ Requested file doesn't exist yet: `{file_path}`")
+            return False
+        url = f"{TELEGRAM_API}/bot{self.token}/sendDocument"
+        try:
+            with open(file_path, "rb") as fh:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", self.chat_id)
+                if caption:
+                    data.add_field("caption", caption)
+                data.add_field("document", fh, filename=os.path.basename(file_path))
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url, data=data, timeout=aiohttp.ClientTimeout(total=60)
+                    ) as resp:
+                        if resp.status == 200:
+                            return True
+                        text = await resp.text()
+                        logger.error(f"sendDocument failed [{resp.status}]: {text}")
+                        return False
+        except Exception as e:
+            logger.error(f"send_document error: {e}", exc_info=True)
+            return False
