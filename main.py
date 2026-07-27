@@ -10,7 +10,7 @@ from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
-from core.state import BotState, DailyLevel
+from core.state import BotState, DailyLevel, SYMBOLS
 from core.strategy import StrategyEngine
 from core.monitor import MarketMonitor
 from core import persistence
@@ -30,7 +30,29 @@ async def daily_reset(state: BotState, engine: StrategyEngine, telegram: Telegra
                        monitor: Optional["MarketMonitor"] = None):
     """Runs at 5:30 AM IST — fetch PDH/PDL and reset daily counters."""
     logger.info("=== Daily Reset at 5:30 AM IST ===")
+
+    # If a symbol was removed from SYMBOLS (watchlist restructuring) but
+    # still has an open position, save its level BEFORE reset_daily()
+    # wipes it — reset_daily() rebuilds state.levels using only the
+    # current SYMBOLS list, so a de-listed symbol's data would otherwise
+    # vanish here even though monitor._trailing (and the union-based
+    # iteration in monitor.run()/_reconcile_positions) still expects it
+    # to have a valid level to check exit conditions against.
+    preserved_levels = {}
+    if monitor is not None:
+        for sym in monitor._trailing.keys():
+            if sym not in SYMBOLS:
+                existing = state.get_level(sym)
+                if existing is not None:
+                    preserved_levels[sym] = existing
+
     state.reset_daily()
+
+    for sym, level in preserved_levels.items():
+        state.levels[sym] = level
+        logger.info(f"{sym} | De-listed but still open — preserved its level data across "
+                   f"daily reset so exit monitoring keeps working until it closes.")
+
     success = await engine.fetch_and_set_levels()
     if not success:
         # Retry once
