@@ -821,15 +821,18 @@ class MarketMonitor:
                         rr_lines = (f"*Expected RR:* 1:{round(abs(tp_price - signal.entry_price) / risk, 1)}\n"
                                    if risk else "")
 
-                stats = persistence.get_symbol_stats(symbol)
+                pattern_label = "trend-aligned flip setups (all symbols)" if signal.trend_mode \
+                                 else "sweep-reversal setups (all symbols)"
+                stats = persistence.get_pattern_stats(trend_mode=signal.trend_mode)
                 if stats["has_enough_data"]:
                     confidence = ("HIGH" if stats["win_rate_pct"] >= 60 else
                                   "MEDIUM" if stats["win_rate_pct"] >= 45 else "LOW")
                     stats_block = (
                         f"*Confidence:* {confidence} _(heuristic from historical win rate — not a guarantee)_\n"
-                        f"*Historical Win Rate:* {stats['win_rate_pct']:.0f}% ({stats['count']} closed trades)\n"
+                        f"*Historical Win Rate:* {stats['win_rate_pct']:.0f}% "
+                        f"({stats['count']} {pattern_label})\n"
                         + (f"*Avg Hold Time:* {stats['avg_hold_minutes']:.0f} min\n" if stats['avg_hold_minutes'] else "")
-                        + f"\nThis setup has occurred {stats['count']} times.\n"
+                        + f"\nThis pattern has occurred {stats['count']} times across all symbols.\n"
                         + (f"Average move: {stats['avg_move_pct']:+.2f}%\n" if stats['avg_move_pct'] is not None else "")
                         + (f"Largest move: {stats['largest_move_pct']:+.2f}%\n" if stats['largest_move_pct'] is not None else "")
                     )
@@ -837,9 +840,9 @@ class MarketMonitor:
                     n = stats["count"]
                     stats_block = (
                         f"*Confidence:* N/A — not enough history yet ({n}/{MIN_TRADES_FOR_HISTORICAL_STATS} "
-                        f"closed trades logged for {symbol})\n"
+                        f"{pattern_label} logged)\n"
                         f"*Historical Win Rate:* N/A — will show once {MIN_TRADES_FOR_HISTORICAL_STATS}+ "
-                        f"trades are logged\n"
+                        f"trades of this pattern are logged\n"
                     )
 
                 msg = (
