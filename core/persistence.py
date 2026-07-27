@@ -110,14 +110,21 @@ def load_state() -> Optional[dict]:
     return {"levels": snapshot.get("levels", {}), "trailing": snapshot.get("trailing", {})}
 
 
-def get_symbol_stats(symbol: str) -> dict:
+def get_pattern_stats(trend_mode: bool) -> dict:
     """
-    Aggregates trades.jsonl for one symbol into the stats used in the
-    enhanced Telegram message (occurrence count, win rate, avg/largest move,
-    avg hold time). Returns has_enough_data=False if there are fewer than
-    MIN_TRADES_FOR_HISTORICAL_STATS resolved closes — the caller should show
-    a plain "not enough history yet" line rather than a fabricated-looking
-    precise percentage from a tiny sample.
+    Aggregates trades.jsonl by PATTERN TYPE (trend_mode True/False) across
+    ALL symbols, rather than per-symbol. This answers "does this kind of
+    setup tend to work" instead of "has this specific coin happened to
+    work 5 times" — pools data across all 8 symbols so useful numbers
+    accumulate much faster than a per-symbol breakdown would.
+
+    trend_mode=False -> regular sweep-reversal setups (the core strategy)
+    trend_mode=True  -> trend-aligned flip setups (the reactive, in-trend entries)
+
+    Returns has_enough_data=False if there are fewer than
+    MIN_TRADES_FOR_HISTORICAL_STATS resolved closes of this pattern type —
+    the caller should show a plain "not enough history yet" line rather
+    than a fabricated-looking precise percentage from a tiny sample.
     """
     from core.monitor import MIN_TRADES_FOR_HISTORICAL_STATS  # local import avoids a cycle
 
@@ -136,10 +143,10 @@ def get_symbol_stats(symbol: str) -> dict:
                     event = json.loads(line)
                 except Exception:
                     continue
-                if event.get("event_type") == "close" and event.get("symbol") == symbol:
+                if event.get("event_type") == "close" and event.get("trend_mode") == trend_mode:
                     closes.append(event)
     except Exception as e:
-        logger.error(f"Failed to read trades.jsonl for stats: {e}", exc_info=True)
+        logger.error(f"Failed to read trades.jsonl for pattern stats: {e}", exc_info=True)
         return empty
 
     resolved = [c for c in closes if c.get("realized_rr") is not None]
