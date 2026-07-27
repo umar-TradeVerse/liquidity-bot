@@ -110,7 +110,59 @@ def load_state() -> Optional[dict]:
     return {"levels": snapshot.get("levels", {}), "trailing": snapshot.get("trailing", {})}
 
 
-def log_trade_event(event: dict):
+def get_symbol_stats(symbol: str) -> dict:
+    """
+    Aggregates trades.jsonl for one symbol into the stats used in the
+    enhanced Telegram message (occurrence count, win rate, avg/largest move,
+    avg hold time). Returns has_enough_data=False if there are fewer than
+    MIN_TRADES_FOR_HISTORICAL_STATS resolved closes — the caller should show
+    a plain "not enough history yet" line rather than a fabricated-looking
+    precise percentage from a tiny sample.
+    """
+    from core.monitor import MIN_TRADES_FOR_HISTORICAL_STATS  # local import avoids a cycle
+
+    empty = {
+        "has_enough_data": False, "count": 0, "win_rate_pct": None,
+        "avg_move_pct": None, "largest_move_pct": None, "avg_hold_minutes": None,
+    }
+    if not _ensure_dir_available() or not os.path.exists(TRADES_LOG_PATH):
+        return empty
+
+    closes = []
+    try:
+        with open(TRADES_LOG_PATH, "r") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("event_type") == "close" and event.get("symbol") == symbol:
+                    closes.append(event)
+    except Exception as e:
+        logger.error(f"Failed to read trades.jsonl for stats: {e}", exc_info=True)
+        return empty
+
+    resolved = [c for c in closes if c.get("realized_rr") is not None]
+    if len(resolved) < MIN_TRADES_FOR_HISTORICAL_STATS:
+        return {**empty, "count": len(closes)}
+
+    wins = [c for c in resolved if c["realized_rr"] > 0]
+    move_pcts = []
+    for c in resolved:
+        entry, exit_price, side = c.get("entry"), c.get("exit_price"), c.get("side")
+        if entry and exit_price:
+            move = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+            move_pcts.append(100 * move / entry)
+    durations = [c["duration_minutes"] for c in resolved if c.get("duration_minutes") is not None]
+
+    return {
+        "has_enough_data": True,
+        "count": len(resolved),
+        "win_rate_pct": round(100 * len(wins) / len(resolved), 0),
+        "avg_move_pct": round(sum(move_pcts) / len(move_pcts), 2) if move_pcts else None,
+        "largest_move_pct": round(max(move_pcts, key=abs), 2) if move_pcts else None,
+        "avg_hold_minutes": round(sum(durations) / len(durations), 0) if durations else None,
+    }
     """Append one JSON line to trades.jsonl. event should include at minimum:
     event_type ('open'|'close'), symbol, side, timestamp_ist.
     """
