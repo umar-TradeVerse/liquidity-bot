@@ -6,12 +6,14 @@ import asyncio
 import logging
 import sys
 import os
+from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
-from core.state import BotState
+from core.state import BotState, DailyLevel
 from core.strategy import StrategyEngine
 from core.monitor import MarketMonitor
+from core import persistence
 from notifications.telegram import TelegramBot
 from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
@@ -23,7 +25,8 @@ IST = pytz.timezone("Asia/Kolkata")
 TESTING_FORCE_IMMEDIATE_FETCH = False
 
 
-async def daily_reset(state: BotState, engine: StrategyEngine, telegram: TelegramBot):
+async def daily_reset(state: BotState, engine: StrategyEngine, telegram: TelegramBot,
+                       monitor: Optional["MarketMonitor"] = None):
     """Runs at 5:30 AM IST — fetch PDH/PDL and reset daily counters."""
     logger.info("=== Daily Reset at 5:30 AM IST ===")
     state.reset_daily()
@@ -40,6 +43,10 @@ async def daily_reset(state: BotState, engine: StrategyEngine, telegram: Telegra
             )
             state.paused = True
             return
+    # Snapshot immediately so a restart later today never reloads yesterday's
+    # (now stale) state instead of today's freshly-reset levels.
+    if monitor is not None:
+        persistence.save_state(state, monitor._trailing)
     await telegram.send_alert(
         f"✅ Daily levels set:\n"
         f"{'='*30}\n" +
@@ -72,22 +79,42 @@ async def main():
     scheduler.add_job(
         daily_reset,
         CronTrigger(hour=5, minute=30, timezone=IST),
-        args=[state, engine, telegram],
+        args=[state, engine, telegram, monitor],
         id="daily_reset",
         replace_existing=True
     )
     scheduler.start()
+    # Restart recovery: if a same-day state snapshot exists (mounted volume,
+    # see core/persistence.py), restore levels + in-flight trailing (SL/TP/
+    # MFE-MAE tracking) BEFORE deciding whether to run daily_reset. This is
+    # what stops a Railway restart mid-day from wiping sweep-in-progress
+    # state and losing exit-condition tracking on any open position.
+    restored = persistence.load_state()
+    if restored:
+        for sym, level_dict in restored["levels"].items():
+            state.levels[sym] = DailyLevel(**level_dict) if level_dict is not None else None
+        monitor.restore_trailing(restored["trailing"])
+        await telegram.send_alert(
+            f"♻️ Restored today's state from snapshot "
+            f"({len(restored['trailing'])} open position(s) reattached)."
+        )
+
     # Run initial fetch if bot starts after 5:30 AM (or if testing override is on)
+    # and we didn't just restore a same-day snapshot — a successful restore
+    # already has today's levels, so re-fetching would be redundant (and
+    # harmless, but noisy) rather than wrong.
     from datetime import datetime
     now = datetime.now(IST)
     started_after_530 = now.hour >= 5 and (now.hour > 5 or now.minute >= 30)
-    if started_after_530:
+    if restored and state.levels_ready():
+        logger.info("Same-day snapshot restored — skipping immediate daily_reset fetch")
+    elif started_after_530:
         logger.info("Bot started after 5:30 AM — fetching today's levels immediately")
-        await daily_reset(state, engine, telegram)
+        await daily_reset(state, engine, telegram, monitor)
     elif TESTING_FORCE_IMMEDIATE_FETCH:
         logger.info("TESTING_FORCE_IMMEDIATE_FETCH is True — fetching levels immediately "
                     "even though it's before 5:30 AM IST")
-        await daily_reset(state, engine, telegram)
+        await daily_reset(state, engine, telegram, monitor)
     # Start monitoring loop
     try:
         await monitor.run()
