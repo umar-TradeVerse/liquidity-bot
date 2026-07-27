@@ -170,6 +170,9 @@ def get_pattern_stats(trend_mode: bool) -> dict:
         "largest_move_pct": round(max(move_pcts, key=abs), 2) if move_pcts else None,
         "avg_hold_minutes": round(sum(durations) / len(durations), 0) if durations else None,
     }
+
+
+def log_trade_event(event: dict):
     """Append one JSON line to trades.jsonl. event should include at minimum:
     event_type ('open'|'close'), symbol, side, timestamp_ist.
     """
