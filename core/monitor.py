@@ -88,7 +88,15 @@ MIN_TRADES_FOR_HISTORICAL_STATS = 5  # below this, message shows "not enough
 # that keeps it independent of the TP ladder so it also protects trend-mode
 # trades (which skip the ladder and TP1/TP2 entirely) and doesn't depend on
 # a partial-close order having succeeded first.
-BREAKEVEN_TRIGGER_R = 0.5
+#
+# Raised from 0.5R to 1.0R on 2026-07-27 after a real case where the trade
+# moved to breakeven, got clipped by a small reversal wick, and then the
+# original favorable move resumed hard right after. This is an inherent
+# tradeoff of any breakeven-stop system, not a bug — 1.0R requires a bigger
+# favorable move before locking in breakeven, reducing how often normal
+# noise triggers it, at the cost of giving back more on trades that reverse
+# between 0.5R and 1.0R (which the original 0.5R setting would have caught).
+BREAKEVEN_TRIGGER_R = 1.0
 STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
                                      # counter-trend confirmations on a
                                      # symbol today, the day's trend
