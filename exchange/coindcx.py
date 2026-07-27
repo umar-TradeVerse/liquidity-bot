@@ -34,7 +34,14 @@ SYMBOL_MAP = {
     "KAITOUSD": "B-KAITO_USDT",
     "DEXEUSD": "B-DEXE_USDT",
     "RIFUSD": "B-RIF_USDT",
-    "ZAMAUSD": "B-ZAMA_USDT"
+    "ZAMAUSD": "B-ZAMA_USDT",
+    # Kept even though removed from SYMBOLS (2026-07-28 restructuring) —
+    # NOT in the active watchlist, so no new ICPUSD signals will ever form,
+    # but the pair mapping must stay available so any already-open ICPUSD
+    # position can still be fetched/monitored/closed properly instead of
+    # crashing with a KeyError the moment the bot tries to process it.
+    # Safe to delete once you've confirmed ICPUSD is fully closed out.
+    "ICPUSD": "B-ICP_USDT",
 }
 
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
