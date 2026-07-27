@@ -14,6 +14,7 @@ from core.state import BotState, DailyLevel
 from core.strategy import StrategyEngine
 from core.monitor import MarketMonitor
 from core import persistence
+from core.command_listener import run_command_listener
 from notifications.telegram import TelegramBot
 from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
@@ -115,9 +116,14 @@ async def main():
         logger.info("TESTING_FORCE_IMMEDIATE_FETCH is True — fetching levels immediately "
                     "even though it's before 5:30 AM IST")
         await daily_reset(state, engine, telegram, monitor)
-    # Start monitoring loop
+    # Start monitoring loop + Telegram command listener (/trades, /state)
+    # concurrently. The listener runs independently so a slow getUpdates
+    # long-poll never delays candle processing.
     try:
-        await monitor.run()
+        await asyncio.gather(
+            monitor.run(),
+            run_command_listener(telegram),
+        )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     finally:
