@@ -1,199 +1,107 @@
-# Liquidity Strategy Bot — Delta Exchange
+# TradeVerse Liquidity Bot
 
-Automated crypto futures trading bot based on a custom PDH/PDL liquidity strategy.
+An automated futures trading bot on **CoinDCX**, trading a liquidity-sweep
+reversal strategy across 8 symbols (ETHUSD, SOLUSD, XRPUSD, TAOUSD, AEROUSD,
+LTCUSD, ICPUSD, KAITOUSD), 15-minute candles, 5:30 AM–11:00 PM IST daily.
 
----
+## Strategy summary
 
-## Strategy Summary
+**Core setup — sweep + reversal:**
+1. Price sweeps the previous day's high (PDH) or low (PDL).
+2. Bot watches for the first opposite-colored trigger candle.
+3. On confirmation, enters against the sweep direction, targeting the
+   opposite fixed daily level (PDH for shorts, PDL for longs).
 
-**Every day at 5:30 AM IST:**
-- Fetches previous day's High (PDH) and Low (PDL) for all symbols
+**CISD (Change In State of Delivery) reclaim** — for "deep" sweeps that move
+well past the fixed PDH/PDL, the reclaim reference used to confirm entry is
+the open of the candle just before the trigger, instead of demanding a full
+reclaim back to the original (now distant) fixed level. Added after real
+cases where the fixed-level requirement cost hours of unnecessary delay on
+an already-valid entry.
 
-**Throughout the day (1m candles):**
+**Trend bias** — classified once daily from the last 3 daily candles.
+`UPTREND`/`DOWNTREND` bias favors one side (auto-traded) over the other
+(alert-only); `NONE` covers sideways or an already-matured 2+ day trend,
+keeping the original dual-sided logic.
 
-### Scenario 1 — Sweep Reversal (Primary Edge)
-| Direction | Condition | Entry |
-|-----------|-----------|-------|
-| SHORT | Price closes above PDH → rejection candle forms → next candle closes below rejection candle low | SELL at close |
-| LONG | Price closes below PDL → rejection candle forms → next candle closes above rejection candle high | BUY at close |
+**Trend-aligned flip trades** — when in a trend, a bounce off a
+counter-trend confirmation seeds a dynamic re-anchored level for hunting
+liquidity in the trend's direction. These trades often enter already past
+the fixed daily PDH/PDL, so they deliberately skip the fixed-target and
+rejection-candle exit priorities and run on stop-loss + ROE protection
+(and breakeven-move, see below) only.
 
-**Stop Loss:** Above rejection candle high (SHORT) / Below rejection candle low (LONG) + 0.1% buffer
+**Rule: one auto-trade per symbol per day.** Further clean setups on an
+already-traded symbol are alert-only regardless of outcome. Counter-trend
+signals are always alert-only, regardless of this rule.
 
-### Scenario 2 — Breakout (Clean break, no rejection)
-| Direction | Condition | Entry |
-|-----------|-----------|-------|
-| LONG | Price closes above PDH, no rejection, next candle also closes above PDH | BUY |
-| SHORT | Price closes below PDL, no rejection, next candle also closes below PDL | SELL |
+## Exit logic (priority order, evaluated every closed candle)
 
-**Stop Loss:** Just below PDH (LONG) / Just above PDL (SHORT) + 0.1% buffer
+1. **Target achieved** — PDH (long) / PDL (short) reached. Skipped for
+   trend-mode trades.
+2. **Rejection exit** — a rejection/engulfing candle near target, only if
+   the position is already profitable and at ≥3% ROE. Skipped for
+   trend-mode trades.
+3. **ROE protection** — closes at ≥7% ROE regardless of the above.
 
-### Scenario 3 — Inside Day
-- Price stays within PDH/PDL all day → **No trade**
+**TP1/TP2/TP3 partial ladder** (non-trend-mode only): TP1 at 1.5R, TP2 at
+2.5R, TP3 = the original single target above. Only seeded if TP1/TP2 sit
+closer than TP3 — otherwise the trade behaves as a single-target trade,
+unchanged. TP1/TP2 are bot-managed partial market closes, always sized off
+a freshly-fetched live quantity (CoinDCX's `close_position_market` has no
+`reduce_only` support, so trusting a locally-cached quantity risks flipping
+the position instead of trimming it). TP3 stays a resting exchange-side
+order — a dead-man's-switch full close if the bot itself is ever down.
 
----
+**Breakeven stop-move**: once a trade's MFE reaches +0.5R (any trade type,
+including trend-mode), the SL moves to entry price. Added after a 7-day
+analysis showed most losing trades had moved meaningfully in the account's
+favor before reversing to a full stop-out.
 
-## Symbols
-- ETHUSD, SOLUSD, XRPUSD, TAOUSD, ICPUSD (Delta Exchange perpetual futures)
+## State persistence & restart recovery
 
-## Rules
-- Max **2 trades per day** (resets at 5:30 AM IST)
-- If symbol already triggered one scenario, ignore second signal for that symbol
-- Failed orders do **not** count toward daily limit
-- TP is **manual** — bot only handles entry + SL
+Railway containers restart often (redeploys, occasional crashes) — an
+in-memory-only bot loses all same-day sweep-in-progress state and
+in-flight SL/TP/MFE-MAE tracking on every restart. `core/persistence.py`
+snapshots `state.levels` + the monitor's trailing dict to a mounted volume
+(`/data/state_snapshot.json`) roughly every minute, and on startup, restores
+same-day state before the daily 5:30 AM reset logic runs. A cross-check
+against live exchange positions flags (once, not repeatedly) any position
+CoinDCX shows open that has no local tracking record — this can still
+happen for a position opened before this system existed, or in the narrow
+window between order placement and the next snapshot.
 
----
+## Trade history & Telegram commands
 
-## Project Structure
+Every open/close/partial-close event is appended to `/data/trades.jsonl`
+(one JSON object per line) — independent of Railway's log retention
+entirely. From the bot's Telegram chat:
+- `/trades` — sends the full trade history file
+- `/state` — sends the current state snapshot (debugging aid)
+- `/help` — lists commands
 
-```
-liquidity-bot/
-├── main.py                  # Entry point + scheduler
-├── core/
-│   ├── state.py             # Bot state, daily counters, levels
-│   ├── strategy.py          # Signal detection logic
-│   ├── monitor.py           # 1m candle polling loop
-│   └── patterns.py          # Candlestick pattern detection
-├── exchange/
-│   └── delta.py             # Delta Exchange API client
-├── notifications/
-│   └── telegram.py          # Telegram alerts
-├── utils/
-│   └── logger.py            # Rotating file logger
-├── logs/                    # Auto-created
-├── requirements.txt
-├── .env.example
-├── railway.toml
-├── Procfile
-└── .gitignore
-```
+Trade-execution alerts include historical stats (occurrence count, win
+rate, avg/largest move, avg hold time) per symbol once 5+ closed trades
+are logged — shown as "not enough data yet" below that threshold rather
+than a misleadingly precise number from a tiny sample.
 
----
+## Known limitations / open items
 
-## Setup
+- **CoinDCX futures wallet-balance endpoint returns 404** (confirmed since
+  2026-07-17). Margin cap tracking uses the bot's own committed-margin
+  count against an optional `TOTAL_ACCOUNT_MARGIN_USD` env var instead.
+- **Breakeven move uses exact entry price**, not accounting for the taker
+  fee — a breakeven-triggered exit is a small net loss after fees, not a
+  true scratch.
+- **Full backtest comparison of alternate TP methodologies** (PDH/PDL-based,
+  swing-based, ATR-based, trailing) needs several weeks of clean
+  `trades.jsonl` data to be trustworthy — the 7-day sample used to justify
+  the current TP1/TP2/TP3 ladder had too many restart-related gaps for a
+  confident multi-method comparison.
 
-### 1. Clone & install
-```bash
-git clone https://github.com/YOUR_USERNAME/liquidity-bot.git
-cd liquidity-bot
-pip install -r requirements.txt
-```
+## Environment variables
 
-### 2. Configure environment
-```bash
-cp .env.example .env
-# Edit .env with your credentials
-```
-
-Required variables:
-```
-DELTA_API_KEY=        # From Delta Exchange → Account → API
-DELTA_API_SECRET=     # From Delta Exchange → Account → API
-TELEGRAM_BOT_TOKEN=   # From @BotFather on Telegram
-TELEGRAM_CHAT_ID=     # From @userinfobot on Telegram
-TRADE_SIZE_USD=100    # USD per trade (position = this × 5x leverage)
-```
-
-### 3. Run locally
-```bash
-python main.py
-```
-
----
-
-## GitHub Setup
-
-```bash
-git init
-git add .
-git commit -m "Initial commit — liquidity bot"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/liquidity-bot.git
-git push -u origin main
-```
-
----
-
-## Railway Deployment (24/7)
-
-1. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-2. Select your `liquidity-bot` repository
-3. Go to **Variables** tab and add all `.env` values:
-   - `DELTA_API_KEY`
-   - `DELTA_API_SECRET`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-   - `TRADE_SIZE_USD`
-4. Railway will auto-detect `Procfile` and start `python main.py`
-5. Monitor logs in Railway dashboard
-
-**Important:** Set Railway region to **EU West** or **US East** for lowest latency to Delta Exchange.
-
----
-
-## Delta Exchange API Setup
-
-1. Login to [delta.exchange](https://www.delta.exchange)
-2. Go to Account → API Keys → Create New Key
-3. Permissions needed: **Read + Trade** (do NOT enable withdrawal)
-4. Copy API Key and Secret to your `.env`
-
----
-
-## Telegram Bot Setup
-
-1. Open Telegram → search `@BotFather`
-2. Send `/newbot` → follow instructions → copy the token
-3. Open `@userinfobot` → send any message → copy your Chat ID
-4. Add both to `.env`
-
----
-
-## Candlestick Patterns Used
-
-| Pattern | Type | Detection Rule |
-|---------|------|----------------|
-| Bearish Pin Bar | Rejection after PDH sweep | Upper wick ≥ 2× body, body in lower 40% of range |
-| Bullish Pin Bar | Rejection after PDL sweep | Lower wick ≥ 2× body, body in upper 40% of range |
-| Doji (Bearish) | Rejection after PDH sweep | Body ≤ 10% of range, upper wick dominant |
-| Doji (Bullish) | Rejection after PDL sweep | Body ≤ 10% of range, lower wick dominant |
-| Bearish Engulfing | Rejection after PDH sweep | Current bearish body fully engulfs previous body |
-| Bullish Engulfing | Rejection after PDL sweep | Current bullish body fully engulfs previous body |
-
----
-
-## Risk Management
-
-- **Leverage:** Fixed 5x
-- **SL Buffer:** 0.1% beyond rejection candle high/low
-- **Position size:** `TRADE_SIZE_USD × 5 / entry_price` contracts
-- **Max daily loss:** 2 trades × your defined trade size
-- Note: Strategy may stop out 2-3 times before the real move (tight SL by design)
-
----
-
-## Telegram Alerts Reference
-
-| Event | Alert |
-|-------|-------|
-| Bot started | 🤖 Bot started |
-| Daily levels set | ✅ PDH/PDL for all symbols |
-| PDH/PDL fetch failed | ⚠️ CRITICAL alert |
-| Setup detected | 🔍 Symbol, side, pattern, entry, SL |
-| Trade executed | ✅ Full trade details + order ID |
-| Trade skipped (max limit) | ⏭️ Skipped setup details |
-| Order failed | ❌ Error details |
-| Manual intervention needed | ⚠️ Action required |
-
----
-
-## Edge Cases Handled
-
-| Scenario | Handling |
-|----------|----------|
-| PDH/PDL fetch fails | Retry once → Telegram alert → bot paused for day |
-| Order placement fails | Alert sent, NOT counted toward daily limit |
-| SL order fails after entry | Retry once → manual intervention alert |
-| Bot restarts after 5:30 AM | Immediately fetches today's levels |
-| Same symbol fires twice | Second signal ignored (scenario_fired flag) |
-| More than 2 signals in a day | 3rd+ skipped with Telegram notification |
-| Rejection candle invalidated | Cleared if price moves >0.5% away |
+- `COINDCX_API_KEY`, `COINDCX_API_SECRET`
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- `TOTAL_ACCOUNT_MARGIN_USD` (optional — enables the local margin cap)
+- `PERSIST_DIR` (optional — defaults to `/data`, the Railway volume mount)
