@@ -204,7 +204,18 @@ class MarketMonitor:
                 await self._reconcile_positions()
                 await self._update_regime()
 
-                tasks = [self._process_symbol(sym) for sym in SYMBOLS]
+                # Union with self._trailing.keys(): if a symbol was removed
+                # from SYMBOLS (watchlist restructuring) while it still had
+                # an open position, it must keep being monitored until that
+                # position actually closes — otherwise its breakeven-move,
+                # TP ladder, and exit logic silently stop, and the position
+                # becomes invisible to reconciliation even though it's still
+                # live on the exchange. New signals still can't form for it
+                # (strategy.py only evaluates symbols in SYMBOLS), so this
+                # only affects winding down what's already open, never
+                # opens anything new.
+                active_symbols = set(SYMBOLS) | set(self._trailing.keys())
+                tasks = [self._process_symbol(sym) for sym in active_symbols]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
                 self._loops_since_save += 1
@@ -311,7 +322,12 @@ class MarketMonitor:
 
         self._open_positions = positions
 
-        for symbol in SYMBOLS:
+        # Same reasoning as the main loop: a symbol removed from SYMBOLS
+        # (watchlist restructuring) must still be reconciled/closed-out
+        # properly if it has an open position or restored level data —
+        # otherwise its close would go completely undetected.
+        active_symbols = set(SYMBOLS) | set(self._trailing.keys()) | set(positions.keys())
+        for symbol in active_symbols:
             level = self.state.get_level(symbol)
             if level and level.in_trade and symbol not in positions:
                 reason_line = await self._classify_reconciled_exit(symbol)
