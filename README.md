@@ -1,8 +1,16 @@
 # TradeVerse Liquidity Bot
 
 An automated futures trading bot on **CoinDCX**, trading a liquidity-sweep
-reversal strategy across 8 symbols (ETHUSD, SOLUSD, XRPUSD, TAOUSD, AEROUSD,
-LTCUSD, ICPUSD, KAITOUSD), 15-minute candles, 5:30 AM–11:00 PM IST daily.
+reversal strategy across 10 symbols (ETHUSD, SOLUSD, XRPUSD, TAOUSD, AEROUSD,
+LTCUSD, KAITOUSD, DEXEUSD, RIFUSD, ZAMAUSD), 15-minute candles, 5:30 AM–11:00 PM IST daily.
+
+**Symbol restructuring (2026-07-28):** ICPUSD was replaced with DEXEUSD, RIFUSD,
+and ZAMAUSD after a BTC-correlation screen (90-day daily returns) showed these
+three move meaningfully more independently of BTC than ICP did, similar to how
+AERO and KAITO already behaved relative to the rest of the lineup. Candidates
+were also screened for Shariah-compliance concerns (interest/yield-farming-based
+business models) before being shortlisted — this is not a substitute for your
+own or a scholar's review, just an initial filter.
 
 ## Strategy summary
 
