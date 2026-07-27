@@ -9,7 +9,10 @@ import threading
 SYMBOLS = [
     "ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "AEROUSD",
     "LTCUSD",
-    "ICPUSD", "KAITOUSD"
+    "KAITOUSD",
+    "DEXEUSD", "RIFUSD", "ZAMAUSD"  # added 2026-07-28 — replaced ICPUSD
+    # after a BTC-correlation screen showed these three move more
+    # independently of BTC (see conversation history / correlation scan).
 ]
 
 REGIME_SYMBOL = "BTCUSD"
