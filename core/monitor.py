@@ -64,6 +64,31 @@ DAY_END_MINUTE = 0
 
 TRADE_LEVERAGE = 10
 MAX_CONCURRENT_POSITIONS = 2
+
+# Partial take-profit ladder (added per Umar's request after the 7-day MFE
+# analysis showed avg MFE ~0.97R vs avg realized ~0.17R). Applies ONLY to
+# non-trend-mode trades — trend-mode (flip) trades keep the existing
+# SL + ROE-only behavior unchanged, since a fixed-target ladder doesn't fit
+# an entry that's already past the daily PDH/PDL by design.
+# TP3 is capped at the original single-target level (PDH/PDL) — it is NOT
+# a new, more distant target. TP1/TP2 are interior partials closer than
+# that existing target. If TP1's R-multiple would sit beyond TP3, the
+# ladder silently collapses to the old single-TP behavior for that trade
+# (no partial tiers, same as before this change).
+TP_LADDER_R = (1.5, 2.5)  # TP1, TP2 — TP3 is always the original PDH/PDL target
+TP_LADDER_WEIGHTS = (0.34, 0.33, 0.33)  # TP1, TP2, TP3 — must sum to 1.0
+MIN_TRADES_FOR_HISTORICAL_STATS = 5  # below this, message shows "not enough
+                                      # data yet" rather than a misleadingly
+                                      # precise win rate from a tiny sample
+
+# Breakeven stop-move — added after the 7-day loss analysis showed 6 of 9
+# losing trades had moved 0.3R-0.8R in their favor before reversing all the
+# way to full stop-loss. Triggered on raw MFE reaching this R-multiple
+# (checked directly against candle highs/lows), NOT tied to TP1 filling —
+# that keeps it independent of the TP ladder so it also protects trend-mode
+# trades (which skip the ladder and TP1/TP2 entirely) and doesn't depend on
+# a partial-close order having succeeded first.
+BREAKEVEN_TRIGGER_R = 0.5
 STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
                                      # counter-trend confirmations on a
                                      # symbol today, the day's trend
@@ -211,19 +236,26 @@ class MarketMonitor:
             return "reason unknown (no fill data returned)"
 
         price = fill["price"]
-        sl = tr.get("sl")
+        sl = tr.get("live_sl", tr.get("sl"))
         tp = tr.get("tp")
         tolerance = 0.005
 
         if sl and abs(price - sl) / sl <= tolerance:
-            return f"Stop Loss hit (fill ~{price:.4f} vs SL {sl:.4f})"
+            label = "Breakeven Stop hit" if tr.get("breakeven_moved") else "Stop Loss hit"
+            return f"{label} (fill ~{price:.4f} vs SL {sl:.4f})"
         if tp and abs(price - tp) / tp <= tolerance:
             return f"Take Profit hit (fill ~{price:.4f} vs TP {tp:.4f})"
         return f"unclear — fill ~{price:.4f} (entry {tr.get('entry')}, SL {sl}, TP {tp})"
 
-    def _log_close(self, symbol: str, tr: dict, exit_price: Optional[float], reason: str):
-        """Writes one 'close' line to trades.jsonl using whatever we tracked
-        in self._trailing for this symbol (entry/sl/tp/mfe/mae/opened_at)."""
+    def _log_close(self, symbol: str, tr: dict, exit_price: Optional[float], reason: str,
+                    event_type: str = "close"):
+        """Writes one line to trades.jsonl using whatever we tracked in
+        self._trailing for this symbol (entry/sl/tp/mfe/mae/opened_at).
+        event_type='close' means the position is fully done (used for win-rate
+        stats in get_symbol_stats). event_type='partial_close' is a TP1/TP2
+        ladder fill — the trade is still open, and get_symbol_stats
+        deliberately excludes these from win-rate/occurrence counting so a
+        single trade with two partial fills doesn't get counted as three."""
         try:
             entry = tr.get("entry")
             side = tr.get("side")
@@ -244,7 +276,7 @@ class MarketMonitor:
                     rr = round(reward / risk, 3)
 
             persistence.log_trade_event({
-                "event_type": "close",
+                "event_type": event_type,
                 "symbol": symbol,
                 "side": side,
                 "entry": entry,
@@ -340,6 +372,109 @@ class MarketMonitor:
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
+    async def _check_breakeven_move(self, symbol: str, tr: dict):
+        """Once MFE reaches BREAKEVEN_TRIGGER_R, move the exchange-side SL to
+        entry price. Runs for every trade type, including trend-mode. Uses
+        the ORIGINAL sl (tr['sl']) for the risk calculation — tr['sl'] is
+        never mutated, so R-multiple analytics (_log_close, ladder capping)
+        stay correct even after the live stop has moved. tr['live_sl'] is
+        the actual current protective price, used for reconciled-exit
+        classification."""
+        if tr.get("breakeven_moved"):
+            return
+        entry, sl = tr.get("entry"), tr.get("sl")
+        risk = abs(entry - sl) if entry is not None and sl is not None else 0
+        if risk <= 0:
+            return
+
+        mfe = tr.get("mfe", entry)
+        mfe_R = (mfe - entry) / risk if tr["side"] == "BUY" else (entry - mfe) / risk
+        if mfe_R < BREAKEVEN_TRIGGER_R:
+            return
+
+        success = await self.coindcx.update_stop_loss(symbol, new_sl_price=entry)
+        if success:
+            tr["live_sl"] = entry
+            tr["breakeven_moved"] = True
+            logger.info(f"{symbol} | SL moved to breakeven ({entry:.4f}) — MFE reached "
+                       f"{mfe_R:.2f}R (trigger: {BREAKEVEN_TRIGGER_R}R)")
+            await self.telegram.send_alert(
+                f"🛡️ *SL Moved to Breakeven*\n\n"
+                f"*Symbol:* {symbol}\n*New SL:* {entry:.4f} (entry price)\n\n"
+                f"This trade reached +{BREAKEVEN_TRIGGER_R}R — worst case from here is now "
+                f"scratch, not a full loss."
+            )
+        else:
+            logger.warning(f"{symbol} | Failed to move SL to breakeven — will retry next candle "
+                           f"if MFE condition still holds")
+            # breakeven_moved stays False — retried automatically next candle
+
+    async def _check_partial_tp_ladder(self, symbol: str, tr: dict, candle: dict):
+        """Checks TP1/TP2 (interior partials, closer than the original single
+        target) and executes a partial market close on whichever tier the
+        candle has reached, in order. TP3 is NOT handled here — it's the
+        original target/rejection/ROE priority logic below, unchanged, which
+        closes whatever quantity remains at that point.
+
+        Silently does nothing for trades where the ladder was never seeded
+        (tp1_price missing) — that happens when TP1's R-multiple would have
+        sat beyond the original single target at entry time, in which case
+        _handle_signal deliberately skipped seeding the ladder and this
+        trade behaves exactly as it would have before this feature existed."""
+        if "tp1_price" not in tr:
+            return
+        side = tr["side"]
+
+        for tier in (1, 2):
+            price_key, filled_key, weight_key = f"tp{tier}_price", f"tp{tier}_filled", f"tp{tier}_weight"
+            if tr.get(filled_key):
+                continue
+            tp_price = tr[price_key]
+            hit = (candle['high'] >= tp_price) if side == 'BUY' else (candle['low'] <= tp_price)
+            if not hit:
+                continue
+
+            try:
+                live_positions = await self.coindcx.get_open_positions()
+            except Exception as e:
+                logger.error(f"{symbol} | Failed to fetch live position for TP{tier} partial close: {e}",
+                             exc_info=True)
+                return  # try again next candle rather than guessing at quantity
+
+            live_qty = abs(live_positions.get(symbol, 0))
+            if live_qty <= 0:
+                # Position already fully gone (closed some other way) — nothing to partial-close.
+                tr[filled_key] = True
+                continue
+
+            # Portion of the CURRENT remaining quantity, not the original
+            # entry quantity — this is what keeps it safe against the
+            # missing reduce_only guarantee (see coindcx.py comment):
+            # always close a fraction of what's actually live right now.
+            remaining_weight = sum(tr.get(f"tp{t}_weight", 0) for t in (1, 2, 3)
+                                    if not tr.get(f"tp{t}_filled", False))
+            tier_weight = tr[weight_key]
+            close_qty = live_qty * (tier_weight / remaining_weight) if remaining_weight > 0 else live_qty
+
+            success = await self.coindcx.close_position_market(symbol, side, close_qty)
+            if success:
+                tr[filled_key] = True
+                self._log_close(symbol, tr, exit_price=tp_price, reason=f"tp{tier}_partial",
+                                 event_type="partial_close")
+                pct_of_position = round(100 * tier_weight, 0)
+                await self.telegram.send_alert(
+                    f"🎯 *TP{tier} Hit — Partial Close*\n\n"
+                    f"*Symbol:* {symbol}\n*Price:* {tp_price:.4f}\n"
+                    f"*Closed:* ~{pct_of_position:.0f}% of remaining position\n\n"
+                    f"Remainder still running toward "
+                    f"{'TP' + str(tier + 1) if tier == 1 and 'tp2_price' in tr and not tr.get('tp2_filled') else 'final target'}."
+                )
+                logger.info(f"{symbol} | TP{tier} partial close at {tp_price:.4f} (qty {close_qty:.6f})")
+            else:
+                logger.error(f"{symbol} | TP{tier} partial close order failed — will retry next candle "
+                             f"if price still qualifies")
+                return  # don't mark filled; try again next candle
+
     async def _check_exit_conditions(self, symbol: str, candle: dict, prev_candle: Optional[dict]):
         tr = self._trailing.get(symbol)
         if not tr:
@@ -365,7 +500,15 @@ class MarketMonitor:
         skip_target_priorities = tr.get("trend_mode", False)
         details = None  # fetched at most once per candle, reused across priorities
 
+        # Runs regardless of trend_mode — this is the fix for the "worked
+        # then reversed" loss pattern, and trend-mode trades (which skip the
+        # target/rejection priorities entirely) need this protection even
+        # more, since they otherwise only have SL + ROE.
+        await self._check_breakeven_move(symbol, tr)
+
         if not skip_target_priorities:
+            await self._check_partial_tp_ladder(symbol, tr, candle)
+
             if side == 'BUY' and candle['high'] >= target:
                 await self._exit_position(symbol, tr, exit_price=target, reason="target_achieved",
                                            label="Take Profit – Target Achieved")
@@ -597,11 +740,39 @@ class MarketMonitor:
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
                 opened_at_ist = datetime.now(IST).isoformat()
-                self._trailing[symbol] = {"side": signal.side, "entry": signal.entry_price,
-                                           "sl": signal.sl_price, "tp": tp_price,
-                                           "trend_mode": signal.trend_mode,
-                                           "opened_at": opened_at_ist,
-                                           "mfe": signal.entry_price, "mae": signal.entry_price}
+                risk = abs(signal.entry_price - signal.sl_price)
+
+                tr = {"side": signal.side, "entry": signal.entry_price,
+                      "sl": signal.sl_price, "live_sl": signal.sl_price,
+                      "breakeven_moved": False,
+                      "tp": tp_price,
+                      "trend_mode": signal.trend_mode,
+                      "opened_at": opened_at_ist,
+                      "mfe": signal.entry_price, "mae": signal.entry_price}
+
+                # Seed the TP1/TP2 partial ladder — only for non-trend-mode
+                # trades, and only if each tier's R-multiple sits strictly
+                # closer than the original single target (tp_price). If TP1
+                # would already be beyond that target, skip the ladder
+                # entirely for this trade — it behaves exactly as before.
+                if not signal.trend_mode and risk > 0:
+                    candidate_prices = []
+                    for r in TP_LADDER_R:
+                        p = (signal.entry_price + r * risk if signal.side == 'BUY'
+                             else signal.entry_price - r * risk)
+                        candidate_prices.append(p)
+                    within_target = all(
+                        (p <= tp_price if signal.side == 'BUY' else p >= tp_price)
+                        for p in candidate_prices
+                    )
+                    if within_target:
+                        tr["tp1_price"] = candidate_prices[0]
+                        tr["tp2_price"] = candidate_prices[1]
+                        tr["tp1_filled"] = False
+                        tr["tp2_filled"] = False
+                        tr["tp1_weight"], tr["tp2_weight"], tr["tp3_weight"] = TP_LADDER_WEIGHTS
+
+                self._trailing[symbol] = tr
                 self._open_positions[symbol] = quantity_filled
                 persistence.log_trade_event({
                     "event_type": "open", "symbol": symbol, "side": signal.side,
@@ -628,17 +799,55 @@ class MarketMonitor:
                 if signal.trend_mode:
                     tp_note = ("🎯 Trend-aligned trade — no fixed resting TP set (target would sit "
                               "behind entry). Exit runs on stop-loss + ROE protection only.")
+                    tp_lines = ""
+                    rr_lines = ""
                 else:
-                    tp_note = (f"🎯 Resting take-profit set at {tp_price:.4f} (Priority 1 target)."
+                    tp_note = (f"🎯 Resting take-profit (dead-man's-switch) set at {tp_price:.4f} — "
+                              f"fires if the bot itself ever goes down before managing exits."
                               if tp_set else
-                              f"⚠️ Could not set a resting take-profit order — Priority 1 will still "
-                              f"be enforced by the bot on each closed candle, with possible minor "
-                              f"slippage. Check CoinDCX manually if concerned.")
+                              f"⚠️ Could not set the resting take-profit safety order — the bot's own "
+                              f"candle-by-candle logic will still enforce all exits, but there's no "
+                              f"exchange-side backstop if the bot is down. Check CoinDCX manually if concerned.")
+
+                    if "tp1_price" in tr:
+                        tp_lines = (f"*TP1:* {tr['tp1_price']:.4f} (34%)\n"
+                                   f"*TP2:* {tr['tp2_price']:.4f} (33%)\n"
+                                   f"*TP3:* {tp_price:.4f} (33%, final target)\n")
+                        rr_lines = (f"*Expected RR:*\n"
+                                   f"1:{TP_LADDER_R[0]}\n1:{TP_LADDER_R[1]}\n"
+                                   f"1:{round(abs(tp_price - signal.entry_price) / risk, 1) if risk else '—'}\n")
+                    else:
+                        tp_lines = f"*TP:* {tp_price:.4f} (single target — TP1/TP2 would've sat beyond it)\n"
+                        rr_lines = (f"*Expected RR:* 1:{round(abs(tp_price - signal.entry_price) / risk, 1)}\n"
+                                   if risk else "")
+
+                stats = persistence.get_symbol_stats(symbol)
+                if stats["has_enough_data"]:
+                    confidence = ("HIGH" if stats["win_rate_pct"] >= 60 else
+                                  "MEDIUM" if stats["win_rate_pct"] >= 45 else "LOW")
+                    stats_block = (
+                        f"*Confidence:* {confidence} _(heuristic from historical win rate — not a guarantee)_\n"
+                        f"*Historical Win Rate:* {stats['win_rate_pct']:.0f}% ({stats['count']} closed trades)\n"
+                        + (f"*Avg Hold Time:* {stats['avg_hold_minutes']:.0f} min\n" if stats['avg_hold_minutes'] else "")
+                        + f"\nThis setup has occurred {stats['count']} times.\n"
+                        + (f"Average move: {stats['avg_move_pct']:+.2f}%\n" if stats['avg_move_pct'] is not None else "")
+                        + (f"Largest move: {stats['largest_move_pct']:+.2f}%\n" if stats['largest_move_pct'] is not None else "")
+                    )
+                else:
+                    n = stats["count"]
+                    stats_block = (
+                        f"*Confidence:* N/A — not enough history yet ({n}/{MIN_TRADES_FOR_HISTORICAL_STATS} "
+                        f"closed trades logged for {symbol})\n"
+                        f"*Historical Win Rate:* N/A — will show once {MIN_TRADES_FOR_HISTORICAL_STATS}+ "
+                        f"trades are logged\n"
+                    )
 
                 msg = (
                     f"✅ *Trade Executed*\n\n"
                     f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                    f"{tp_lines}{rr_lines}\n"
+                    f"{stats_block}\n"
                     f"*Margin:* ${margin_usd:.2f}\n*Leverage:* {TRADE_LEVERAGE}x\n"
                     f"*Exposure:* ${margin_usd * TRADE_LEVERAGE:.2f}\n*Quantity:* {quantity_filled}\n"
                     f"*Order ID:* `{order_id}`\n*Open positions:* {len(self._open_positions)}/{MAX_CONCURRENT_POSITIONS}\n\n"
