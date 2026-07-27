@@ -53,6 +53,7 @@ from core.state import BotState, SYMBOLS, REGIME_SYMBOL, TradeRecord
 from core.strategy import StrategyEngine, Signal
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
+from core import persistence
 from utils.logger import setup_logger
 logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
@@ -137,6 +138,18 @@ class MarketMonitor:
         self._open_positions: dict = {}
         self._trailing: dict = {}
         self._position_lock = asyncio.Lock()
+        self._loops_since_save = 0
+        self._SAVE_EVERY_N_LOOPS = 4  # ~1 minute at POLL_INTERVAL_SECONDS=15
+
+    def restore_trailing(self, trailing: dict):
+        """Called once from main.py at startup if a same-day state snapshot
+        was found. Restores in-flight SL/TP/MFE/MAE tracking so the exit
+        logic (_check_exit_conditions) resumes correctly after a restart,
+        instead of going dark on any position that was open when the
+        process stopped."""
+        self._trailing = trailing or {}
+        if self._trailing:
+            logger.info(f"Restored trailing state for: {list(self._trailing.keys())}")
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(IST)
@@ -159,6 +172,11 @@ class MarketMonitor:
 
                 tasks = [self._process_symbol(sym) for sym in SYMBOLS]
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+                self._loops_since_save += 1
+                if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
+                    persistence.save_state(self.state, self._trailing)
+                    self._loops_since_save = 0
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}", exc_info=True)
@@ -202,6 +220,47 @@ class MarketMonitor:
             return f"Take Profit hit (fill ~{price:.4f} vs TP {tp:.4f})"
         return f"unclear — fill ~{price:.4f} (entry {tr.get('entry')}, SL {sl}, TP {tp})"
 
+    def _log_close(self, symbol: str, tr: dict, exit_price: Optional[float], reason: str):
+        """Writes one 'close' line to trades.jsonl using whatever we tracked
+        in self._trailing for this symbol (entry/sl/tp/mfe/mae/opened_at)."""
+        try:
+            entry = tr.get("entry")
+            side = tr.get("side")
+            opened_at = tr.get("opened_at")
+            duration_minutes = None
+            if opened_at:
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at)
+                    duration_minutes = round((datetime.now(IST) - opened_dt).total_seconds() / 60, 1)
+                except Exception:
+                    pass
+
+            rr = None
+            if exit_price is not None and entry is not None and tr.get("sl") is not None:
+                risk = abs(entry - tr["sl"])
+                if risk > 0:
+                    reward = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+                    rr = round(reward / risk, 3)
+
+            persistence.log_trade_event({
+                "event_type": "close",
+                "symbol": symbol,
+                "side": side,
+                "entry": entry,
+                "sl": tr.get("sl"),
+                "tp": tr.get("tp"),
+                "trend_mode": tr.get("trend_mode", False),
+                "exit_price": exit_price,
+                "reason": reason,
+                "mfe_price": tr.get("mfe"),
+                "mae_price": tr.get("mae"),
+                "opened_at_ist": opened_at,
+                "duration_minutes": duration_minutes,
+                "realized_rr": rr,
+            })
+        except Exception as e:
+            logger.error(f"{symbol} | Failed to log trade close event: {e}", exc_info=True)
+
     async def _reconcile_positions(self):
         try:
             positions = await self.coindcx.get_open_positions()
@@ -215,6 +274,9 @@ class MarketMonitor:
             level = self.state.get_level(symbol)
             if level and level.in_trade and symbol not in positions:
                 reason_line = await self._classify_reconciled_exit(symbol)
+                tr = self._trailing.get(symbol)
+                if tr:
+                    self._log_close(symbol, tr, exit_price=None, reason=reason_line)
                 self.state.reset_symbol_watch(symbol)
                 self._trailing.pop(symbol, None)
                 logger.info(f"{symbol} | Position closed ({reason_line}) — resuming watch for fresh setups")
@@ -223,6 +285,25 @@ class MarketMonitor:
                     f"*Symbol:* {symbol}\n"
                     f"*Likely reason:* {reason_line}\n\n"
                     f"Resuming watch for fresh liquidity setups on this symbol."
+                )
+
+            # Orphan check: exchange shows an open position we have no local
+            # trailing record for. Happens if the process restarted between
+            # order placement and the next periodic save, or (before this
+            # fix existed) after any restart at all. We can't reconstruct
+            # the original SL/TP/scenario from the exchange alone, so this
+            # is a manual-review flag, not an auto-fix.
+            if symbol in positions and symbol not in self._trailing:
+                logger.warning(f"{symbol} | Exchange shows an open position with no local "
+                               f"tracking (orphaned after restart?) — flagging for manual review")
+                await self.telegram.send_alert(
+                    f"⚠️ *Untracked Open Position*\n\n"
+                    f"*Symbol:* {symbol}\n\n"
+                    f"CoinDCX shows this position open, but the bot has no local SL/TP/entry "
+                    f"record for it (likely a restart between order placement and the last "
+                    f"state save). The bot's exit logic will NOT monitor this position until "
+                    f"you either close it manually or it hits its exchange-side SL. "
+                    f"Please check CoinDCX directly."
                 )
 
     async def _process_symbol(self, symbol: str):
@@ -261,6 +342,18 @@ class MarketMonitor:
             return
 
         side = tr["side"]
+
+        # Track max favorable / max adverse excursion every candle, regardless
+        # of exit priority outcome below — this is what makes the "if I'd
+        # held longer" TP analysis possible without re-deriving it from raw
+        # candle logs after the fact.
+        if side == 'BUY':
+            tr["mfe"] = max(tr.get("mfe", tr["entry"]), candle['high'])
+            tr["mae"] = min(tr.get("mae", tr["entry"]), candle['low'])
+        else:
+            tr["mfe"] = min(tr.get("mfe", tr["entry"]), candle['low'])
+            tr["mae"] = max(tr.get("mae", tr["entry"]), candle['high'])
+
         target = level.pdh if side == 'BUY' else level.pdl
         skip_target_priorities = tr.get("trend_mode", False)
         details = None  # fetched at most once per candle, reused across priorities
@@ -335,6 +428,7 @@ class MarketMonitor:
         if quantity <= 0:
             logger.warning(f"{symbol} | No live position found on exchange at exit time "
                            f"(reason={reason}) — skipping close call, resetting local state only")
+            self._log_close(symbol, tr, exit_price=None, reason=f"{reason}_already_closed")
             self.state.reset_symbol_watch(symbol)
             self._trailing.pop(symbol, None)
             self._open_positions.pop(symbol, None)
@@ -362,6 +456,7 @@ class MarketMonitor:
             )
             logger.error(f"{symbol} | Failed to auto-close on {reason} trigger")
 
+        self._log_close(symbol, tr, exit_price=exit_price, reason=reason)
         self.state.reset_symbol_watch(symbol)
         self._trailing.pop(symbol, None)
         self._open_positions.pop(symbol, None)
@@ -494,10 +589,23 @@ class MarketMonitor:
                 self.state.mark_auto_traded(symbol)
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
+                opened_at_ist = datetime.now(IST).isoformat()
                 self._trailing[symbol] = {"side": signal.side, "entry": signal.entry_price,
                                            "sl": signal.sl_price, "tp": tp_price,
-                                           "trend_mode": signal.trend_mode}
+                                           "trend_mode": signal.trend_mode,
+                                           "opened_at": opened_at_ist,
+                                           "mfe": signal.entry_price, "mae": signal.entry_price}
                 self._open_positions[symbol] = quantity_filled
+                persistence.log_trade_event({
+                    "event_type": "open", "symbol": symbol, "side": signal.side,
+                    "entry": signal.entry_price, "sl": signal.sl_price, "tp": tp_price,
+                    "trend_mode": signal.trend_mode, "scenario": signal.scenario,
+                    "order_id": order_id, "opened_at_ist": opened_at_ist,
+                })
+                # Snapshot immediately after opening rather than waiting for the
+                # next periodic save — a restart in the seconds right after
+                # entry is exactly the window the orphan-check above exists for.
+                persistence.save_state(self.state, self._trailing)
 
                 tp_set = False
                 if not signal.trend_mode:
