@@ -140,6 +140,7 @@ class MarketMonitor:
         self._position_lock = asyncio.Lock()
         self._loops_since_save = 0
         self._SAVE_EVERY_N_LOOPS = 4  # ~1 minute at POLL_INTERVAL_SECONDS=15
+        self._orphan_alerted: set = set()  # symbols already flagged this run —
 
     def restore_trailing(self, trailing: dict):
         """Called once from main.py at startup if a same-day state snapshot
@@ -294,17 +295,23 @@ class MarketMonitor:
             # the original SL/TP/scenario from the exchange alone, so this
             # is a manual-review flag, not an auto-fix.
             if symbol in positions and symbol not in self._trailing:
-                logger.warning(f"{symbol} | Exchange shows an open position with no local "
-                               f"tracking (orphaned after restart?) — flagging for manual review")
-                await self.telegram.send_alert(
-                    f"⚠️ *Untracked Open Position*\n\n"
-                    f"*Symbol:* {symbol}\n\n"
-                    f"CoinDCX shows this position open, but the bot has no local SL/TP/entry "
-                    f"record for it (likely a restart between order placement and the last "
-                    f"state save). The bot's exit logic will NOT monitor this position until "
-                    f"you either close it manually or it hits its exchange-side SL. "
-                    f"Please check CoinDCX directly."
-                )
+                if symbol not in self._orphan_alerted:
+                    logger.warning(f"{symbol} | Exchange shows an open position with no local "
+                                   f"tracking (orphaned after restart?) — flagging for manual review")
+                    await self.telegram.send_alert(
+                        f"⚠️ *Untracked Open Position*\n\n"
+                        f"*Symbol:* {symbol}\n\n"
+                        f"CoinDCX shows this position open, but the bot has no local SL/TP/entry "
+                        f"record for it (likely a restart between order placement and the last "
+                        f"state save). The bot's exit logic will NOT monitor this position until "
+                        f"you either close it manually or it hits its exchange-side SL. "
+                        f"This alert won't repeat — check CoinDCX when you can."
+                    )
+                    self._orphan_alerted.add(symbol)
+            elif symbol in self._orphan_alerted:
+                # Position resolved (closed manually, or trailing was restored) —
+                # allow a fresh alert if it somehow becomes orphaned again later.
+                self._orphan_alerted.discard(symbol)
 
     async def _process_symbol(self, symbol: str):
         try:
