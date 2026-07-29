@@ -623,13 +623,28 @@ class MarketMonitor:
                                    f"{MIN_ROE_FOR_REJECTION_EXIT_PCT}% minimum — holding for more "
                                    f"confirmation instead of exiting early")
 
-        if details is None:
-            details = await self.coindcx.get_position_details(symbol)
-        if details and details.get("roe") is not None and details["roe"] >= ROE_TARGET_PCT:
-            await self._exit_position(symbol, tr, exit_price=candle['close'],
-                                       reason="roe_protection", label="Take Profit – ROE Protection",
-                                       roe=details["roe"])
-            return
+        # 2026-07-29: skip the blanket ROE-protection check once the TP
+        # ladder has actually started filling (TP1 done). Confirmed via a
+        # real AERO trade that ROE_TARGET_PCT (7%) sits BELOW TP1's own
+        # ROE-equivalent for typical risk setups (~14-15%) — meaning ROE-
+        # protection was firing on the exact same candle as TP1 and sweeping
+        # up the entire remainder before TP2/TP3 ever got a chance, even
+        # though price was still moving favorably, not reversing. Once TP1
+        # has filled, the remainder's downside is already capped at
+        # breakeven-or-better (via the staged ratchet above), so letting it
+        # run toward TP2/TP3 without a lower-bar safety net cutting it short
+        # is a deliberate choice, not an oversight — accepted tradeoff:
+        # a reversal before TP2 now closes at breakeven instead of the
+        # smaller-but-locked-in profit ROE-protection used to guarantee.
+        ladder_already_running = tr.get("tp1_filled", False)
+        if not ladder_already_running:
+            if details is None:
+                details = await self.coindcx.get_position_details(symbol)
+            if details and details.get("roe") is not None and details["roe"] >= ROE_TARGET_PCT:
+                await self._exit_position(symbol, tr, exit_price=candle['close'],
+                                           reason="roe_protection", label="Take Profit – ROE Protection",
+                                           roe=details["roe"])
+                return
 
     async def _exit_position(self, symbol: str, tr: dict, exit_price: float, reason: str,
                               label: str, roe: Optional[float] = None):
