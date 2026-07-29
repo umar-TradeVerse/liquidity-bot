@@ -277,8 +277,8 @@ class MarketMonitor:
         """Writes one line to trades.jsonl using whatever we tracked in
         self._trailing for this symbol (entry/sl/tp/mfe/mae/opened_at).
         event_type='close' means the position is fully done (used for win-rate
-        stats in get_symbol_stats). event_type='partial_close' is a TP1/TP2
-        ladder fill — the trade is still open, and get_symbol_stats
+        stats in get_pattern_stats). event_type='partial_close' is a TP1/TP2
+        ladder fill — the trade is still open, and get_pattern_stats
         deliberately excludes these from win-rate/occurrence counting so a
         single trade with two partial fills doesn't get counted as three."""
         try:
