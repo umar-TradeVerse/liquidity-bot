@@ -335,7 +335,21 @@ class MarketMonitor:
         active_symbols = set(SYMBOLS) | set(self._trailing.keys()) | set(positions.keys())
         for symbol in active_symbols:
             level = self.state.get_level(symbol)
-            if level and level.in_trade and symbol not in positions:
+            # BUG FIX (2026-07-29): was `if level and level.in_trade and symbol
+            # not in positions`. This missed a real case — SOLUSD was closed
+            # manually outside the bot, but the closure happened in the
+            # window before a daily reset (which rebuilds level.in_trade to
+            # False for everyone, correctly, since it has no memory of the
+            # old trade). That reset wiping in_trade to False meant this
+            # check never fired again, even though self._trailing still had
+            # a stale entry — and _check_exit_conditions only checks
+            # `symbol in self._trailing`, not level.in_trade, so the bot kept
+            # trying to manage a position that no longer existed, forever.
+            # self._trailing is the more reliable source of truth for "am I
+            # tracking this as open" — checking it directly (not just
+            # level.in_trade) closes this gap.
+            locally_tracked_open = (level and level.in_trade) or (symbol in self._trailing)
+            if locally_tracked_open and symbol not in positions:
                 reason_line = await self._classify_reconciled_exit(symbol)
                 tr = self._trailing.get(symbol)
                 if tr:
