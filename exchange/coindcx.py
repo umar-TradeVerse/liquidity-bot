@@ -709,7 +709,20 @@ class CoinDCXClient:
             "/exchange/v1/derivatives/futures/positions",
             {"timestamp": timestamp}
         )
-        entries = positions_result if isinstance(positions_result, list) else []
+        # BUG FIX (2026-07-29): same class of bug as get_position_details —
+        # only handled the bare-list response shape. Very likely the actual
+        # cause of SOLUSD's repeated "Could not find an open position id —
+        # SL not updated" breakeven-move failures.
+        if isinstance(positions_result, list):
+            entries = positions_result
+        elif isinstance(positions_result, dict) and "positions" in positions_result:
+            entries = positions_result["positions"]
+        else:
+            if positions_result is not None:
+                logger.warning(f"{symbol} | Unexpected positions response shape in "
+                               f"update_stop_loss: {type(positions_result)} — "
+                               f"raw: {str(positions_result)[:300]}")
+            entries = []
 
         position_id = None
         for entry in entries:
@@ -770,7 +783,21 @@ class CoinDCXClient:
             "/exchange/v1/derivatives/futures/positions",
             {"timestamp": timestamp}
         )
-        entries = positions_result if isinstance(positions_result, list) else []
+        # BUG FIX (2026-07-29): same class of bug as get_position_details and
+        # update_stop_loss — only handled the bare-list response shape. Very
+        # likely explains the original KAITOUSD "Could not find an open
+        # position id — TP/SL not updated" / "TP set attempt 1/3 failed"
+        # warning seen right at trade-open time.
+        if isinstance(positions_result, list):
+            entries = positions_result
+        elif isinstance(positions_result, dict) and "positions" in positions_result:
+            entries = positions_result["positions"]
+        else:
+            if positions_result is not None:
+                logger.warning(f"{symbol} | Unexpected positions response shape in "
+                               f"update_position_tpsl: {type(positions_result)} — "
+                               f"raw: {str(positions_result)[:300]}")
+            entries = []
 
         position_id = None
         for entry in entries:
