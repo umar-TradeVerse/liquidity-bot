@@ -615,9 +615,15 @@ class CoinDCXClient:
         # with zero trace in the logs. Now it's at least a visible WARNING,
         # so a repeat of the KAITOUSD incident (or any new failure mode) is
         # immediately diagnosable instead of requiring a full code audit.
+        # 2026-07-29: also dumping the actual pair values seen, since the
+        # list/dict shape fix alone didn't resolve SOLUSD — there are real
+        # entries in the response, just none matching "B-SOL_USDT" exactly,
+        # which points at a pair-naming mismatch, not a parsing failure.
+        seen_pairs = [e.get("pair") for e in entries if isinstance(e, dict)]
         logger.warning(f"{symbol} | get_position_details found no matching open position "
-                       f"for pair {coindcx_symbol} — ROE-protection cannot run this candle. "
-                       f"({len(entries)} total entries in response)")
+                       f"for expected pair '{coindcx_symbol}' — ROE-protection cannot run "
+                       f"this candle. ({len(entries)} total entries in response) "
+                       f"Actual pair values seen: {seen_pairs}")
         return None
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
@@ -738,7 +744,9 @@ class CoinDCXClient:
                 break
 
         if not position_id:
-            logger.error(f"{symbol} | Could not find an open position id — SL not updated")
+            seen_pairs = [e.get("pair") for e in entries if isinstance(e, dict)]
+            logger.error(f"{symbol} | Could not find an open position id for expected pair "
+                        f"'{coindcx_symbol}' — SL not updated. Actual pair values seen: {seen_pairs}")
             return False
 
         instrument = await self._get_instrument_details(coindcx_symbol)
@@ -813,7 +821,9 @@ class CoinDCXClient:
                 break
 
         if not position_id:
-            logger.error(f"{symbol} | Could not find an open position id — TP/SL not updated")
+            seen_pairs = [e.get("pair") for e in entries if isinstance(e, dict)]
+            logger.error(f"{symbol} | Could not find an open position id for expected pair "
+                        f"'{coindcx_symbol}' — TP/SL not updated. Actual pair values seen: {seen_pairs}")
             return False
 
         instrument = await self._get_instrument_details(coindcx_symbol)
