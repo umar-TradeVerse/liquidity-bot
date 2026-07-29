@@ -83,20 +83,26 @@ MIN_TRADES_FOR_HISTORICAL_STATS = 5  # below this, message shows "not enough
 
 # Breakeven stop-move — added after the 7-day loss analysis showed 6 of 9
 # losing trades had moved 0.3R-0.8R in their favor before reversing all the
-# way to full stop-loss. Triggered on raw MFE reaching this R-multiple
+# way to full stop-loss. Triggered on raw MFE reaching an R-multiple
 # (checked directly against candle highs/lows), NOT tied to TP1 filling —
 # that keeps it independent of the TP ladder so it also protects trend-mode
 # trades (which skip the ladder and TP1/TP2 entirely) and doesn't depend on
 # a partial-close order having succeeded first.
 #
-# Raised from 0.5R to 1.0R on 2026-07-27 after a real case where the trade
-# moved to breakeven, got clipped by a small reversal wick, and then the
-# original favorable move resumed hard right after. This is an inherent
-# tradeoff of any breakeven-stop system, not a bug — 1.0R requires a bigger
-# favorable move before locking in breakeven, reducing how often normal
-# noise triggers it, at the cost of giving back more on trades that reverse
-# between 0.5R and 1.0R (which the original 0.5R setting would have caught).
-BREAKEVEN_TRIGGER_R = 1.0
+# Went through two single-threshold versions before landing on a staged
+# ratchet (2026-07-29):
+#   0.5R (original) — ETHUSD moved to exact breakeven, then got clipped by
+#     a small reversal wick right before the original move resumed hard.
+#   1.0R (the fix for the above, 2026-07-27) — KAITOUSD then moved only
+#     ~0.47R and reversed to a FULL loss, since 1.0R never triggered at all.
+# There's no single number that avoids both failure modes — it's a genuine
+# structural tradeoff, not a tuning problem. A staged ratchet reduces the
+# SEVERITY of the failure instead: partial protection kicks in earlier (so
+# a KAITOUSD-style reversal takes a smaller loss, not the full one), while
+# full breakeven still requires a more convincing move (so an ETHUSD-style
+# small wick is less likely to clip it).
+BREAKEVEN_STAGE1_R = 0.4   # partial: cut remaining risk roughly in half
+BREAKEVEN_STAGE2_R = 1.0   # full: move SL all the way to entry
 STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
                                      # counter-trend confirmations on a
                                      # symbol today, the day's trend
@@ -397,15 +403,18 @@ class MarketMonitor:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
     async def _check_breakeven_move(self, symbol: str, tr: dict):
-        """Once MFE reaches BREAKEVEN_TRIGGER_R, move the exchange-side SL to
-        entry price. Runs for every trade type, including trend-mode. Uses
-        the ORIGINAL sl (tr['sl']) for the risk calculation — tr['sl'] is
-        never mutated, so R-multiple analytics (_log_close, ladder capping)
-        stay correct even after the live stop has moved. tr['live_sl'] is
-        the actual current protective price, used for reconciled-exit
-        classification."""
-        if tr.get("breakeven_moved"):
-            return
+        """Two-stage SL ratchet based on MFE:
+          Stage 1 (BREAKEVEN_STAGE1_R): move SL partway — halfway between the
+            original SL and entry — cutting max remaining loss roughly in half.
+          Stage 2 (BREAKEVEN_STAGE2_R): move SL the rest of the way to entry.
+        Runs for every trade type, including trend-mode. Uses the ORIGINAL
+        sl (tr['sl']) for the risk calculation — tr['sl'] is never mutated,
+        so R-multiple analytics (_log_close, ladder capping) stay correct
+        even after the live stop has moved. tr['live_sl'] is the actual
+        current protective price, used for reconciled-exit classification.
+        Each stage only ever fires once, and stage 2 can fire directly
+        without stage 1 having happened first if price gapped past both
+        thresholds in a single candle."""
         entry, sl = tr.get("entry"), tr.get("sl")
         risk = abs(entry - sl) if entry is not None and sl is not None else 0
         if risk <= 0:
@@ -413,25 +422,46 @@ class MarketMonitor:
 
         mfe = tr.get("mfe", entry)
         mfe_R = (mfe - entry) / risk if tr["side"] == "BUY" else (entry - mfe) / risk
-        if mfe_R < BREAKEVEN_TRIGGER_R:
+
+        # Stage 2 first — if price already moved far enough to skip straight
+        # past stage 1, go directly to full breakeven rather than parking at
+        # a partial level that's already stale.
+        if not tr.get("breakeven_moved") and mfe_R >= BREAKEVEN_STAGE2_R:
+            success = await self.coindcx.update_stop_loss(symbol, new_sl_price=entry)
+            if success:
+                tr["live_sl"] = entry
+                tr["breakeven_moved"] = True
+                tr["breakeven_stage1_moved"] = True  # stage 1 is superseded, mark done
+                logger.info(f"{symbol} | SL moved to full breakeven ({entry:.4f}) — MFE reached "
+                           f"{mfe_R:.2f}R (stage 2 trigger: {BREAKEVEN_STAGE2_R}R)")
+                await self.telegram.send_alert(
+                    f"🛡️ *SL Moved to Breakeven*\n\n"
+                    f"*Symbol:* {symbol}\n*New SL:* {entry:.4f} (entry price)\n\n"
+                    f"This trade reached +{BREAKEVEN_STAGE2_R}R — worst case from here is now "
+                    f"scratch, not a full loss."
+                )
+            else:
+                logger.warning(f"{symbol} | Failed to move SL to full breakeven — will retry "
+                               f"next candle if MFE condition still holds")
             return
 
-        success = await self.coindcx.update_stop_loss(symbol, new_sl_price=entry)
-        if success:
-            tr["live_sl"] = entry
-            tr["breakeven_moved"] = True
-            logger.info(f"{symbol} | SL moved to breakeven ({entry:.4f}) — MFE reached "
-                       f"{mfe_R:.2f}R (trigger: {BREAKEVEN_TRIGGER_R}R)")
-            await self.telegram.send_alert(
-                f"🛡️ *SL Moved to Breakeven*\n\n"
-                f"*Symbol:* {symbol}\n*New SL:* {entry:.4f} (entry price)\n\n"
-                f"This trade reached +{BREAKEVEN_TRIGGER_R}R — worst case from here is now "
-                f"scratch, not a full loss."
-            )
-        else:
-            logger.warning(f"{symbol} | Failed to move SL to breakeven — will retry next candle "
-                           f"if MFE condition still holds")
-            # breakeven_moved stays False — retried automatically next candle
+        if not tr.get("breakeven_stage1_moved") and mfe_R >= BREAKEVEN_STAGE1_R:
+            partial_sl = (entry + sl) / 2  # halfway between original SL and entry
+            success = await self.coindcx.update_stop_loss(symbol, new_sl_price=partial_sl)
+            if success:
+                tr["live_sl"] = partial_sl
+                tr["breakeven_stage1_moved"] = True
+                logger.info(f"{symbol} | SL moved to partial breakeven ({partial_sl:.4f}) — MFE "
+                           f"reached {mfe_R:.2f}R (stage 1 trigger: {BREAKEVEN_STAGE1_R}R)")
+                await self.telegram.send_alert(
+                    f"🛡️ *SL Moved to Partial Breakeven*\n\n"
+                    f"*Symbol:* {symbol}\n*New SL:* {partial_sl:.4f} (halfway to entry)\n\n"
+                    f"This trade reached +{BREAKEVEN_STAGE1_R}R — remaining risk is now roughly "
+                    f"half of the original. Full breakeven locks in at +{BREAKEVEN_STAGE2_R}R."
+                )
+            else:
+                logger.warning(f"{symbol} | Failed to move SL to partial breakeven — will retry "
+                               f"next candle if MFE condition still holds")
 
     async def _check_partial_tp_ladder(self, symbol: str, tr: dict, candle: dict):
         """Checks TP1/TP2 (interior partials, closer than the original single
@@ -769,6 +799,7 @@ class MarketMonitor:
                 tr = {"side": signal.side, "entry": signal.entry_price,
                       "sl": signal.sl_price, "live_sl": signal.sl_price,
                       "breakeven_moved": False,
+                      "breakeven_stage1_moved": False,
                       "tp": tp_price,
                       "trend_mode": signal.trend_mode,
                       "opened_at": opened_at_ist,
