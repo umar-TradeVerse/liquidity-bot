@@ -554,7 +554,26 @@ class CoinDCXClient:
         timestamp = int(time.time() * 1000)
         body = {"timestamp": timestamp}
         result = await self._post("/exchange/v1/derivatives/futures/positions", body)
-        entries = result if isinstance(result, list) else []
+
+        # BUG FIX (2026-07-29): this used to be
+        #   entries = result if isinstance(result, list) else []
+        # which silently returned an empty list — and therefore a silent
+        # `return None` below — every time the API returned the dict-wrapped
+        # shape ({"positions": [...]}) instead of a bare list. get_open_positions()
+        # already correctly handled both shapes; this function didn't, meaning
+        # ROE-protection could go dark indefinitely with zero errors logged.
+        # This is the likely root cause of a real KAITOUSD trade riding a
+        # ~100% ROE swing all the way back down to a full stop-loss without
+        # ROE-protection ever firing.
+        if isinstance(result, list):
+            entries = result
+        elif isinstance(result, dict) and "positions" in result:
+            entries = result["positions"]
+        else:
+            if result is not None:
+                logger.warning(f"{symbol} | Unexpected positions response shape in "
+                               f"get_position_details: {type(result)} — raw: {str(result)[:300]}")
+            entries = []
 
         for entry in entries:
             if not isinstance(entry, dict) or entry.get("pair") != coindcx_symbol:
@@ -591,6 +610,14 @@ class CoinDCXClient:
             return {"id": entry.get("id"), "active_pos": active, "roe": roe,
                     "pnl": pnl, "mark_price": mark_price, "raw": entry}
 
+        # No matching open position found for this symbol. This used to be a
+        # silent `return None` — meaning ROE-protection could fail invisibly
+        # with zero trace in the logs. Now it's at least a visible WARNING,
+        # so a repeat of the KAITOUSD incident (or any new failure mode) is
+        # immediately diagnosable instead of requiring a full code audit.
+        logger.warning(f"{symbol} | get_position_details found no matching open position "
+                       f"for pair {coindcx_symbol} — ROE-protection cannot run this candle. "
+                       f"({len(entries)} total entries in response)")
         return None
 
     async def get_open_orders(self, symbol: str) -> Optional[list]:
