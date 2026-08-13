@@ -50,7 +50,7 @@ import pytz
 import os
 
 from core.state import BotState, SYMBOLS, REGIME_SYMBOL, TradeRecord
-from core.strategy import StrategyEngine, Signal
+from core.strategy import StrategyEngine, Signal, ENTRY_EXPIRY_MINUTES
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
 from core import persistence
@@ -410,6 +410,27 @@ class MarketMonitor:
                 await self._check_exit_conditions(symbol, candle, prev_candle)
 
             signal = self.engine.process_candle(symbol, candle)
+
+            # Rule 4 (2026-08-13) expiry alerts — drained here rather than
+            # via the Signal return path, since an expiry was never a
+            # confirmed entry. Filtered to this symbol since the engine's
+            # queue is shared across all symbols processed concurrently.
+            if self.engine.pending_expiry_alerts:
+                remaining = []
+                for ev in self.engine.pending_expiry_alerts:
+                    if ev['symbol'] == symbol:
+                        await self.telegram.send_alert(
+                            f"⏱️ *Setup Expired — Entry Not Triggered in Time*\n\n"
+                            f"*Symbol:* {symbol}\n*Side:* {ev['side']}\n"
+                            f"*Elapsed:* {ev['elapsed_minutes']} min "
+                            f"(limit: {ENTRY_EXPIRY_MINUTES} min)\n\n"
+                            f"No entry confirmed within the window — waiting for a "
+                            f"completely fresh liquidity sweep."
+                        )
+                    else:
+                        remaining.append(ev)
+                self.engine.pending_expiry_alerts = remaining
+
             if signal:
                 await self._handle_signal(signal)
 
@@ -698,6 +719,24 @@ class MarketMonitor:
         symbol = signal.symbol
         level = self.state.get_level(symbol)
 
+        # Rules 1-3 (2026-08-13) — SL too wide, or sweep too shallow/too
+        # deep. Checked FIRST, ahead of every other routing decision: a
+        # rejected setup is always alert-only, regardless of what the
+        # trend/stability/counter-trend routing would otherwise have done
+        # with it, since it never should have reached execution at all.
+        if signal.reject_reason:
+            logger.info(f"{symbol} | {signal.side} setup REJECTED — {signal.reject_reason} — alert only")
+            await self.telegram.send_alert(
+                f"🚫 *Setup Rejected — Hard Rule*\n\n"
+                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
+                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                f"*Level swept:* {signal.swept_level:.4f}\n\n"
+                f"*Reason:* {signal.reject_reason}\n\n"
+                f"No auto-entry executed. This setup was rejected by a hard rule, not by "
+                f"trend/stability routing — review manually on CoinDCX if you disagree."
+            )
+            return
+
         if level and level.auto_traded_today:
             logger.info(f"{symbol} | Fresh {signal.side} setup, but today's auto-trade "
                        f"already used — alert only")
@@ -787,6 +826,18 @@ class MarketMonitor:
                     self._open_positions.pop(symbol, None)
                     return
 
+            # Rule 10 fix (2026-08-13) — mark today's one-attempt-per-symbol
+            # slot used HERE, the moment we actually commit to attempting an
+            # order, not after the order succeeds. Previously this only
+            # fired inside the success branch below, which meant every
+            # order that failed (e.g. the whole no-funds audit week) never
+            # set this flag at all — confirmed via real data: RIF fired 3
+            # auto-attempts and TAO fired 2, all on the same symbol/day,
+            # because every one of them failed and none ever marked the
+            # day as used. This now fires regardless of what happens next,
+            # matching what "one attempt per day" actually means.
+            self.state.mark_auto_traded(symbol)
+
             level_line = (f"*Level swept:* {signal.swept_level:.4f} (dynamic re-anchor, "
                           f"not the fixed daily PDH/PDL below)\n*Fixed PDH:* {signal.pdh:.4f} | "
                           f"*Fixed PDL:* {signal.pdl:.4f}"
@@ -819,7 +870,9 @@ class MarketMonitor:
                 )
                 self.state.register_trade(record)
                 self.state.mark_in_trade(symbol)
-                self.state.mark_auto_traded(symbol)
+                # mark_auto_traded() already fired above, at the point we
+                # committed to attempting this order — see the Rule 10 fix
+                # comment there. Not repeated here anymore.
 
                 tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
                 opened_at_ist = datetime.now(IST).isoformat()
