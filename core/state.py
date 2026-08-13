@@ -29,11 +29,17 @@ class DailyLevel:
     pdh_event_active: bool = False
     pdh_sweep_extreme: Optional[float] = None
     pdh_day_extreme: Optional[float] = None
+    # Epoch-ms of the candle that FIRST armed this side into SWEPT state.
+    # Used for the 90-minute entry-expiry rule (2026-08-13) — measured from
+    # the actual confirmed sweep candle, not from any earlier candle that
+    # merely approached the level, per the rule's explicit requirement.
+    pdh_sweep_armed_at: Optional[int] = None
     pdl_state: str = "NONE"
     pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
     pdl_day_extreme: Optional[float] = None
+    pdl_sweep_armed_at: Optional[int] = None
     # Trend bias, set once at the daily reset from the last 3 daily candles.
     # "NONE" = sideways OR a matured/exhausted trend (2+ consecutive same-
     # direction days) — keep the original dual-sided sweep-reversal logic.
@@ -150,9 +156,11 @@ class BotState:
                 level.pdh_state = "NONE"
                 level.pdh_trigger = None
                 level.pdh_sweep_extreme = None
+                level.pdh_sweep_armed_at = None
                 level.pdl_state = "NONE"
                 level.pdl_trigger = None
                 level.pdl_sweep_extreme = None
+                level.pdl_sweep_armed_at = None
                 # trend_bias / trend_ref_high / trend_ref_low deliberately NOT
                 # reset here — they're a daily classification, not per-trade
                 # state, and must persist across position closes within the
