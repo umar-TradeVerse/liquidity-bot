@@ -158,10 +158,44 @@ TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
                                      # ones actually used right now; day-3 is
                                      # fetched and available for future tuning)
 
+# ══════════════════════════════════════════════════════════════════════════
+# HARD RULES added 2026-08-13, following the 7-day no-funds audit. Each was
+# validated against real historical setups before being added — see the
+# audit conversation for the full impact tables. These are quality gates on
+# an otherwise-confirmed entry, not new detection logic — they reject a
+# setup that already passed every existing check, rather than changing how
+# sweeps/triggers/reclaims are detected.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Rule 1 — Maximum Stop Loss Distance. If the calculated SL is more than
+# this far from entry, reject the trade outright (alert-only, no execution).
+MAX_SL_DISTANCE_PCT = 0.035  # 3.5%
+
+# Rules 2 & 3 — Minimum/Maximum Liquidity Sweep Distance. A sweep must clear
+# the swept level (fixed PDH/PDL, or the dynamic trend-flip reference —
+# whichever is actually being hunted) by at least MIN, and by no more than
+# MAX, to count as the kind of liquidity event this strategy targets.
+# MIN lowered from the originally-proposed 2.0% to 1.0% after the impact
+# table showed 2.0% would have rejected 82% of all real signals this week,
+# 89% of which were winners — 1.0% still filters shallow/marginal sweeps
+# (e.g. the KAITO case that tapped PDH by only 0.3% and lost) without
+# gutting the strategy's actual operating range.
+MIN_LIQUIDITY_SWEEP_PCT = 0.01   # 1.0%
+MAX_LIQUIDITY_SWEEP_PCT = 0.10   # 10.0%
+
+# Rule 4 — Entry Expiry. The confirming candle must close beyond the
+# trigger's high/low within this many minutes of the ORIGINAL sweep candle
+# that first armed this side — not from any earlier candle that merely
+# approached the level. If this window elapses while still SWEPT/TRIGGERED,
+# the setup expires and the side resets to NONE, requiring a completely
+# fresh sweep (not just a fresh trigger on the same old sweep).
+ENTRY_EXPIRY_MINUTES = 90
+
 
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
-                 counter_trend=False, trend_mode=False, swept_level=None):
+                 counter_trend=False, trend_mode=False, swept_level=None,
+                 reject_reason=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -174,6 +208,12 @@ class Signal:
         self.trend_mode = trend_mode        # True = this IS the trend-aligned flip
                                              # trade — exit hierarchy skips the
                                              # fixed-target priority for these
+        # Set when one of the 2026-08-13 hard rules (SL distance, sweep
+        # depth bounds) rejects an otherwise-confirmed entry. monitor.py
+        # checks this FIRST, before counter-trend/stability routing — a
+        # rejected setup is always alert-only, never auto-traded, and gets
+        # its own distinct alert message naming which rule fired.
+        self.reject_reason = reject_reason
         # The level actually swept to produce this signal — the FIXED daily
         # PDH/PDL for a normal-regime trade, or the DYNAMIC re-anchored
         # trend_ref_high/trend_ref_low for a trend-flip trade. This is what
@@ -207,11 +247,59 @@ def _classify_day(c: dict) -> str:
     return "SIDEWAYS"
 
 
+def _check_hard_rules(side: str, entry: float, sl: float, swept_level: float,
+                       sweep_extreme: float) -> Optional[str]:
+    """Rules 1-3 (2026-08-13): evaluated on an otherwise-fully-confirmed
+    entry. Returns a human-readable reject reason if any rule fails, else
+    None. Rule 8 (ambiguous -> don't trade) is implemented here as the
+    defensive fallback: any missing/degenerate input (zero risk, zero
+    level, etc.) rejects rather than guessing, since there's no case in
+    the deterministic state machine that legitimately produces one of
+    these as a valid confirmed entry — seeing one here means something
+    upstream is off, and the safe default is to not trade it."""
+    if entry is None or sl is None or swept_level is None or sweep_extreme is None:
+        return "AMBIGUOUS SETUP — missing entry/SL/level data"
+    if swept_level <= 0 or entry <= 0:
+        return "AMBIGUOUS SETUP — non-positive price data"
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "AMBIGUOUS SETUP — entry and SL are identical (zero risk)"
+
+    # Rule 1 — SL distance
+    sl_distance_pct = (risk / entry)
+    if sl_distance_pct > MAX_SL_DISTANCE_PCT:
+        return f"SL too wide ({sl_distance_pct*100:.2f}% > {MAX_SL_DISTANCE_PCT*100:.1f}%)"
+
+    # Rules 2 & 3 — sweep depth bounds, measured against the level actually
+    # being hunted (fixed PDH/PDL, or the dynamic trend-flip reference —
+    # whichever `swept_level` resolves to at the call site).
+    if side == 'PDH':
+        sweep_depth_pct = (sweep_extreme - swept_level) / swept_level
+    else:
+        sweep_depth_pct = (swept_level - sweep_extreme) / swept_level
+
+    if sweep_depth_pct < MIN_LIQUIDITY_SWEEP_PCT:
+        return (f"Sweep too shallow ({sweep_depth_pct*100:.2f}% < "
+                f"{MIN_LIQUIDITY_SWEEP_PCT*100:.1f}%)")
+    if sweep_depth_pct > MAX_LIQUIDITY_SWEEP_PCT:
+        return (f"Sweep too deep ({sweep_depth_pct*100:.2f}% > "
+                f"{MAX_LIQUIDITY_SWEEP_PCT*100:.1f}%)")
+
+    return None
+
+
 class StrategyEngine:
     def __init__(self, coindcx: CoinDCXClient, state: BotState):
         self.coindcx = coindcx
         self.state = state
         self._last_candle: dict = {}  # {symbol: last candle}, needed for inside-bar check
+        # Rule 4 (2026-08-13) expiry events, drained by monitor.py after each
+        # process_candle() call. process_candle()'s return type stays
+        # Optional[Signal] — an expiry isn't a signal, there was never a
+        # confirmed entry to alert on in the normal sense, so this is a
+        # separate small side-channel rather than overloading Signal for it.
+        self.pending_expiry_alerts: list = []
 
     async def fetch_and_set_levels(self) -> bool:
         success_count = 0
@@ -305,13 +393,37 @@ class StrategyEngine:
         # PDH SIDE — sweep of effective_pdh -> bearish trigger -> SHORT
         # ══════════════════════════════════════════════════════════════
         if not level.pdh_event_active:
+            pdh_expired_this_candle = False
             if level.pdh_state in ("SWEPT", "TRIGGERED"):
                 if candle['high'] > level.pdh_sweep_extreme:
                     level.pdh_sweep_extreme = candle['high']
                 if level.pdh_day_extreme is None or candle['high'] > level.pdh_day_extreme:
                     level.pdh_day_extreme = candle['high']
 
-            if level.pdh_state == "NONE":
+                # Rule 4 — Entry Expiry (2026-08-13). Measured from the
+                # ORIGINAL sweep candle that armed this side, not from any
+                # later re-trigger — per the rule's explicit requirement.
+                if level.pdh_sweep_armed_at is not None:
+                    elapsed_minutes = (candle['time'] - level.pdh_sweep_armed_at) / 1000 / 60
+                    if elapsed_minutes > ENTRY_EXPIRY_MINUTES:
+                        logger.info(f"{symbol} | PDH-side setup EXPIRED — "
+                                    f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
+                                    f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
+                                    f"waiting for a completely fresh sweep")
+                        level.pdh_state = "NONE"
+                        level.pdh_trigger = None
+                        level.pdh_sweep_extreme = None
+                        level.pdh_sweep_armed_at = None
+                        level.pdh_cisd_ref = None
+                        level.pdh_event_active = True  # prevents re-arming on THIS same
+                                                        # candle too, via the guard below
+                        pdh_expired_this_candle = True
+                        self.pending_expiry_alerts.append({
+                            'symbol': symbol, 'side': 'PDH',
+                            'elapsed_minutes': round(elapsed_minutes),
+                        })
+
+            if not pdh_expired_this_candle and level.pdh_state == "NONE":
                 if candle['high'] > effective_pdh and not inside_bar:
                     # FIX (2026-07-21): the day's very first sweep attempt now
                     # must also clear MIN_SWEEP_DEPTH_PCT, measured against
@@ -327,6 +439,7 @@ class StrategyEngine:
                         level.pdh_state = "SWEPT"
                         level.pdh_sweep_extreme = candle['high']
                         level.pdh_day_extreme = candle['high']
+                        level.pdh_sweep_armed_at = candle['time']
                         logger.info(f"{symbol} | PDH-side swept (H:{candle['high']:.4f}) — "
                                     f"watching for the first bearish trigger candle")
 
@@ -378,19 +491,37 @@ class StrategyEngine:
                         # signal. Detection/logging is unchanged (still shows
                         # "[trend-aligned flip]"), only auto-entry is removed.
                         counter = level.trend_bias == "UPTREND" or is_flip
+
+                        # Rules 1-3 (2026-08-13) — SL distance and sweep
+                        # depth bounds, checked against whatever level was
+                        # actually swept (effective_pdh — the fixed PDH, or
+                        # the dynamic trend-flip reference).
+                        reject_reason = _check_hard_rules(
+                            'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme)
+
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=is_flip,
-                                         swept_level=effective_pdh)
-                        logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} "
-                                    f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
-                                    f"{' [trend-aligned flip]' if is_flip else ''}")
+                                         swept_level=effective_pdh, reject_reason=reject_reason)
+                        if reject_reason:
+                            logger.info(f"{symbol} | SHORT setup confirmed but REJECTED — "
+                                        f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
+                                        f"(sweep extreme {level.pdh_sweep_extreme:.4f})")
+                        else:
+                            logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
+                                        f"Entry:{entry:.4f} SL:{sl:.4f} "
+                                        f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
+                                        f"{' [trend-aligned flip]' if is_flip else ''}")
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
+                        level.pdh_sweep_armed_at = None
                         level.pdh_event_active = True
                         level.pdh_cisd_ref = None
-                        if counter:
+                        # A rejected setup never really confirmed — don't
+                        # let it count toward trend-stability tracking or
+                        # seed a flip reference, both of which are meant to
+                        # reflect genuinely valid counter-trend confirmations.
+                        if counter and not reject_reason:
                             level.counter_trend_confirms += 1
 
                         # UPTREND mirror: this counter-trend SHORT confirmation
@@ -401,7 +532,7 @@ class StrategyEngine:
                         # gates (depth + inside-bar) before anything arms.
                         # See module docstring for the real cases that made
                         # this necessary.
-                        if counter and level.trend_bias == "UPTREND":
+                        if counter and not reject_reason and level.trend_bias == "UPTREND":
                             seed_low = candle['low']
                             if level.trend_ref_low is None or seed_low < level.trend_ref_low:
                                 level.trend_ref_low = seed_low
@@ -429,13 +560,33 @@ class StrategyEngine:
         # PDL SIDE — sweep of effective_pdl -> bullish trigger -> LONG
         # ══════════════════════════════════════════════════════════════
         if signal is None and not level.pdl_event_active:
+            pdl_expired_this_candle = False
             if level.pdl_state in ("SWEPT", "TRIGGERED"):
                 if candle['low'] < level.pdl_sweep_extreme:
                     level.pdl_sweep_extreme = candle['low']
                 if level.pdl_day_extreme is None or candle['low'] < level.pdl_day_extreme:
                     level.pdl_day_extreme = candle['low']
 
-            if level.pdl_state == "NONE":
+                if level.pdl_sweep_armed_at is not None:
+                    elapsed_minutes = (candle['time'] - level.pdl_sweep_armed_at) / 1000 / 60
+                    if elapsed_minutes > ENTRY_EXPIRY_MINUTES:
+                        logger.info(f"{symbol} | PDL-side setup EXPIRED — "
+                                    f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
+                                    f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
+                                    f"waiting for a completely fresh sweep")
+                        level.pdl_state = "NONE"
+                        level.pdl_trigger = None
+                        level.pdl_sweep_extreme = None
+                        level.pdl_sweep_armed_at = None
+                        level.pdl_cisd_ref = None
+                        level.pdl_event_active = True
+                        pdl_expired_this_candle = True
+                        self.pending_expiry_alerts.append({
+                            'symbol': symbol, 'side': 'PDL',
+                            'elapsed_minutes': round(elapsed_minutes),
+                        })
+
+            if not pdl_expired_this_candle and level.pdl_state == "NONE":
                 if candle['low'] < effective_pdl and not inside_bar:
                     # See matching PDH-side comment above — same fix, and
                     # this now also governs a trend-flip's seeded reference
@@ -447,6 +598,7 @@ class StrategyEngine:
                         level.pdl_state = "SWEPT"
                         level.pdl_sweep_extreme = candle['low']
                         level.pdl_day_extreme = candle['low']
+                        level.pdl_sweep_armed_at = candle['time']
                         logger.info(f"{symbol} | PDL-side swept (L:{candle['low']:.4f}) — "
                                     f"watching for the first bullish trigger candle")
 
@@ -494,16 +646,26 @@ class StrategyEngine:
                         # no longer auto-execute, routed through the existing
                         # alert-only path instead.
                         counter = level.trend_bias == "DOWNTREND" or is_flip
+
+                        reject_reason = _check_hard_rules(
+                            'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme)
+
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=is_flip,
-                                         swept_level=effective_pdl)
-                        logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
-                                    f"Entry:{entry:.4f} SL:{sl:.4f} "
-                                    f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
-                                    f"{' [trend-aligned flip]' if is_flip else ''}")
+                                         swept_level=effective_pdl, reject_reason=reject_reason)
+                        if reject_reason:
+                            logger.info(f"{symbol} | LONG setup confirmed but REJECTED — "
+                                        f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
+                                        f"(sweep extreme {level.pdl_sweep_extreme:.4f})")
+                        else:
+                            logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
+                                        f"Entry:{entry:.4f} SL:{sl:.4f} "
+                                        f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
+                                        f"{' [trend-aligned flip]' if is_flip else ''}")
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
+                        level.pdl_sweep_armed_at = None
                         level.pdl_event_active = True
                         level.pdl_cisd_ref = None
                         if counter:
@@ -514,7 +676,7 @@ class StrategyEngine:
                         # SHORT hunt. FIX (2026-07-26): no longer force-arms
                         # pdh_state — see module docstring and the mirrored
                         # comment in the PDH-side block above.
-                        if counter and level.trend_bias == "DOWNTREND":
+                        if counter and not reject_reason and level.trend_bias == "DOWNTREND":
                             seed_high = candle['high']
                             if level.trend_ref_high is None or seed_high > level.trend_ref_high:
                                 level.trend_ref_high = seed_high
