@@ -169,7 +169,12 @@ TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
 
 # Rule 1 — Maximum Stop Loss Distance. If the calculated SL is more than
 # this far from entry, reject the trade outright (alert-only, no execution).
-MAX_SL_DISTANCE_PCT = 0.035  # 3.5%
+MAX_SL_DISTANCE_PCT = 0.02  # 2.0% — tightened from 3.5% on 2026-08-14 after
+                             # the first live KAITOUSD trade showed a 2.16%
+                             # raw SL distance translating to -18.47% ROE at
+                             # 10x leverage. The rule stays a RAW price-%
+                             # check (not leveraged ROE) — this just lowers
+                             # the raw ceiling itself.
 
 # Rules 2 & 3 — Minimum/Maximum Liquidity Sweep Distance. A sweep must clear
 # the swept level (fixed PDH/PDL, or the dynamic trend-flip reference —
