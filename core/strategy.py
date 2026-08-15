@@ -185,7 +185,13 @@ MAX_SL_DISTANCE_PCT = 0.02  # 2.0% — tightened from 3.5% on 2026-08-14 after
 # 89% of which were winners — 1.0% still filters shallow/marginal sweeps
 # (e.g. the KAITO case that tapped PDH by only 0.3% and lost) without
 # gutting the strategy's actual operating range.
-MIN_LIQUIDITY_SWEEP_PCT = 0.01   # 1.0%
+MIN_LIQUIDITY_SWEEP_PCT = 0.005  # 0.5% — loosened from 1.0% on 2026-08-15.
+                                  # Evidence review showed 1.0% blocked 93%
+                                  # winners among rejections in the 20-trade
+                                  # verified set; 0.5% is a middle ground —
+                                  # some floor still has value (e.g. the
+                                  # ZAMAUSD 0.58%-sweep trade that went on to
+                                  # hit SL), but 1.0% was too destructive.
 MAX_LIQUIDITY_SWEEP_PCT = 0.10   # 10.0%
 
 # Rule 4 — Entry Expiry. The confirming candle must close beyond the
@@ -200,7 +206,7 @@ ENTRY_EXPIRY_MINUTES = 90
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
                  counter_trend=False, trend_mode=False, swept_level=None,
-                 reject_reason=None):
+                 reject_reason=None, use_staged_entry=False):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -213,12 +219,18 @@ class Signal:
         self.trend_mode = trend_mode        # True = this IS the trend-aligned flip
                                              # trade — exit hierarchy skips the
                                              # fixed-target priority for these
-        # Set when one of the 2026-08-13 hard rules (SL distance, sweep
-        # depth bounds) rejects an otherwise-confirmed entry. monitor.py
+        # Set when one of the 2026-08-13 hard rules (sweep depth bounds,
+        # ambiguous data) rejects an otherwise-confirmed entry. monitor.py
         # checks this FIRST, before counter-trend/stability routing — a
         # rejected setup is always alert-only, never auto-traded, and gets
         # its own distinct alert message naming which rule fired.
         self.reject_reason = reject_reason
+        # 2026-08-15: True when SL distance exceeds MAX_SL_DISTANCE_PCT.
+        # This no longer rejects the trade — monitor.py instead places only
+        # 50% of planned margin initially, adding the remaining 50% only on
+        # the same +1R/confirmation logic used elsewhere, never a blind
+        # timer or percentage trigger alone.
+        self.use_staged_entry = use_staged_entry
         # The level actually swept to produce this signal — the FIXED daily
         # PDH/PDL for a normal-regime trade, or the DYNAMIC re-anchored
         # trend_ref_high/trend_ref_low for a trend-flip trade. This is what
@@ -253,28 +265,33 @@ def _classify_day(c: dict) -> str:
 
 
 def _check_hard_rules(side: str, entry: float, sl: float, swept_level: float,
-                       sweep_extreme: float) -> Optional[str]:
-    """Rules 1-3 (2026-08-13): evaluated on an otherwise-fully-confirmed
-    entry. Returns a human-readable reject reason if any rule fails, else
-    None. Rule 8 (ambiguous -> don't trade) is implemented here as the
-    defensive fallback: any missing/degenerate input (zero risk, zero
-    level, etc.) rejects rather than guessing, since there's no case in
-    the deterministic state machine that legitimately produces one of
-    these as a valid confirmed entry — seeing one here means something
-    upstream is off, and the safe default is to not trade it."""
+                       sweep_extreme: float) -> tuple:
+    """Rules 2/3 (2026-08-13, sweep depth bounds) and Rule 8 (ambiguous ->
+    don't trade) still hard-reject here. Rule 1 (SL distance) no longer
+    rejects — changed 2026-08-15: a wide SL usually just means the
+    structural sweep extreme sits further from entry, not that the setup
+    itself is bad. Rejecting those outright was found to block real
+    winners disproportionately (evidence: RIF's 3.79%-SL trade that ran to
+    8.27R). Instead, SL > MAX_SL_DISTANCE_PCT now triggers a STAGED entry
+    (50% now, remaining 50% only added on the same +1R/confirmation logic
+    already used for breakeven-ratchet math) — this keeps dollar risk
+    controlled without discarding otherwise-valid structure.
+
+    Returns (reject_reason, use_staged_entry). reject_reason is None unless
+    a real hard-reject rule fires; use_staged_entry is True when SL
+    distance exceeds MAX_SL_DISTANCE_PCT (irrelevant if reject_reason is set)."""
     if entry is None or sl is None or swept_level is None or sweep_extreme is None:
-        return "AMBIGUOUS SETUP — missing entry/SL/level data"
+        return "AMBIGUOUS SETUP — missing entry/SL/level data", False
     if swept_level <= 0 or entry <= 0:
-        return "AMBIGUOUS SETUP — non-positive price data"
+        return "AMBIGUOUS SETUP — non-positive price data", False
 
     risk = abs(entry - sl)
     if risk <= 0:
-        return "AMBIGUOUS SETUP — entry and SL are identical (zero risk)"
+        return "AMBIGUOUS SETUP — entry and SL are identical (zero risk)", False
 
-    # Rule 1 — SL distance
+    # Rule 1 — SL distance: no longer a reject, just a staged-entry trigger
     sl_distance_pct = (risk / entry)
-    if sl_distance_pct > MAX_SL_DISTANCE_PCT:
-        return f"SL too wide ({sl_distance_pct*100:.2f}% > {MAX_SL_DISTANCE_PCT*100:.1f}%)"
+    use_staged_entry = sl_distance_pct > MAX_SL_DISTANCE_PCT
 
     # Rules 2 & 3 — sweep depth bounds, measured against the level actually
     # being hunted (fixed PDH/PDL, or the dynamic trend-flip reference —
@@ -286,12 +303,12 @@ def _check_hard_rules(side: str, entry: float, sl: float, swept_level: float,
 
     if sweep_depth_pct < MIN_LIQUIDITY_SWEEP_PCT:
         return (f"Sweep too shallow ({sweep_depth_pct*100:.2f}% < "
-                f"{MIN_LIQUIDITY_SWEEP_PCT*100:.1f}%)")
+                f"{MIN_LIQUIDITY_SWEEP_PCT*100:.1f}%)", use_staged_entry)
     if sweep_depth_pct > MAX_LIQUIDITY_SWEEP_PCT:
         return (f"Sweep too deep ({sweep_depth_pct*100:.2f}% > "
-                f"{MAX_LIQUIDITY_SWEEP_PCT*100:.1f}%)")
+                f"{MAX_LIQUIDITY_SWEEP_PCT*100:.1f}%)", use_staged_entry)
 
-    return None
+    return None, use_staged_entry
 
 
 class StrategyEngine:
@@ -497,16 +514,19 @@ class StrategyEngine:
                         # "[trend-aligned flip]"), only auto-entry is removed.
                         counter = level.trend_bias == "UPTREND" or is_flip
 
-                        # Rules 1-3 (2026-08-13) — SL distance and sweep
-                        # depth bounds, checked against whatever level was
-                        # actually swept (effective_pdh — the fixed PDH, or
-                        # the dynamic trend-flip reference).
-                        reject_reason = _check_hard_rules(
+                        # Rules 1-3 (2026-08-13, Rule 1 revised 2026-08-15) —
+                        # sweep depth bounds still hard-reject; SL distance
+                        # now only sets use_staged_entry (50% initial size),
+                        # checked against whatever level was actually swept
+                        # (effective_pdh — the fixed PDH, or the dynamic
+                        # trend-flip reference).
+                        reject_reason, use_staged_entry = _check_hard_rules(
                             'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme)
 
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=is_flip,
-                                         swept_level=effective_pdh, reject_reason=reject_reason)
+                                         swept_level=effective_pdh, reject_reason=reject_reason,
+                                         use_staged_entry=use_staged_entry)
                         if reject_reason:
                             logger.info(f"{symbol} | SHORT setup confirmed but REJECTED — "
                                         f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
@@ -515,7 +535,8 @@ class StrategyEngine:
                             logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
                                         f"Entry:{entry:.4f} SL:{sl:.4f} "
                                         f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
-                                        f"{' [trend-aligned flip]' if is_flip else ''}")
+                                        f"{' [trend-aligned flip]' if is_flip else ''}"
+                                        f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
@@ -652,12 +673,13 @@ class StrategyEngine:
                         # alert-only path instead.
                         counter = level.trend_bias == "DOWNTREND" or is_flip
 
-                        reject_reason = _check_hard_rules(
+                        reject_reason, use_staged_entry = _check_hard_rules(
                             'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme)
 
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=is_flip,
-                                         swept_level=effective_pdl, reject_reason=reject_reason)
+                                         swept_level=effective_pdl, reject_reason=reject_reason,
+                                         use_staged_entry=use_staged_entry)
                         if reject_reason:
                             logger.info(f"{symbol} | LONG setup confirmed but REJECTED — "
                                         f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
@@ -666,7 +688,8 @@ class StrategyEngine:
                             logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
                                         f"Entry:{entry:.4f} SL:{sl:.4f} "
                                         f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
-                                        f"{' [trend-aligned flip]' if is_flip else ''}")
+                                        f"{' [trend-aligned flip]' if is_flip else ''}"
+                                        f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
