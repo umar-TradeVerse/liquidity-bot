@@ -498,6 +498,83 @@ class MarketMonitor:
                 logger.warning(f"{symbol} | Failed to move SL to partial breakeven — will retry "
                                f"next candle if MFE condition still holds")
 
+    async def _check_staged_addition(self, symbol: str, tr: dict, candle: dict, target):
+        """2026-08-15 — Rule 1 replacement: trades with SL distance beyond
+        MAX_SL_DISTANCE_PCT open at only 50% of planned margin (see
+        _handle_signal). The remaining 50% is added here, ONLY when ALL of:
+          - MFE has reached BREAKEVEN_STAGE2_R (+1R) — same threshold
+            already used for the breakeven ratchet, reused rather than
+            inventing a second number to tune.
+          - The CURRENT candle shows no rejection candle against the
+            position's direction (reusing the same _is_bearish_rejection /
+            _is_bullish_rejection shape checks already used for exit logic —
+            not new subjective criteria).
+          - Price hasn't already covered most of the distance to target
+            (adding late, with little room left, isn't worth the extra risk).
+        Never adds on a blind timer or percentage alone, and NEVER adds
+        while the trade is underwater — mfe_R must already be >= 1.0, which
+        by definition means the trade is profitable at the moment of adding.
+        """
+        if not tr.get("staged_entry") or tr.get("staged_stage2_added"):
+            return
+
+        entry, sl, side = tr.get("entry"), tr.get("sl"), tr["side"]
+        risk = abs(entry - sl) if entry is not None and sl is not None else 0
+        if risk <= 0:
+            return
+
+        mfe = tr.get("mfe", entry)
+        mfe_R = (mfe - entry) / risk if side == "BUY" else (entry - mfe) / risk
+        if mfe_R < BREAKEVEN_STAGE2_R:
+            return
+
+        rejection_against = (_is_bearish_rejection(candle) if side == "BUY"
+                              else _is_bullish_rejection(candle))
+        if rejection_against:
+            logger.info(f"{symbol} | Staged addition skipped this candle — rejection "
+                       f"candle against position direction")
+            return
+
+        if target:
+            total_distance = abs(target - entry)
+            covered = abs(mfe - entry)
+            if total_distance > 0 and (covered / total_distance) >= 0.90:
+                logger.info(f"{symbol} | Staged addition skipped — already {covered/total_distance*100:.0f}% "
+                           f"of the way to target, not enough room left to justify adding")
+                return
+
+        remaining_margin = tr.get("planned_margin_usd", 0) - tr.get("deployed_margin_usd", 0)
+        if remaining_margin <= 0:
+            return
+
+        quantity_to_add = (remaining_margin * TRADE_LEVERAGE) / candle['close']
+        order_result = await self.coindcx.place_market_order(
+            symbol=symbol, side=side, quantity=quantity_to_add,
+            sl_price=tr.get("live_sl", sl), leverage=TRADE_LEVERAGE
+        )
+
+        if order_result and order_result.get('id'):
+            added_qty = order_result.get('quantity', quantity_to_add)
+            tr["deployed_margin_usd"] = tr.get("planned_margin_usd", 0)
+            tr["staged_stage2_added"] = True
+            self._open_positions[symbol] = self._open_positions.get(symbol, 0) + added_qty
+            logger.info(f"{symbol} | Staged addition filled — remaining 50% (${remaining_margin:.2f} "
+                       f"margin) added at {candle['close']:.4f}, MFE was {mfe_R:.2f}R")
+            persistence.log_trade_event({
+                "event_type": "staged_addition", "symbol": symbol, "side": side,
+                "add_price": candle['close'], "margin_added": remaining_margin,
+                "mfe_r_at_add": round(mfe_R, 3),
+            })
+            await self.telegram.send_alert(
+                f"➕ *Staged Entry — Remaining 50% Added*\n\n"
+                f"*Symbol:* {symbol}\n*Add price:* {candle['close']:.4f}\n"
+                f"*Margin added:* ${remaining_margin:.2f}\n*Trade now at:* +{mfe_R:.2f}R\n\n"
+                f"Position is now at full planned size."
+            )
+        else:
+            logger.warning(f"{symbol} | Staged addition order failed — will retry next candle "
+                           f"if conditions still hold")
+
     async def _check_partial_tp_ladder(self, symbol: str, tr: dict, candle: dict):
         """Checks TP1/TP2 (interior partials, closer than the original single
         target) and executes a partial market close on whichever tier the
@@ -594,6 +671,7 @@ class MarketMonitor:
         # target/rejection priorities entirely) need this protection even
         # more, since they otherwise only have SL + ROE.
         await self._check_breakeven_move(symbol, tr)
+        await self._check_staged_addition(symbol, tr, candle, target)
 
         if not skip_target_priorities:
             await self._check_partial_tp_ladder(symbol, tr, candle)
@@ -725,7 +803,19 @@ class MarketMonitor:
         # trend/stability/counter-trend routing would otherwise have done
         # with it, since it never should have reached execution at all.
         if signal.reject_reason:
-            logger.info(f"{symbol} | {signal.side} setup REJECTED — {signal.reject_reason} — alert only")
+            # 2026-08-15: also surface whether this setup would ALSO have
+            # been alert-only for counter-trend/flip reasons, so a hard-rule
+            # rejection never leaves ambiguity about whether the trend gate
+            # is still active — it's checked here even though the hard-rule
+            # check fires first and would have blocked execution regardless.
+            also_note = ""
+            if signal.trend_mode:
+                also_note = "\n\n_Note: this was also a trend-aligned flip setup — would have been alert-only for that reason too, independent of the hard-rule rejection above._"
+            elif signal.counter_trend:
+                also_note = "\n\n_Note: this setup also fights today's trend bias — would have been alert-only as counter-trend too, independent of the hard-rule rejection above._"
+
+            logger.info(f"{symbol} | {signal.side} setup REJECTED — {signal.reject_reason} — alert only"
+                       f"{' (also counter-trend/flip)' if also_note else ''}")
             await self.telegram.send_alert(
                 f"🚫 *Setup Rejected — Hard Rule*\n\n"
                 f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
@@ -734,6 +824,7 @@ class MarketMonitor:
                 f"*Reason:* {signal.reject_reason}\n\n"
                 f"No auto-entry executed. This setup was rejected by a hard rule, not by "
                 f"trend/stability routing — review manually on CoinDCX if you disagree."
+                f"{also_note}"
             )
             return
 
@@ -847,12 +938,18 @@ class MarketMonitor:
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}\n"
+                f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}"
+                f"{' — STAGED ENTRY (wide SL, 50% initial)' if signal.use_staged_entry else ''}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
                 f"{level_line}{trend_line}\n\n⏳ Placing order..."
             )
 
-            quantity = (margin_usd * TRADE_LEVERAGE) / signal.entry_price
+            # 2026-08-15: SL distance beyond MAX_SL_DISTANCE_PCT no longer
+            # rejects the trade — it opens at half planned margin instead,
+            # with the remainder added only via _check_staged_addition's
+            # +1R/confirmation check (never a blind timer or percentage).
+            initial_margin = margin_usd * 0.5 if signal.use_staged_entry else margin_usd
+            quantity = (initial_margin * TRADE_LEVERAGE) / signal.entry_price
 
             order_result = await self.coindcx.place_market_order(
                 symbol=symbol, side=signal.side, quantity=quantity,
@@ -885,7 +982,11 @@ class MarketMonitor:
                       "tp": tp_price,
                       "trend_mode": signal.trend_mode,
                       "opened_at": opened_at_ist,
-                      "mfe": signal.entry_price, "mae": signal.entry_price}
+                      "mfe": signal.entry_price, "mae": signal.entry_price,
+                      "staged_entry": signal.use_staged_entry,
+                      "staged_stage2_added": False,
+                      "planned_margin_usd": margin_usd,
+                      "deployed_margin_usd": initial_margin}
 
                 # Seed the TP1/TP2 partial ladder — only for non-trend-mode
                 # trades, and only if each tier's R-multiple sits strictly
@@ -982,16 +1083,26 @@ class MarketMonitor:
                         f"trades of this pattern are logged\n"
                     )
 
+                staged_note = ""
+                if signal.use_staged_entry:
+                    staged_note = (
+                        f"\n\n📊 *Staged Entry* — SL distance exceeded the normal cap, so this "
+                        f"opened at 50% size (${initial_margin:.2f} of ${margin_usd:.2f} planned). "
+                        f"Remaining ${margin_usd - initial_margin:.2f} adds automatically only if "
+                        f"the trade reaches +1R with continued confirmation — never on a blind timer."
+                    )
+
                 msg = (
                     f"✅ *Trade Executed*\n\n"
                     f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                     f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
                     f"{tp_lines}{rr_lines}\n"
                     f"{stats_block}\n"
-                    f"*Margin:* ${margin_usd:.2f}\n*Leverage:* {TRADE_LEVERAGE}x\n"
-                    f"*Exposure:* ${margin_usd * TRADE_LEVERAGE:.2f}\n*Quantity:* {quantity_filled}\n"
+                    f"*Margin:* ${initial_margin:.2f}\n*Leverage:* {TRADE_LEVERAGE}x\n"
+                    f"*Exposure:* ${initial_margin * TRADE_LEVERAGE:.2f}\n*Quantity:* {quantity_filled}\n"
                     f"*Order ID:* `{order_id}`\n*Open positions:* {len(self._open_positions)}/{MAX_CONCURRENT_POSITIONS}\n\n"
-                    f"{tp_note}\n\n"
+                    f"{tp_note}"
+                    f"{staged_note}\n\n"
                     f"🔄 Today's auto-trade for this symbol has now been used — further setups will be alert-only."
                 )
                 await self.telegram.send_alert(msg)
