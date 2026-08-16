@@ -499,8 +499,12 @@ class StrategyEngine:
                     is_deep_sweep = sweep_depth_from_pdh >= DEEP_SWEEP_THRESHOLD_PCT
                     if USE_CISD_FOR_DEEP_SWEEPS and is_deep_sweep and level.pdh_cisd_ref is not None:
                         reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= level.pdh_cisd_ref
+                        reclaim_ref_used = level.pdh_cisd_ref
+                        reclaim_ref_label = "CISD reference"
                     else:
                         reclaim_ok = level.trend_bias == "DOWNTREND" or candle['close'] <= pdh * (1 - MIN_RECLAIM_MARGIN_PCT)
+                        reclaim_ref_used = pdh * (1 - MIN_RECLAIM_MARGIN_PCT)
+                        reclaim_ref_label = "fixed PDH"
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
@@ -567,8 +571,8 @@ class StrategyEngine:
                                         f"a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger "
-                                    f"but did not reclaim below the fixed PDH {pdh:.4f} — "
-                                    f"rejecting this confirmation")
+                                    f"but did not reclaim below the {reclaim_ref_label} "
+                                    f"{reclaim_ref_used:.4f} — rejecting this confirmation")
                 elif candle['close'] < trig['low'] and not is_bearish:
                     logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger low "
                                 f"{trig['low']:.4f} but candle closed bullish — rejecting this "
@@ -662,8 +666,12 @@ class StrategyEngine:
                     is_deep_sweep = sweep_depth_from_pdl >= DEEP_SWEEP_THRESHOLD_PCT
                     if USE_CISD_FOR_DEEP_SWEEPS and is_deep_sweep and level.pdl_cisd_ref is not None:
                         reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= level.pdl_cisd_ref
+                        reclaim_ref_used = level.pdl_cisd_ref
+                        reclaim_ref_label = "CISD reference"
                     else:
                         reclaim_ok = level.trend_bias == "UPTREND" or candle['close'] >= pdl * (1 + MIN_RECLAIM_MARGIN_PCT)
+                        reclaim_ref_used = pdl * (1 + MIN_RECLAIM_MARGIN_PCT)
+                        reclaim_ref_label = "fixed PDL"
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
@@ -713,8 +721,8 @@ class StrategyEngine:
                                         f"needs a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger "
-                                    f"but did not reclaim above the fixed PDL {pdl:.4f} — "
-                                    f"rejecting this confirmation")
+                                    f"but did not reclaim above the {reclaim_ref_label} "
+                                    f"{reclaim_ref_used:.4f} — rejecting this confirmation")
                 elif candle['close'] > trig['high'] and not is_bullish:
                     logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger high "
                                 f"{trig['high']:.4f} but candle closed bearish — rejecting this "
