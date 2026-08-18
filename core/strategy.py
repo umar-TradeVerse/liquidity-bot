@@ -202,6 +202,20 @@ MAX_LIQUIDITY_SWEEP_PCT = 0.10   # 10.0%
 # fresh sweep (not just a fresh trigger on the same old sweep).
 ENTRY_EXPIRY_MINUTES = 90
 
+# ══════════════════════════════════════════════════════════════════════════
+# INFORMATIONAL-ONLY drift tracker, added 2026-08-18. Does NOT change
+# ENTRY_EXPIRY_MINUTES, does NOT re-arm or extend real trading state, does
+# NOT auto-trade anything. Purely observes: after a setup expires, does
+# price EVENTUALLY do what would have confirmed it, and if so, how far had
+# it drifted from the sweep extreme by then? Early evidence (4 traced
+# cases) suggested low drift (<~1.5%) correlated with the eventual move
+# being real, while high drift (>~2.5%) correlated with it reversing --
+# but that's from 4 data points, nowhere near proven. This tracker exists
+# to accumulate more real cases before ever considering acting on it.
+POST_EXPIRY_DRIFT_OBSERVATION_MINUTES = 180  # how long to keep watching
+                                              # after expiry before giving up
+                                              # on this specific observation
+
 
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
@@ -322,6 +336,14 @@ class StrategyEngine:
         # confirmed entry to alert on in the normal sense, so this is a
         # separate small side-channel rather than overloading Signal for it.
         self.pending_expiry_alerts: list = []
+        # 2026-08-18 informational drift tracker -- see constant comment
+        # above. drift_observations holds setups currently being watched
+        # post-expiry; pending_drift_results holds completed observations
+        # (confirmed-late or timed-out) waiting to be drained into an
+        # alert by monitor.py. Neither ever touches level.pdh_state /
+        # level.pdl_state or any real trading field.
+        self.drift_observations: list = []
+        self.pending_drift_results: list = []
 
     async def fetch_and_set_levels(self) -> bool:
         success_count = 0
@@ -432,6 +454,16 @@ class StrategyEngine:
                                     f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
                                     f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
                                     f"waiting for a completely fresh sweep")
+                        # Informational-only snapshot, taken BEFORE the real
+                        # state resets below. Read-only from here on.
+                        self.drift_observations.append({
+                            'symbol': symbol, 'side': 'PDH', 'direction': 'SHORT',
+                            'trigger_high': level.pdh_trigger['high'],
+                            'trigger_low': level.pdh_trigger['low'],
+                            'sweep_extreme': level.pdh_sweep_extreme,
+                            'sweep_armed_at': level.pdh_sweep_armed_at,
+                            'expired_at': candle['time'],
+                        })
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
@@ -604,6 +636,14 @@ class StrategyEngine:
                                     f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
                                     f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
                                     f"waiting for a completely fresh sweep")
+                        self.drift_observations.append({
+                            'symbol': symbol, 'side': 'PDL', 'direction': 'LONG',
+                            'trigger_high': level.pdl_trigger['high'],
+                            'trigger_low': level.pdl_trigger['low'],
+                            'sweep_extreme': level.pdl_sweep_extreme,
+                            'sweep_armed_at': level.pdl_sweep_armed_at,
+                            'expired_at': candle['time'],
+                        })
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
@@ -735,4 +775,49 @@ class StrategyEngine:
                     level.pdl_trigger = None
                     level.pdl_cisd_ref = None
 
+        # Informational-only drift observation check -- entirely read-only,
+        # never touches level.pdh_state/pdl_state or `signal`. See the
+        # POST_EXPIRY_DRIFT_OBSERVATION_MINUTES comment above.
+        self._check_drift_observations(symbol, candle, level)
+
         return signal
+
+    def _check_drift_observations(self, symbol: str, candle: dict, level) -> None:
+        """Watches previously-expired setups to see if price eventually
+        does what would have confirmed them, purely for later analysis.
+        Never re-arms real state, never produces a Signal, never affects
+        auto-trading. Drops an observation if it goes stale (too old) or
+        if a genuinely fresh sweep has since re-armed that same side,
+        since a new real cycle supersedes the old informational watch."""
+        still_watching = []
+        for obs in self.drift_observations:
+            if obs['symbol'] != symbol:
+                still_watching.append(obs)
+                continue
+
+            elapsed_min = (candle['time'] - obs['expired_at']) / 1000 / 60
+            if elapsed_min > POST_EXPIRY_DRIFT_OBSERVATION_MINUTES:
+                continue  # too old, drop silently -- no verdict either way
+
+            fresh_state = level.pdh_state if obs['side'] == 'PDH' else level.pdl_state
+            if fresh_state != "NONE":
+                continue  # a genuinely new cycle has started, old watch is stale
+
+            if obs['direction'] == 'SHORT':
+                confirmed = candle['close'] < obs['trigger_low'] and candle['close'] < candle['open']
+            else:
+                confirmed = candle['close'] > obs['trigger_high'] and candle['close'] > candle['open']
+
+            if confirmed:
+                drift_pct = abs(candle['close'] - obs['sweep_extreme']) / obs['sweep_extreme'] * 100
+                total_elapsed_min = (candle['time'] - obs['sweep_armed_at']) / 1000 / 60
+                self.pending_drift_results.append({
+                    'symbol': symbol, 'side': obs['side'], 'direction': obs['direction'],
+                    'would_be_entry': candle['close'], 'elapsed_minutes': round(total_elapsed_min),
+                    'drift_pct': round(drift_pct, 2),
+                })
+                continue  # found it, drop the observation
+
+            still_watching.append(obs)
+
+        self.drift_observations = still_watching
