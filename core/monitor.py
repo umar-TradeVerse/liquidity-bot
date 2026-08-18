@@ -431,6 +431,29 @@ class MarketMonitor:
                         remaining.append(ev)
                 self.engine.pending_expiry_alerts = remaining
 
+            # 2026-08-18 informational-only drift tracker — drained the same
+            # way. This NEVER triggers a trade and never re-arms anything;
+            # it only reports what price did after a setup already expired,
+            # purely for later analysis of whether entry-drift % predicts
+            # which late confirmations are worth having versus not.
+            if self.engine.pending_drift_results:
+                remaining_drift = []
+                for res in self.engine.pending_drift_results:
+                    if res['symbol'] == symbol:
+                        await self.telegram.send_alert(
+                            f"📊 *Informational — Late Confirmation Observed*\n\n"
+                            f"*Symbol:* {symbol}\n*Side:* {res['side']} ({res['direction']})\n"
+                            f"*Would-be entry:* {res['would_be_entry']:.4f}\n"
+                            f"*Total elapsed since sweep:* {res['elapsed_minutes']} min\n"
+                            f"*Entry drift from sweep extreme:* {res['drift_pct']:.2f}%\n\n"
+                            f"This setup already expired at {ENTRY_EXPIRY_MINUTES} min — no trade was "
+                            f"taken. This is purely for tracking whether entry drift % predicts which "
+                            f"late confirmations are worth catching. No action needed."
+                        )
+                    else:
+                        remaining_drift.append(res)
+                self.engine.pending_drift_results = remaining_drift
+
             if signal:
                 await self._handle_signal(signal)
 
