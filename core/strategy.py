@@ -416,8 +416,14 @@ class StrategyEngine:
 
         pdh = level.pdh
         pdl = level.pdl
-        effective_pdh = level.trend_ref_high if (level.trend_bias == "DOWNTREND" and level.trend_ref_high is not None) else pdh
-        effective_pdl = level.trend_ref_low if (level.trend_bias == "UPTREND" and level.trend_ref_low is not None) else pdl
+        # 2026-08-20: dynamic trend-flip re-anchoring removed entirely, per
+        # explicit request -- SHORT signals now ONLY come from a genuine
+        # fixed-PDH sweep, LONG only from a genuine fixed-PDL sweep. Flip
+        # trades were already alert-only (never auto-traded), so this has
+        # zero impact on auto-executed trades -- it only removes the
+        # confusing "swept a level far from the fixed PDH/PDL" alerts.
+        effective_pdh = pdh
+        effective_pdl = pdl
 
         signal = None
         is_bullish = candle['close'] > candle['open']
@@ -540,27 +546,21 @@ class StrategyEngine:
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
-                        is_flip = level.trend_bias == "DOWNTREND"
-                        # 2026-07-29: trend-aligned flip trades no longer
-                        # auto-execute — after two consecutive SL-hit losses
-                        # entering on a dynamic re-anchored level (not a real
-                        # fixed-PDH break), these now route through the exact
-                        # same alert-only path as a genuine counter-trend
-                        # signal. Detection/logging is unchanged (still shows
-                        # "[trend-aligned flip]"), only auto-entry is removed.
-                        counter = level.trend_bias == "UPTREND" or is_flip
+                        # 2026-08-20: flip mechanism removed entirely (see
+                        # module docstring / effective_pdh comment above).
+                        # counter_trend now purely reflects whether this
+                        # SHORT fights today's UPTREND bias -- no more flip
+                        # concept at all. As of today, counter_trend no
+                        # longer forces alert-only either (see Fix 3 in
+                        # monitor.py) -- it now triggers reduced/staged
+                        # sizing instead, same mechanism as a wide SL.
+                        counter = level.trend_bias == "UPTREND"
 
-                        # Rules 1-3 (2026-08-13, Rule 1 revised 2026-08-15) —
-                        # sweep depth bounds still hard-reject; SL distance
-                        # now only sets use_staged_entry (50% initial size),
-                        # checked against whatever level was actually swept
-                        # (effective_pdh — the fixed PDH, or the dynamic
-                        # trend-flip reference).
                         reject_reason, use_staged_entry = _check_hard_rules(
                             'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme)
 
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=is_flip,
+                                         counter_trend=counter, trend_mode=False,
                                          swept_level=effective_pdh, reject_reason=reject_reason,
                                          use_staged_entry=use_staged_entry)
                         if reject_reason:
@@ -571,7 +571,6 @@ class StrategyEngine:
                             logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
                                         f"Entry:{entry:.4f} SL:{sl:.4f} "
                                         f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
-                                        f"{' [trend-aligned flip]' if is_flip else ''}"
                                         f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
@@ -579,28 +578,8 @@ class StrategyEngine:
                         level.pdh_sweep_armed_at = None
                         level.pdh_event_active = True
                         level.pdh_cisd_ref = None
-                        # A rejected setup never really confirmed — don't
-                        # let it count toward trend-stability tracking or
-                        # seed a flip reference, both of which are meant to
-                        # reflect genuinely valid counter-trend confirmations.
                         if counter and not reject_reason:
                             level.counter_trend_confirms += 1
-
-                        # UPTREND mirror: this counter-trend SHORT confirmation
-                        # sets a CANDIDATE reference for the buy-side liquidity
-                        # LONG hunt. FIX (2026-07-26): no longer force-arms
-                        # pdl_state — a later candle must independently sweep
-                        # past this reference through the normal NONE-state
-                        # gates (depth + inside-bar) before anything arms.
-                        # See module docstring for the real cases that made
-                        # this necessary.
-                        if counter and not reject_reason and level.trend_bias == "UPTREND":
-                            seed_low = candle['low']
-                            if level.trend_ref_low is None or seed_low < level.trend_ref_low:
-                                level.trend_ref_low = seed_low
-                            logger.info(f"{symbol} | UPTREND — buy-side reference set at "
-                                        f"{level.trend_ref_low:.4f} from this dip; still needs "
-                                        f"a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger "
                                     f"but did not reclaim below the {reclaim_ref_label} "
@@ -715,17 +694,15 @@ class StrategyEngine:
                     if reclaim_ok:
                         entry = candle['close']
                         sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
-                        is_flip = level.trend_bias == "UPTREND"
-                        # Same fix as the PDH-side mirror above — flip trades
-                        # no longer auto-execute, routed through the existing
-                        # alert-only path instead.
-                        counter = level.trend_bias == "DOWNTREND" or is_flip
+                        # 2026-08-20: flip mechanism removed entirely -- see
+                        # the mirrored comment in the PDH-side block above.
+                        counter = level.trend_bias == "DOWNTREND"
 
                         reject_reason, use_staged_entry = _check_hard_rules(
                             'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme)
 
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=is_flip,
+                                         counter_trend=counter, trend_mode=False,
                                          swept_level=effective_pdl, reject_reason=reject_reason,
                                          use_staged_entry=use_staged_entry)
                         if reject_reason:
@@ -736,7 +713,6 @@ class StrategyEngine:
                             logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
                                         f"Entry:{entry:.4f} SL:{sl:.4f} "
                                         f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
-                                        f"{' [trend-aligned flip]' if is_flip else ''}"
                                         f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
@@ -744,21 +720,8 @@ class StrategyEngine:
                         level.pdl_sweep_armed_at = None
                         level.pdl_event_active = True
                         level.pdl_cisd_ref = None
-                        if counter:
+                        if counter and not reject_reason:
                             level.counter_trend_confirms += 1
-
-                        # DOWNTREND: this counter-trend LONG confirmation sets
-                        # a CANDIDATE reference for the sell-side liquidity
-                        # SHORT hunt. FIX (2026-07-26): no longer force-arms
-                        # pdh_state — see module docstring and the mirrored
-                        # comment in the PDH-side block above.
-                        if counter and not reject_reason and level.trend_bias == "DOWNTREND":
-                            seed_high = candle['high']
-                            if level.trend_ref_high is None or seed_high > level.trend_ref_high:
-                                level.trend_ref_high = seed_high
-                            logger.info(f"{symbol} | DOWNTREND — sell-side reference set at "
-                                        f"{level.trend_ref_high:.4f} from this bounce; still "
-                                        f"needs a genuine sweep past it to arm")
                     else:
                         logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger "
                                     f"but did not reclaim above the {reclaim_ref_label} "
