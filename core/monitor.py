@@ -113,6 +113,11 @@ STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
 
 REJECTION_PROXIMITY_PCT = 0.01  # 1.0%
 ROE_TARGET_PCT = 7.0
+# 2026-08-20 Fix 1: how far behind the best price the trailing stop sits
+# for the remainder after an ROE-protection partial close, expressed as a
+# fraction of the ORIGINAL entry-to-SL risk. 0.5 means it trails half an
+# R-multiple behind the running high-water mark, ratcheting forward only.
+TRAILING_STOP_R_BUFFER = 0.5
 MIN_ROE_FOR_REJECTION_EXIT_PCT = 3.0  # JUDGMENT CALL, unvalidated — half of
                                        # ROE_TARGET_PCT. Priority 2 (rejection
                                        # exit) now requires the position to
@@ -759,14 +764,99 @@ class MarketMonitor:
         # a reversal before TP2 now closes at breakeven instead of the
         # smaller-but-locked-in profit ROE-protection used to guarantee.
         ladder_already_running = tr.get("tp1_filled", False)
-        if not ladder_already_running:
+
+        # 2026-08-20 Fix 1: ROE-protection now partial-closes instead of
+        # closing the whole position. Real evidence (a KAITOUSD trade)
+        # showed price continuing well past the full-close point before
+        # eventually reversing -- a full close has no way to participate
+        # in that kind of continuation. Now: close 50% at the ROE
+        # threshold (banking real profit, same as before), and let the
+        # remainder ride behind a trailing stop instead of exiting
+        # entirely. Skipped once already triggered (roe_partial_done) --
+        # from then on _check_roe_trailing_stop (below) owns the exit.
+        if not ladder_already_running and not tr.get("roe_partial_done", False):
             if details is None:
                 details = await self.coindcx.get_position_details(symbol)
             if details and details.get("roe") is not None and details["roe"] >= ROE_TARGET_PCT:
-                await self._exit_position(symbol, tr, exit_price=candle['close'],
-                                           reason="roe_protection", label="Take Profit – ROE Protection",
-                                           roe=details["roe"])
+                try:
+                    live_positions = await self.coindcx.get_open_positions()
+                except Exception as e:
+                    logger.error(f"{symbol} | Failed to fetch live position for ROE partial close: {e}",
+                                 exc_info=True)
+                    return
+                live_qty = abs(live_positions.get(symbol, 0))
+                if live_qty <= 0:
+                    self._log_close(symbol, tr, exit_price=None, reason="roe_protection_already_closed")
+                    self.state.reset_symbol_watch(symbol)
+                    self._trailing.pop(symbol, None)
+                    self._open_positions.pop(symbol, None)
+                    return
+                close_qty = live_qty * 0.5
+                success = await self.coindcx.close_position_market(symbol, side, close_qty)
+                if success:
+                    tr["roe_partial_done"] = True
+                    tr["trailing_high_water"] = candle['close']
+                    self._log_close(symbol, tr, exit_price=candle['close'], reason="roe_protection_partial",
+                                     event_type="partial_close")
+                    await self.telegram.send_alert(
+                        f"✅ *Take Profit – ROE Protection (Partial)*\n\n"
+                        f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if side == 'BUY' else '📉 SHORT'}\n"
+                        f"*Entry:* {tr['entry']:.4f}\n*Exit price:* {candle['close']:.4f}\n"
+                        f"*ROE:* {details['roe']:.2f}%\n*Closed:* ~50% of position\n\n"
+                        f"Remainder now running behind a trailing stop instead of closing "
+                        f"entirely, so a further favorable move can still be captured."
+                    )
+                    logger.info(f"{symbol} | ROE-protection partial close at {candle['close']:.4f} "
+                               f"(qty {close_qty:.6f}, ROE {details['roe']:.2f}%)")
+                else:
+                    logger.error(f"{symbol} | ROE-protection partial close order failed — "
+                                f"will retry next candle if ROE still qualifies")
                 return
+
+        if tr.get("roe_partial_done", False):
+            await self._check_roe_trailing_stop(symbol, tr, candle)
+
+    async def _check_roe_trailing_stop(self, symbol: str, tr: dict, candle: dict):
+        """Owns the exit for the remainder left after an ROE-protection
+        partial close. Trails behind the best price seen since the partial
+        close by TRAILING_STOP_R_BUFFER (a fraction of the ORIGINAL entry
+        risk) -- ratchets forward only, never loosens. Closes the full
+        remainder if price closes back through the trailing level."""
+        side = tr["side"]
+        entry, sl = tr["entry"], tr["sl"]
+        original_risk = abs(entry - sl)
+        if original_risk <= 0:
+            return
+
+        high_water = tr.get("trailing_high_water", candle['close'])
+        if side == 'BUY':
+            if candle['close'] > high_water:
+                high_water = candle['close']
+            trail_sl = high_water - (TRAILING_STOP_R_BUFFER * original_risk)
+            hit = candle['close'] < trail_sl
+        else:
+            if candle['close'] < high_water:
+                high_water = candle['close']
+            trail_sl = high_water + (TRAILING_STOP_R_BUFFER * original_risk)
+            hit = candle['close'] > trail_sl
+
+        tr["trailing_high_water"] = high_water
+
+        if hit:
+            await self._exit_position(symbol, tr, exit_price=candle['close'],
+                                       reason="roe_trailing_stop",
+                                       label="Position Closed — Trailing Stop (post-ROE remainder)")
+            return
+
+        new_trail_sl = trail_sl
+        if new_trail_sl != tr.get("live_sl"):
+            try:
+                success = await self.coindcx.update_stop_loss(symbol, new_sl_price=new_trail_sl)
+                if success:
+                    tr["live_sl"] = new_trail_sl
+                    logger.info(f"{symbol} | Trailing stop (post-ROE remainder) moved to {new_trail_sl:.4f}")
+            except Exception as e:
+                logger.error(f"{symbol} | Failed to update trailing stop: {e}", exc_info=True)
 
     async def _exit_position(self, symbol: str, tr: dict, exit_price: float, reason: str,
                               label: str, roe: Optional[float] = None):
@@ -867,6 +957,11 @@ class MarketMonitor:
             )
             return
 
+        # 2026-08-20: Fix 3 (staged entry for counter-trend) was built and
+        # tested, but parked per explicit decision -- the "good run since
+        # Friday" contains zero real counter-trend trades, so unlike Fix 1
+        # and Fix 2, this one has no track record to lean on at all.
+        # Reverted to the original full alert-only block until revisited.
         if level.counter_trend_confirms >= STABILITY_MAX_COUNTER_CONFIRMS:
             logger.info(f"{symbol} | {signal.side} setup — {level.counter_trend_confirms} "
                        f"counter-trend confirmations already seen today, day's "
