@@ -58,38 +58,22 @@ SOL, XRP all traced to ~2.8-3R winners using this exact logic):
   original dual-sided sweep-reversal logic handles today.
 
   If day-1 is decisive and day-2 differs (or isn't decisive itself),
-  this is a single FRESH trend day, and the flip is applied:
+  this is a single FRESH trend day.
 
-  In DOWNTREND: the PDL (buy-side) sweep-reversal machinery still runs
-  exactly as before and still requires all the same gates — but its
-  resulting LONG signal is marked counter_trend and is alert-only, not
-  auto-traded. The MOMENT that LONG signal confirms, its own
-  confirmation candle's high becomes a candidate reference
-  (trend_ref_high) for the sell-side liquidity SHORT hunt.
-
-  *** FIX (2026-07-26) ***: this candidate reference does NOT
-  automatically arm the PDH-side state machine into "SWEPT" anymore.
-  Real cases (ETHUSD and KAITOUSD, both 2026-07-26) showed the old
-  behaviour — force-setting pdh_state="SWEPT" directly from the seed —
-  let a trade fire even when price never independently swept past that
-  reference by any meaningful margin (ETH: seed 1876.53, actual peak
-  only 1878.50, just 0.10% — far short of the same 0.2% bar every
-  other sweep has to clear; KAITO: entry landed at essentially the
-  seed price itself, 1.0106 vs seed 1.0108). Now the seed only updates
-  trend_ref_high/trend_ref_low, which becomes the new effective_pdh/
-  effective_pdl automatically — the EXISTING NONE-state sweep-arming
-  logic (depth gate, inside-bar gate) then has to independently detect
-  a real sweep past it on a LATER candle, exactly like any other
-  sweep, before anything arms. Checked against real data: this change
-  correctly still allows ICPUSD's validated win (real sweep, 0.70%
-  past its seed) while blocking both disputed ETH and KAITO trades at
-  the source.
-
-  UPTREND is the exact mirror: the PDH (sell-side) machinery still
-  runs, its resulting SHORT signal is counter_trend/alert-only, and
-  the moment it confirms, its own low becomes a candidate reference
-  (trend_ref_low) for the buy-side liquidity LONG hunt — same fix
-  applies, no automatic arming.
+  *** REMOVED (2026-08-20) ***: this used to seed a dynamic
+  "trend_ref_high"/"trend_ref_low" re-anchored reference from a
+  counter-trend bounce, which effective_pdh/effective_pdl would then
+  hunt instead of the fixed daily PDH/PDL — the "trend-aligned flip"
+  mechanism. Removed entirely after a real trade's rejection alert
+  showed "Level swept: 196.00", far from the fixed PDH (201.42),
+  causing confusion about what was actually being hunted. Since flip
+  trades had already been alert-only (never auto-traded) since
+  2026-07-29, this removal has zero impact on any auto-executed trade
+  — SHORT signals now ONLY come from a genuine fixed-PDH sweep, LONG
+  only from a genuine fixed-PDL sweep. effective_pdh/effective_pdl now
+  always just equal the fixed pdh/pdl. The DailyLevel dataclass still
+  has trend_ref_high/trend_ref_low fields (state.py) for persistence
+  compatibility with old saved snapshots, but nothing sets them anymore.
 
 CISD HYBRID (2026-07-22): for a "deep" sweep (sweep extreme sits at
 least DEEP_SWEEP_THRESHOLD_PCT beyond the fixed PDH/PDL), the reclaim
@@ -115,7 +99,20 @@ from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
 logger = setup_logger("strategy")
 
-SL_BUFFER_PCT = 0.002               # 0.2% buffer beyond the sweep extreme
+SL_BUFFER_PCT = 0.01                # 1.0% buffer beyond the sweep extreme --
+                                     # widened from 0.2% on 2026-08-20. Real
+                                     # trade evidence (KAITOUSD, Aug 16-19)
+                                     # showed SL sitting almost exactly at
+                                     # the sweep wick was too tight -- a
+                                     # shallow re-test of the same wick could
+                                     # clip the stop before the real reversal
+                                     # played out. This is an explicit,
+                                     # deliberate number, not derived from a
+                                     # backtested structural rule -- an
+                                     # earlier attempt to find a clean,
+                                     # non-percentage "structural" reference
+                                     # (e.g. the pre-sweep candle) didn't
+                                     # hold up against the real data checked.
 MIN_SWEEP_DEPTH_PCT = 0.002          # UNVALIDATED placeholder — 0.2%
 MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
                                        # the reclaim check (close must be back
@@ -245,12 +242,10 @@ class Signal:
         # the same +1R/confirmation logic used elsewhere, never a blind
         # timer or percentage trigger alone.
         self.use_staged_entry = use_staged_entry
-        # The level actually swept to produce this signal — the FIXED daily
-        # PDH/PDL for a normal-regime trade, or the DYNAMIC re-anchored
-        # trend_ref_high/trend_ref_low for a trend-flip trade. This is what
-        # alerts should display, not always self.pdh/self.pdl, which stay
-        # fixed even when a flip trade is actually hunting a different,
-        # re-anchored level entirely.
+        # The level actually swept to produce this signal -- the FIXED
+        # daily PDH/PDL. (Prior to 2026-08-20 this could also be a dynamic
+        # re-anchored trend-flip reference; that mechanism was removed
+        # entirely, so this is now always just the fixed pdh/pdl.)
         self.swept_level = swept_level if swept_level is not None else (
             pdh if side == 'SELL' else pdl
         )
@@ -489,10 +484,8 @@ class StrategyEngine:
                     # must also clear MIN_SWEEP_DEPTH_PCT, measured against
                     # effective_pdh itself when no day_extreme exists yet —
                     # previously this check was skipped entirely on the first
-                    # attempt. This same check now also governs a trend-flip's
-                    # seeded reference (effective_pdh resolves to
-                    # trend_ref_high automatically), per the 2026-07-26 fix —
-                    # see module docstring.
+                    # attempt. (effective_pdh always equals the fixed pdh
+                    # since 2026-08-20 — see module docstring.)
                     baseline = level.pdh_day_extreme if level.pdh_day_extreme is not None else effective_pdh
                     deep_enough = candle['high'] >= baseline * (1 + MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
@@ -637,10 +630,7 @@ class StrategyEngine:
 
             if not pdl_expired_this_candle and level.pdl_state == "NONE":
                 if candle['low'] < effective_pdl and not inside_bar:
-                    # See matching PDH-side comment above — same fix, and
-                    # this now also governs a trend-flip's seeded reference
-                    # for the same reason (effective_pdl resolves to
-                    # trend_ref_low automatically).
+                    # See matching PDH-side comment above — same fix.
                     baseline = level.pdl_day_extreme if level.pdl_day_extreme is not None else effective_pdl
                     deep_enough = candle['low'] <= baseline * (1 - MIN_SWEEP_DEPTH_PCT)
                     if deep_enough:
