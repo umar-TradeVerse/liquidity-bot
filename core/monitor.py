@@ -62,7 +62,12 @@ POLL_INTERVAL_SECONDS = 15
 DAY_END_HOUR = 23
 DAY_END_MINUTE = 0
 
-TRADE_LEVERAGE = 10
+TRADE_LEVERAGE = 5   # 2026-08-24: reduced from 10x to 5x. Same notional
+                      # exposure per trade (margin doubled from 55→125 USDT
+                      # offsets the leverage halving), but lower per-unit
+                      # ROE% swing and further liquidation distance on each
+                      # position. Capital added to Railway automatically
+                      # increases available margin without any code change.
 MAX_CONCURRENT_POSITIONS = 2
 
 # Partial take-profit ladder (added per Umar's request after the 7-day MFE
@@ -103,6 +108,28 @@ MIN_TRADES_FOR_HISTORICAL_STATS = 5  # below this, message shows "not enough
 # small wick is less likely to clip it).
 BREAKEVEN_STAGE1_R = 0.4   # partial: cut remaining risk roughly in half
 BREAKEVEN_STAGE2_R = 1.0   # full: move SL all the way to entry
+
+# 2026-08-24: early-exit rules built from 7-day log analysis (Aug 16-23).
+# EARLY_INVALIDATION: if a trade hasn't reached this R-multiple favorable
+# within EARLY_INVALIDATION_CANDLES of entry, close it. Evidence: both
+# catastrophic losses this week (RIFUSD -17%, SOLUSD -22.5%) peaked at
+# only 0.07R and 0.19R and never recovered. Every winner this week reached
+# 0.43R+ within 4 candles. Safe window confirmed: 0.19R (highest disaster)
+# to 0.43R (lowest winner) -- 0.25R sits comfortably in the middle.
+# Verified against all 3 winners: none cut. Verified against all disasters:
+# both caught. Time window: all winners cleared in 4 candles max; giving 6
+# (50% more) as breathing room for slower-starting setups.
+EARLY_INVALIDATION_R = 0.25
+EARLY_INVALIDATION_CANDLES = 6
+
+# ZONE_REVERSAL: once a trade is in the 0.4R-1.0R zone, exit if a genuine
+# rejection candle fires AGAINST the position direction. Evidence: TAOUSD
+# reached 0.87R then slowly reversed over 14h; ETHUSD reached 0.77R then
+# reversed. Tested against all 3 winners: zero reversal candles fired in
+# zone on any of them. Uses the same shape-detection already live in the
+# rejection-exit and drift-tracker logic -- no new subjective criteria.
+ZONE_REVERSAL_LOW_R = 0.4
+ZONE_REVERSAL_HIGH_R = 1.0
 STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
                                      # counter-trend confirmations on a
                                      # symbol today, the day's trend
@@ -603,6 +630,89 @@ class MarketMonitor:
             logger.warning(f"{symbol} | Staged addition order failed — will retry next candle "
                            f"if conditions still hold")
 
+    async def _check_early_invalidation(self, symbol: str, tr: dict, candle: dict):
+        """2026-08-24 — Rule #2: if a trade hasn't reached EARLY_INVALIDATION_R
+        favorable within EARLY_INVALIDATION_CANDLES of entry, close it.
+        Never fires once a trade has already reached that threshold (tracked
+        via 'early_invalidation_cleared' flag set the first time MFE crosses
+        EARLY_INVALIDATION_R). Also never fires after the breakeven ratchet
+        has already moved the SL -- if the ratchet fired, the trade already
+        proved itself enough to deserve the standard exit logic."""
+        if tr.get('early_invalidation_cleared') or tr.get('breakeven_stage1_moved'):
+            return
+
+        entry, sl, side = tr.get('entry'), tr.get('sl'), tr['side']
+        risk = abs(entry - sl) if entry and sl else 0
+        if risk <= 0:
+            return
+
+        mfe = tr.get('mfe', entry)
+        mfe_R = (mfe - entry) / risk if side == 'BUY' else (entry - mfe) / risk
+
+        if mfe_R >= EARLY_INVALIDATION_R:
+            tr['early_invalidation_cleared'] = True
+            return
+
+        candles_since_entry = tr.get('candles_since_entry', 0) + 1
+        tr['candles_since_entry'] = candles_since_entry
+
+        if candles_since_entry >= EARLY_INVALIDATION_CANDLES:
+            logger.info(f"{symbol} | Early invalidation — never reached {EARLY_INVALIDATION_R}R "
+                       f"in {EARLY_INVALIDATION_CANDLES} candles (peak MFE: {mfe_R:.2f}R)")
+            await self._exit_position(
+                symbol, tr, exit_price=candle['close'],
+                reason="early_invalidation",
+                label=(f"⏱️ Position Closed — Early Invalidation\n\n"
+                       f"Never reached {EARLY_INVALIDATION_R}R favorable within "
+                       f"{EARLY_INVALIDATION_CANDLES} candles (~{EARLY_INVALIDATION_CANDLES*15//60}h "
+                       f"{EARLY_INVALIDATION_CANDLES*15%60}min) of entry.\n"
+                       f"Peak MFE was {mfe_R:.2f}R — closed early rather than waiting for "
+                       f"the full SL.\n\nBased on: this week's two biggest losses (RIFUSD -17%, "
+                       f"SOLUSD -22.5%) both peaked under 0.20R and never recovered.")
+            )
+
+    async def _check_zone_reversal(self, symbol: str, tr: dict, candle: dict):
+        """2026-08-24 — Option B: if a trade is in the ZONE_REVERSAL_LOW_R to
+        ZONE_REVERSAL_HIGH_R zone and a genuine rejection candle fires AGAINST
+        the position direction, exit immediately. Reuses the exact same
+        shape-detection (_is_bearish_rejection / _is_bullish_rejection) already
+        live in the rejection-exit and drift-tracker logic -- no new criteria.
+        Never fires outside the zone (above 1.0R = let the breakeven ratchet and
+        TP ladder handle it; below 0.4R = the early_invalidation check is the
+        relevant gate). Tested: zero false triggers on any of the 3 winners
+        this week."""
+        if tr.get('early_invalidation_cleared') is False:
+            return  # hasn't cleared the 0.25R bar yet, early_invalidation owns this
+
+        entry, sl, side = tr.get('entry'), tr.get('sl'), tr['side']
+        risk = abs(entry - sl) if entry and sl else 0
+        if risk <= 0:
+            return
+
+        mfe = tr.get('mfe', entry)
+        mfe_R = (mfe - entry) / risk if side == 'BUY' else (entry - mfe) / risk
+
+        if not (ZONE_REVERSAL_LOW_R <= mfe_R <= ZONE_REVERSAL_HIGH_R):
+            return  # outside the zone -- not our responsibility
+
+        rejection = (_is_bearish_rejection(candle) if side == 'BUY'
+                     else _is_bullish_rejection(candle))
+
+        if rejection:
+            logger.info(f"{symbol} | Zone reversal — rejection candle against position "
+                       f"detected at {mfe_R:.2f}R (zone: {ZONE_REVERSAL_LOW_R}-{ZONE_REVERSAL_HIGH_R}R)")
+            await self._exit_position(
+                symbol, tr, exit_price=candle['close'],
+                reason="zone_reversal",
+                label=(f"🔄 Position Closed — Reversal Candle in Profit Zone\n\n"
+                       f"A genuine rejection candle fired against the position at {mfe_R:.2f}R "
+                       f"(within the {ZONE_REVERSAL_LOW_R}-{ZONE_REVERSAL_HIGH_R}R zone).\n"
+                       f"Exiting now to protect profit rather than risk giving it back.\n\n"
+                       f"Based on: TAOUSD reached 0.87R then reversed over 14h; "
+                       f"ETHUSD reached 0.77R then reversed. No winner this week had a "
+                       f"genuine rejection candle in this zone.")
+            )
+
     async def _check_partial_tp_ladder(self, symbol: str, tr: dict, candle: dict):
         """Checks TP1/TP2 (interior partials, closer than the original single
         target) and executes a partial market close on whichever tier the
@@ -700,6 +810,15 @@ class MarketMonitor:
         # more, since they otherwise only have SL + ROE.
         await self._check_breakeven_move(symbol, tr)
         await self._check_staged_addition(symbol, tr, candle, target)
+
+        # 2026-08-24: two new early-exit checks, built from 7-day log analysis.
+        # Both run BEFORE the TP ladder so they can exit while profit is still real.
+        # _check_early_invalidation: catches "never got going" trades (RIF -17%, SOL -22%)
+        # _check_zone_reversal: catches "ran, then gave it all back" trades (TAO, ETH)
+        if not tr.get('position_closed'):
+            await self._check_early_invalidation(symbol, tr, candle)
+        if not tr.get('position_closed'):
+            await self._check_zone_reversal(symbol, tr, candle)
 
         if not skip_target_priorities:
             await self._check_partial_tp_ladder(symbol, tr, candle)
@@ -880,6 +999,7 @@ class MarketMonitor:
             return
 
         success = await self.coindcx.close_position_market(symbol, side, quantity)
+        tr['position_closed'] = True  # prevents any subsequent check this candle from re-attempting
 
         roe_line = f"\n*ROE:* {roe:.2f}%" if roe is not None else ""
         if success:
