@@ -217,7 +217,8 @@ POST_EXPIRY_DRIFT_OBSERVATION_MINUTES = 180  # how long to keep watching
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
                  counter_trend=False, trend_mode=False, swept_level=None,
-                 reject_reason=None, use_staged_entry=False):
+                 reject_reason=None, use_staged_entry=False,
+                 sweep_closed_inside=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -242,6 +243,12 @@ class Signal:
         # the same +1R/confirmation logic used elsewhere, never a blind
         # timer or percentage trigger alone.
         self.use_staged_entry = use_staged_entry
+        # 2026-08-25 informational only. True = sweep candle closed back
+        # inside the level (genuine hunt). False = closed beyond it
+        # (breakout risk). None = unknown. Surfaced in alerts so the
+        # hunt-vs-breakout split can be evaluated on real trades before
+        # it is ever allowed to gate an entry.
+        self.sweep_closed_inside = sweep_closed_inside
         # The level actually swept to produce this signal -- the FIXED
         # daily PDH/PDL. (Prior to 2026-08-20 this could also be a dynamic
         # re-anchored trend-flip reference; that mechanism was removed
@@ -457,18 +464,27 @@ class StrategyEngine:
                                     f"waiting for a completely fresh sweep")
                         # Informational-only snapshot, taken BEFORE the real
                         # state resets below. Read-only from here on.
-                        self.drift_observations.append({
+                        # 2026-08-25 FIX: a setup can expire while still in
+                        # SWEPT state (no trigger candle ever formed), leaving
+                        # pdh_trigger as None. Reading ['high'] on it raised
+                        # TypeError and killed the whole process_candle call —
+                        # meaning that symbol silently stopped being evaluated
+                        # for the rest of the run. Only record a drift
+                        # observation when a trigger actually exists.
+                        if level.pdh_trigger is not None:
+                            self.drift_observations.append({
                             'symbol': symbol, 'side': 'PDH', 'direction': 'SHORT',
                             'trigger_high': level.pdh_trigger['high'],
                             'trigger_low': level.pdh_trigger['low'],
                             'sweep_extreme': level.pdh_sweep_extreme,
                             'sweep_armed_at': level.pdh_sweep_armed_at,
                             'expired_at': candle['time'],
-                        })
+                            })
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_sweep_armed_at = None
+                        level.pdh_sweep_closed_inside = None
                         level.pdh_cisd_ref = None
                         level.pdh_event_active = True  # prevents re-arming on THIS same
                                                         # candle too, via the guard below
@@ -493,8 +509,18 @@ class StrategyEngine:
                         level.pdh_sweep_extreme = candle['high']
                         level.pdh_day_extreme = candle['high']
                         level.pdh_sweep_armed_at = candle['time']
-                        logger.info(f"{symbol} | PDH-side swept (H:{candle['high']:.4f}) — "
-                                    f"watching for the first bearish trigger candle")
+                        # 2026-08-25 informational classification: a genuine
+                        # liquidity hunt pierces the level with the wick but
+                        # CLOSES back inside it. A close beyond the level is
+                        # acceptance — i.e. a breakout, where a reversal
+                        # short is fighting real momentum rather than fading
+                        # a stop-hunt. Alert-only; does not gate anything.
+                        level.pdh_sweep_closed_inside = candle['close'] < effective_pdh
+                        _char = "HUNT (closed back inside)" if level.pdh_sweep_closed_inside \
+                                else "BREAKOUT RISK (closed beyond level)"
+                        logger.info(f"{symbol} | PDH-side swept (H:{candle['high']:.4f}, "
+                                    f"C:{candle['close']:.4f} vs level {effective_pdh:.4f}) "
+                                    f"— {_char} — watching for the first bearish trigger candle")
 
                         body = abs(candle['close'] - candle['open'])
                         upper_wick = candle['high'] - max(candle['open'], candle['close'])
@@ -555,7 +581,8 @@ class StrategyEngine:
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=False,
                                          swept_level=effective_pdh, reject_reason=reject_reason,
-                                         use_staged_entry=use_staged_entry)
+                                         use_staged_entry=use_staged_entry,
+                                         sweep_closed_inside=level.pdh_sweep_closed_inside)
                         if reject_reason:
                             logger.info(f"{symbol} | SHORT setup confirmed but REJECTED — "
                                         f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
@@ -569,6 +596,7 @@ class StrategyEngine:
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_sweep_armed_at = None
+                        level.pdh_sweep_closed_inside = None
                         level.pdh_event_active = True
                         level.pdh_cisd_ref = None
                         if counter and not reject_reason:
@@ -608,18 +636,27 @@ class StrategyEngine:
                                     f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
                                     f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
                                     f"waiting for a completely fresh sweep")
-                        self.drift_observations.append({
+                        # 2026-08-25 FIX: a setup can expire while still in
+                        # SWEPT state (no trigger candle ever formed), leaving
+                        # pdl_trigger as None. Reading ['high'] on it raised
+                        # TypeError and killed the whole process_candle call —
+                        # meaning that symbol silently stopped being evaluated
+                        # for the rest of the run. Only record a drift
+                        # observation when a trigger actually exists.
+                        if level.pdl_trigger is not None:
+                            self.drift_observations.append({
                             'symbol': symbol, 'side': 'PDL', 'direction': 'LONG',
                             'trigger_high': level.pdl_trigger['high'],
                             'trigger_low': level.pdl_trigger['low'],
                             'sweep_extreme': level.pdl_sweep_extreme,
                             'sweep_armed_at': level.pdl_sweep_armed_at,
                             'expired_at': candle['time'],
-                        })
+                            })
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_sweep_armed_at = None
+                        level.pdl_sweep_closed_inside = None
                         level.pdl_cisd_ref = None
                         level.pdl_event_active = True
                         pdl_expired_this_candle = True
@@ -638,8 +675,13 @@ class StrategyEngine:
                         level.pdl_sweep_extreme = candle['low']
                         level.pdl_day_extreme = candle['low']
                         level.pdl_sweep_armed_at = candle['time']
-                        logger.info(f"{symbol} | PDL-side swept (L:{candle['low']:.4f}) — "
-                                    f"watching for the first bullish trigger candle")
+                        # Mirror of the PDH-side classification above.
+                        level.pdl_sweep_closed_inside = candle['close'] > effective_pdl
+                        _char = "HUNT (closed back inside)" if level.pdl_sweep_closed_inside \
+                                else "BREAKOUT RISK (closed beyond level)"
+                        logger.info(f"{symbol} | PDL-side swept (L:{candle['low']:.4f}, "
+                                    f"C:{candle['close']:.4f} vs level {effective_pdl:.4f}) "
+                                    f"— {_char} — watching for the first bullish trigger candle")
 
                         body = abs(candle['close'] - candle['open'])
                         lower_wick = min(candle['open'], candle['close']) - candle['low']
@@ -694,7 +736,8 @@ class StrategyEngine:
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=False,
                                          swept_level=effective_pdl, reject_reason=reject_reason,
-                                         use_staged_entry=use_staged_entry)
+                                         use_staged_entry=use_staged_entry,
+                                         sweep_closed_inside=level.pdl_sweep_closed_inside)
                         if reject_reason:
                             logger.info(f"{symbol} | LONG setup confirmed but REJECTED — "
                                         f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
@@ -708,6 +751,7 @@ class StrategyEngine:
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_sweep_armed_at = None
+                        level.pdl_sweep_closed_inside = None
                         level.pdl_event_active = True
                         level.pdl_cisd_ref = None
                         if counter and not reject_reason:
