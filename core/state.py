@@ -34,12 +34,18 @@ class DailyLevel:
     # the actual confirmed sweep candle, not from any earlier candle that
     # merely approached the level, per the rule's explicit requirement.
     pdh_sweep_armed_at: Optional[int] = None
+    # 2026-08-25 informational: did the sweep candle CLOSE back inside the
+    # level (a genuine liquidity hunt — wick pierces, body rejects), or did
+    # it close beyond the level (acceptance / breakout)? Captured at arm
+    # time and carried through to the signal for alerting only.
+    pdh_sweep_closed_inside: Optional[bool] = None
     pdl_state: str = "NONE"
     pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
     pdl_day_extreme: Optional[float] = None
     pdl_sweep_armed_at: Optional[int] = None
+    pdl_sweep_closed_inside: Optional[bool] = None
     # Trend bias, set once at the daily reset from the last 3 daily candles.
     # "NONE" = sideways OR a matured/exhausted trend (2+ consecutive same-
     # direction days) — keep the original dual-sided sweep-reversal logic.
@@ -157,10 +163,12 @@ class BotState:
                 level.pdh_trigger = None
                 level.pdh_sweep_extreme = None
                 level.pdh_sweep_armed_at = None
+                level.pdh_sweep_closed_inside = None
                 level.pdl_state = "NONE"
                 level.pdl_trigger = None
                 level.pdl_sweep_extreme = None
                 level.pdl_sweep_armed_at = None
+                level.pdl_sweep_closed_inside = None
                 # trend_bias / trend_ref_high / trend_ref_low deliberately NOT
                 # reset here — they're a daily classification, not per-trade
                 # state, and must persist across position closes within the
