@@ -1173,13 +1173,23 @@ class MarketMonitor:
                           if signal.trend_mode else
                           f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}")
 
+            # 2026-08-25 informational only — see Signal.sweep_closed_inside.
+            if signal.sweep_closed_inside is True:
+                sweep_char = "\n*Sweep character:* ✅ HUNT — sweep candle closed back inside the level"
+            elif signal.sweep_closed_inside is False:
+                sweep_char = ("\n*Sweep character:* ⚠️ BREAKOUT RISK — sweep candle closed "
+                              "_beyond_ the level (price accepted above/below it rather than "
+                              "rejecting). Tracking only — trade still taken normally.")
+            else:
+                sweep_char = ""
+
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                 f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}"
                 f"{' — STAGED ENTRY (wide SL, 50% initial)' if signal.use_staged_entry else ''}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"{level_line}{trend_line}\n\n⏳ Placing order..."
+                f"{level_line}{trend_line}{sweep_char}\n\n⏳ Placing order..."
             )
 
             # 2026-08-15: SL distance beyond MAX_SL_DISTANCE_PCT no longer
