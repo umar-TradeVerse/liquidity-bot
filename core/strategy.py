@@ -166,12 +166,32 @@ TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
 
 # Rule 1 — Maximum Stop Loss Distance. If the calculated SL is more than
 # this far from entry, reject the trade outright (alert-only, no execution).
-MAX_SL_DISTANCE_PCT = 0.02  # 2.0% — tightened from 3.5% on 2026-08-14 after
-                             # the first live KAITOUSD trade showed a 2.16%
-                             # raw SL distance translating to -18.47% ROE at
-                             # 10x leverage. The rule stays a RAW price-%
-                             # check (not leveraged ROE) — this just lowers
-                             # the raw ceiling itself.
+MAX_SL_DISTANCE_PCT = 0.03  # 3.0% — raised from 2.0% on 2026-08-27. The
+                             # 2026-08-20 SL_BUFFER_PCT change (0.2% -> 1.0%)
+                             # shifted the whole SL-distance distribution
+                             # right, so the old 2.0% trigger was staging 97%
+                             # of signals (32/33) instead of the ~30% it was
+                             # designed for. Replay of all 45 R:R-passing
+                             # historical trades at current sizing: 2.0% ->
+                             # +$12.48, 3.0% -> +$24.03, staging 6/45 rather
+                             # than 21/45. NOTE: the threshold sweep was noisy
+                             # (3.25% -> +$29, 3.5% -> +$10), so 3.0% is chosen
+                             # as a defensible round number in a reasonable
+                             # range, NOT as a fitted optimum. Do not read the
+                             # +$24 figure as a forecast.
+
+# 2026-08-27 Rule 11 — minimum reward:risk. Reward is measured to the
+# opposite daily level (the actual target the strategy trades toward),
+# risk is entry->SL. Evidence: across all 53 matched historical trades,
+# 8 had R:R < 1.0 and ALL 8 lost (avg return -0.73%), while the 45 with
+# R:R >= 1.0 won 55.6% with positive average return. Zero winners sat
+# below 1.0. Applying this rule to history moves total P&L from -$11.16
+# to +$12.48 with no winning trade sacrificed. 1.0 is both the
+# mathematically obvious floor (reward must at least equal risk) and the
+# exact point where every historical failure fell below and every
+# success above. Not raised beyond 1.0 because 1.5 would have rejected
+# TAOUSD 08-27 (1.44x), a real winner.
+MIN_REWARD_RISK_RATIO = 1.0
 
 # Rules 2 & 3 — Minimum/Maximum Liquidity Sweep Distance. A sweep must clear
 # the swept level (fixed PDH/PDL, or the dynamic trend-flip reference —
@@ -281,7 +301,7 @@ def _classify_day(c: dict) -> str:
 
 
 def _check_hard_rules(side: str, entry: float, sl: float, swept_level: float,
-                       sweep_extreme: float) -> tuple:
+                       sweep_extreme: float, target: float = None) -> tuple:
     """Rules 2/3 (2026-08-13, sweep depth bounds) and Rule 8 (ambiguous ->
     don't trade) still hard-reject here. Rule 1 (SL distance) no longer
     rejects — changed 2026-08-15: a wide SL usually just means the
@@ -308,6 +328,21 @@ def _check_hard_rules(side: str, entry: float, sl: float, swept_level: float,
     # Rule 1 — SL distance: no longer a reject, just a staged-entry trigger
     sl_distance_pct = (risk / entry)
     use_staged_entry = sl_distance_pct > MAX_SL_DISTANCE_PCT
+
+    # Rule 11 (2026-08-27) — minimum reward:risk. `target` is the opposite
+    # daily level, i.e. what the strategy actually trades toward. Checked
+    # before the sweep-depth rules because a setup offering less reward than
+    # risk isn't worth taking regardless of how clean the sweep was.
+    # `target` is optional, so any caller not yet passing it simply skips
+    # this check rather than crashing.
+    if target is not None and target > 0:
+        reward = abs(target - entry)
+        rr = reward / risk
+        if rr < MIN_REWARD_RISK_RATIO:
+            return (f"Reward:risk too low ({rr:.2f}x < "
+                    f"{MIN_REWARD_RISK_RATIO:.1f}x) — reward to target "
+                    f"({reward:.4f}) is smaller than risk to SL ({risk:.4f})",
+                    use_staged_entry)
 
     # Rules 2 & 3 — sweep depth bounds, measured against the level actually
     # being hunted (fixed PDH/PDL, or the dynamic trend-flip reference —
@@ -576,7 +611,8 @@ class StrategyEngine:
                         counter = level.trend_bias == "UPTREND"
 
                         reject_reason, use_staged_entry = _check_hard_rules(
-                            'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme)
+                            'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme,
+                            target=pdl)
 
                         signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=False,
@@ -731,7 +767,8 @@ class StrategyEngine:
                         counter = level.trend_bias == "DOWNTREND"
 
                         reject_reason, use_staged_entry = _check_hard_rules(
-                            'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme)
+                            'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme,
+                            target=pdh)
 
                         signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
                                          counter_trend=counter, trend_mode=False,
