@@ -122,14 +122,20 @@ BREAKEVEN_STAGE2_R = 1.0   # full: move SL all the way to entry
 EARLY_INVALIDATION_R = 0.25
 EARLY_INVALIDATION_CANDLES = 6
 
-# ZONE_REVERSAL: once a trade is in the 0.4R-1.0R zone, exit if a genuine
-# rejection candle fires AGAINST the position direction. Evidence: TAOUSD
-# reached 0.87R then slowly reversed over 14h; ETHUSD reached 0.77R then
-# reversed. Tested against all 3 winners: zero reversal candles fired in
-# zone on any of them. Uses the same shape-detection already live in the
-# rejection-exit and drift-tracker logic -- no new subjective criteria.
-ZONE_REVERSAL_LOW_R = 0.4
-ZONE_REVERSAL_HIGH_R = 1.0
+# 2026-09-02: zone_reversal removed, replaced by TREND_TRAIL below. Backtest
+# against all 3 real firings (ZAMAUSD, TAOUSD, RIFUSD) showed zone_reversal
+# closed every trade correctly-but-early: 0.56R/0.42R/0.66R actual vs
+# 1.85R/1.80R/0.66R available. A 0.4R-1.0R rejection-candle trigger was too
+# early -- ordinary noise, not real reversals. Simulating a trail instead
+# (activate at 1.0R, 0.3R behind the high-water mark) beat the actual
+# result on ALL THREE cases simultaneously (+1.69R/+0.92R/+0.80R vs
+# +0.56R/+0.42R/+0.66R, $63.23 vs $16.00 total) -- including the one case
+# where zone_reversal had fired correctly. Activating at 1.0R deliberately
+# matches BREAKEVEN_STAGE2_R: below that, the existing ratchet already
+# protects the trade; this only takes over once full breakeven has
+# already fired, extending it into a moving stop instead of a frozen one.
+TREND_TRAIL_ACTIVATE_R = 1.0
+TREND_TRAIL_BUFFER_R = 0.3
 STABILITY_MAX_COUNTER_CONFIRMS = 2  # Trend Stability — after this many
                                      # counter-trend confirmations on a
                                      # symbol today, the day's trend
@@ -671,16 +677,18 @@ class MarketMonitor:
                        f"SOLUSD -22.5%) both peaked under 0.20R and never recovered.")
             )
 
-    async def _check_zone_reversal(self, symbol: str, tr: dict, candle: dict):
-        """2026-08-24 — Option B: if a trade is in the ZONE_REVERSAL_LOW_R to
-        ZONE_REVERSAL_HIGH_R zone and a genuine rejection candle fires AGAINST
-        the position direction, exit immediately. Reuses the exact same
-        shape-detection (_is_bearish_rejection / _is_bullish_rejection) already
-        live in the rejection-exit and drift-tracker logic -- no new criteria.
-        Never fires outside the zone (above 1.0R = let the breakeven ratchet and
-        TP ladder handle it; below 0.4R = the early_invalidation check is the
-        relevant gate). Tested: zero false triggers on any of the 3 winners
-        this week."""
+    async def _check_trend_trailing_stop(self, symbol: str, tr: dict, candle: dict):
+        """2026-09-02 — replaces zone_reversal. Once MFE reaches
+        TREND_TRAIL_ACTIVATE_R (1.0R, same threshold as the stage-2
+        breakeven ratchet), starts trailing the SL TREND_TRAIL_BUFFER_R
+        behind the running high-water mark instead of leaving it frozen at
+        entry. Ratchets forward only, never loosens. Below 1.0R this does
+        nothing -- the existing _check_breakeven_move ratchet is the only
+        thing protecting the trade, same as before this change.
+        Deliberately does NOT reuse TRAILING_STOP_R_BUFFER (0.5) from the
+        post-ROE remainder trail -- that buffer activates only after a much
+        larger move (7%+ ROE) and would sit ABOVE breakeven if applied here
+        at a 1.0R activation point, causing an immediate false stop-out."""
         if tr.get('early_invalidation_cleared') is False:
             return  # hasn't cleared the 0.25R bar yet, early_invalidation owns this
 
@@ -692,26 +700,33 @@ class MarketMonitor:
         mfe = tr.get('mfe', entry)
         mfe_R = (mfe - entry) / risk if side == 'BUY' else (entry - mfe) / risk
 
-        if not (ZONE_REVERSAL_LOW_R <= mfe_R <= ZONE_REVERSAL_HIGH_R):
-            return  # outside the zone -- not our responsibility
+        if mfe_R < TREND_TRAIL_ACTIVATE_R:
+            return  # not yet earned trailing -- stage-2 ratchet already covers this trade
 
-        rejection = (_is_bearish_rejection(candle) if side == 'BUY'
-                     else _is_bullish_rejection(candle))
+        trail_sl = mfe - TREND_TRAIL_BUFFER_R * risk if side == 'BUY' else mfe + TREND_TRAIL_BUFFER_R * risk
+        current_live_sl = tr.get('live_sl', sl)
+        improved = (trail_sl > current_live_sl) if side == 'BUY' else (trail_sl < current_live_sl)
 
-        if rejection:
-            logger.info(f"{symbol} | Zone reversal — rejection candle against position "
-                       f"detected at {mfe_R:.2f}R (zone: {ZONE_REVERSAL_LOW_R}-{ZONE_REVERSAL_HIGH_R}R)")
+        hit = (candle['low'] <= trail_sl) if side == 'BUY' else (candle['high'] >= trail_sl)
+        if hit:
+            logger.info(f"{symbol} | Trend trail hit at {mfe_R:.2f}R MFE — trail was "
+                       f"{trail_sl:.4f} ({TREND_TRAIL_BUFFER_R}R behind high-water)")
             await self._exit_position(
-                symbol, tr, exit_price=candle['close'],
-                reason="zone_reversal",
-                label=(f"🔄 Position Closed — Reversal Candle in Profit Zone\n\n"
-                       f"A genuine rejection candle fired against the position at {mfe_R:.2f}R "
-                       f"(within the {ZONE_REVERSAL_LOW_R}-{ZONE_REVERSAL_HIGH_R}R zone).\n"
-                       f"Exiting now to protect profit rather than risk giving it back.\n\n"
-                       f"Based on: TAOUSD reached 0.87R then reversed over 14h; "
-                       f"ETHUSD reached 0.77R then reversed. No winner this week had a "
-                       f"genuine rejection candle in this zone.")
+                symbol, tr, exit_price=trail_sl,
+                reason="trend_trail",
+                label=(f"📉 *Position Closed — Trend Trail*\n\n"
+                       f"Price pulled back {TREND_TRAIL_BUFFER_R}R from its best point "
+                       f"({mfe_R:.2f}R MFE) after already clearing full breakeven.\n"
+                       f"Locked in the trailed level rather than risk further giveback.")
             )
+            return
+
+        if improved:
+            success = await self.coindcx.update_stop_loss(symbol, new_sl_price=trail_sl)
+            if success:
+                tr['live_sl'] = trail_sl
+                logger.info(f"{symbol} | Trend trail moved to {trail_sl:.4f} "
+                           f"({TREND_TRAIL_BUFFER_R}R behind {mfe_R:.2f}R high-water)")
 
     async def _check_partial_tp_ladder(self, symbol: str, tr: dict, candle: dict):
         """Checks TP1/TP2 (interior partials, closer than the original single
@@ -811,14 +826,16 @@ class MarketMonitor:
         await self._check_breakeven_move(symbol, tr)
         await self._check_staged_addition(symbol, tr, candle, target)
 
-        # 2026-08-24: two new early-exit checks, built from 7-day log analysis.
+        # 2026-08-24/09-02: two early-exit checks, built from log analysis.
         # Both run BEFORE the TP ladder so they can exit while profit is still real.
         # _check_early_invalidation: catches "never got going" trades (RIF -17%, SOL -22%)
-        # _check_zone_reversal: catches "ran, then gave it all back" trades (TAO, ETH)
+        # _check_trend_trailing_stop: replaces zone_reversal (removed 2026-09-02) --
+        # activates only past full breakeven (1.0R) and trails 0.3R behind the
+        # high-water mark, instead of closing on a single rejection candle at 0.4R
         if not tr.get('position_closed'):
             await self._check_early_invalidation(symbol, tr, candle)
         if not tr.get('position_closed'):
-            await self._check_zone_reversal(symbol, tr, candle)
+            await self._check_trend_trailing_stop(symbol, tr, candle)
 
         if not skip_target_priorities:
             await self._check_partial_tp_ladder(symbol, tr, candle)
