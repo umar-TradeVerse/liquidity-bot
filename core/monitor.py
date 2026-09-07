@@ -54,6 +54,7 @@ from core.strategy import StrategyEngine, Signal, ENTRY_EXPIRY_MINUTES
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
 from core import persistence
+from core.obi import compute_obi
 from utils.logger import setup_logger
 logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
@@ -427,6 +428,35 @@ class MarketMonitor:
                 # allow a fresh alert if it somehow becomes orphaned again later.
                 self._orphan_alerted.discard(symbol)
 
+    async def _log_obi(self, symbol: str, side: str, candle: dict, sweep_extreme):
+        """2026-09-03 informational-only. See the wiring comment in
+        _process_symbol for what this does and does not affect."""
+        try:
+            book = await self.coindcx.get_orderbook(symbol, depth=5)
+        except Exception as e:
+            logger.error(f"{symbol} | OBI fetch failed: {e}", exc_info=True)
+            return
+        if not book:
+            return  # get_orderbook already logged why
+
+        obi = compute_obi(book['bids'], book['asks'], levels=5)
+        if obi is None:
+            return
+
+        sweep_str = f"{sweep_extreme:.4f}" if sweep_extreme is not None else "n/a"
+        logger.info(f"{symbol} | OBI at {side} sweep-arm (extreme {sweep_str}): "
+                   f"{obi:+.3f} (top-5 levels)")
+        await self.telegram.send_alert(
+            f"📊 *Informational — Order Book Imbalance at Sweep*\n\n"
+            f"*Symbol:* {symbol}\n*Side:* {side}\n"
+            f"*Sweep extreme:* {sweep_str}\n"
+            f"*OBI (top 5 levels):* {obi:+.3f}\n\n"
+            f"+1.0 = all bid support, -1.0 = all ask pressure. No action taken — "
+            f"this is purely for tracking whether OBI at the moment of a sweep "
+            f"predicts which ones are genuine hunts. Unproven, same as the "
+            f"entry-drift and hunt/breakout trackers before it."
+        )
+
     async def _process_symbol(self, symbol: str):
         try:
             candle = await self.coindcx.get_latest_15m_candle(symbol)
@@ -448,6 +478,26 @@ class MarketMonitor:
                 await self._check_exit_conditions(symbol, candle, prev_candle)
 
             signal = self.engine.process_candle(symbol, candle)
+
+            # 2026-09-03: OBI (Order Book Imbalance) tracker — INFORMATIONAL
+            # ONLY, exactly like the entry-drift and hunt/breakout trackers
+            # before it. Fires once, at the exact candle a sweep freshly
+            # arms (armed_at == this candle's time), fetches order book
+            # depth, computes OBI, and alerts it. Never gates a trade,
+            # never touches level state, never blocks the signal path
+            # above or below this line. If the endpoint doesn't return
+            # usable data (see get_orderbook docstring for why that's a
+            # real possibility), it fails silently and trading continues
+            # completely unaffected.
+            level = self.state.get_level(symbol)
+            if level:
+                for side, armed_field, sweep_field in (
+                    ('PDH', 'pdh_sweep_armed_at', 'pdh_sweep_extreme'),
+                    ('PDL', 'pdl_sweep_armed_at', 'pdl_sweep_extreme'),
+                ):
+                    if getattr(level, armed_field, None) == candle['time']:
+                        await self._log_obi(symbol, side, candle,
+                                             getattr(level, sweep_field, None))
 
             # Rule 4 (2026-08-13) expiry alerts — drained here rather than
             # via the Signal return path, since an expiry was never a
