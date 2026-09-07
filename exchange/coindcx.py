@@ -30,9 +30,9 @@ SYMBOL_MAP = {
     "TAOUSD": "B-TAO_USDT",
     "AEROUSD": "B-AERO_USDT",
     "BTCUSD": "B-BTC_USDT",
-    "LTCUSD": "B-LTC_USDT",
+    "LTCUSD": "B-LTC_USDT",  # removed from SYMBOLS 2026-09-08 -- see note below
     "KAITOUSD": "B-KAITO_USDT",
-    "DEXEUSD": "B-DEXE_USDT",
+    "DEXEUSD": "B-DEXE_USDT",  # removed from SYMBOLS 2026-09-08 -- see note below
     "RIFUSD": "B-RIF_USDT",
     "ZAMAUSD": "B-ZAMA_USDT",
     # Kept even though removed from SYMBOLS (2026-07-28 restructuring) —
@@ -42,6 +42,11 @@ SYMBOL_MAP = {
     # crashing with a KeyError the moment the bot tries to process it.
     # Safe to delete once you've confirmed ICPUSD is fully closed out.
     "ICPUSD": "B-ICP_USDT",
+    # DEXEUSD and LTCUSD above: same treatment, applied 2026-09-08 per
+    # explicit request. Both removed from SYMBOLS so no new signals form,
+    # but kept mapped here so any already-open position on either can
+    # still be managed. Safe to delete their SYMBOL_MAP entries too once
+    # both are confirmed fully closed out.
 }
 
 REVERSE_SYMBOL_MAP = {v: k for k, v in SYMBOL_MAP.items()}
