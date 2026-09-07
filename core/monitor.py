@@ -891,7 +891,7 @@ class MarketMonitor:
         if not tr.get('position_closed'):
             await self._check_trend_trailing_stop(symbol, tr, candle)
 
-        if not skip_target_priorities:
+        if not skip_target_priorities and not tr.get('position_closed'):
             await self._check_partial_tp_ladder(symbol, tr, candle)
 
             if side == 'BUY' and candle['high'] >= target:
@@ -1067,6 +1067,16 @@ class MarketMonitor:
             self.state.reset_symbol_watch(symbol)
             self._trailing.pop(symbol, None)
             self._open_positions.pop(symbol, None)
+            # 2026-09-08 fix: this branch returns early just like the success
+            # path below, but was never marking position_closed -- meaning
+            # any exit check called AFTER this one on the same candle (e.g.
+            # _check_partial_tp_ladder right after _check_trend_trailing_stop)
+            # would keep running against a tr dict that's already been
+            # popped from self._trailing, using stale/incomplete fields.
+            # Confirmed via direct test: this caused a real KeyError crash
+            # on tp2_price. Setting the flag here closes that gap the same
+            # way the success branch already does.
+            tr['position_closed'] = True
             return
 
         success = await self.coindcx.close_position_market(symbol, side, quantity)
