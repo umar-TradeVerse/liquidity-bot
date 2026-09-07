@@ -8,11 +8,12 @@ import threading
 
 SYMBOLS = [
     "ETHUSD", "SOLUSD", "XRPUSD", "TAOUSD", "AEROUSD",
-    "LTCUSD",
     "KAITOUSD",
-    "DEXEUSD", "RIFUSD", "ZAMAUSD"  # added 2026-07-28 — replaced ICPUSD
-    # after a BTC-correlation screen showed these three move more
-    # independently of BTC (see conversation history / correlation scan).
+    "RIFUSD", "ZAMAUSD"
+    # DEXEUSD, LTCUSD removed 2026-09-08 per explicit request. Mapping kept
+    # in exchange/coindcx.py's SYMBOL_MAP (same treatment as ICPUSD below)
+    # so any already-open position on either can still be fetched/
+    # monitored/closed properly -- no new signals will ever form for them.
 ]
 
 REGIME_SYMBOL = "BTCUSD"
