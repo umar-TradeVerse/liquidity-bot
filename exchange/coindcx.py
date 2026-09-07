@@ -249,7 +249,57 @@ class CoinDCXClient:
             "time": c["time"]
         }
 
-    async def get_recent_daily_candles(self, symbol: str, n: int = 3) -> list:
+    async def get_orderbook(self, symbol: str, depth: int = 5) -> Optional[dict]:
+        """2026-09-03: fetches order book depth for OBI (Order Book Imbalance)
+        tracking. INFORMATIONAL ONLY -- this never gates a trade decision,
+        it only feeds the OBI tracker in monitor.py.
+
+        IMPORTANT, UNVERIFIED: this calls the documented public endpoint
+        (/market_data/orderbook via public.coindcx.com, same host as the
+        candles endpoint above). BUT get_instrument_details below calls a
+        DIFFERENT, futures-specific path family
+        (/exchange/v1/derivatives/futures/data/... via api.coindcx.com/
+        _get_base) for other futures-only data. It is not confirmed whether
+        this public endpoint actually returns correct/live depth for
+        derivatives pairs specifically, or whether a separate futures
+        orderbook endpoint under that same derivatives path family is
+        required instead (documentation for that path could not be
+        retrieved to confirm). GOLD/XAUT taught us CoinDCX's docs and
+        actual live behavor can diverge for futures-specific endpoints --
+        treat this exactly the same way: verify against real account data
+        before trusting any output, and if this consistently returns
+        empty/stale results for your B- pairs, that itself is the
+        diagnostic signal to go looking for the derivatives-specific path.
+        """
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping for orderbook")
+            return None
+
+        result = await self._get("/market_data/orderbook",
+                                  params={"pair": coindcx_symbol, "depth": depth})
+
+        if not result or "bids" not in result or "asks" not in result:
+            logger.warning(f"{symbol} | Empty/None response from orderbook endpoint "
+                           f"(pair={coindcx_symbol}) -- OBI tracking skipped this candle")
+            return None
+
+        try:
+            bids = {float(p): float(q) for p, q in result["bids"].items()}
+            asks = {float(p): float(q) for p, q in result["asks"].items()}
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.error(f"{symbol} | Failed to parse orderbook response: {e}")
+            return None
+
+        if not bids or not asks:
+            logger.warning(f"{symbol} | Orderbook returned with empty bids or asks "
+                           f"(pair={coindcx_symbol}) -- possibly wrong endpoint for "
+                           f"this instrument, see get_orderbook docstring")
+            return None
+
+        return {"bids": bids, "asks": asks, "timestamp": result.get("timestamp")}
+
+
         """
         Returns the last n COMPLETE daily candles (today's in-progress candle
         excluded), oldest first, for multi-day trend classification. Reuses
