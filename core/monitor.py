@@ -446,16 +446,9 @@ class MarketMonitor:
         sweep_str = f"{sweep_extreme:.4f}" if sweep_extreme is not None else "n/a"
         logger.info(f"{symbol} | OBI at {side} sweep-arm (extreme {sweep_str}): "
                    f"{obi:+.3f} (top-5 levels)")
-        await self.telegram.send_alert(
-            f"📊 *Informational — Order Book Imbalance at Sweep*\n\n"
-            f"*Symbol:* {symbol}\n*Side:* {side}\n"
-            f"*Sweep extreme:* {sweep_str}\n"
-            f"*OBI (top 5 levels):* {obi:+.3f}\n\n"
-            f"+1.0 = all bid support, -1.0 = all ask pressure. No action taken — "
-            f"this is purely for tracking whether OBI at the moment of a sweep "
-            f"predicts which ones are genuine hunts. Unproven, same as the "
-            f"entry-drift and hunt/breakout trackers before it."
-        )
+        # 2026-09-08: Telegram alert removed per explicit request -- this
+        # stays log-only. Still fully recorded in Railway logs for later
+        # analysis, just no longer pings the phone for an unproven tracker.
 
     async def _process_symbol(self, symbol: str):
         try:
@@ -528,16 +521,14 @@ class MarketMonitor:
                 remaining_drift = []
                 for res in self.engine.pending_drift_results:
                     if res['symbol'] == symbol:
-                        await self.telegram.send_alert(
-                            f"📊 *Informational — Late Confirmation Observed*\n\n"
-                            f"*Symbol:* {symbol}\n*Side:* {res['side']} ({res['direction']})\n"
-                            f"*Would-be entry:* {res['would_be_entry']:.4f}\n"
-                            f"*Total elapsed since sweep:* {res['elapsed_minutes']} min\n"
-                            f"*Entry drift from sweep extreme:* {res['drift_pct']:.2f}%\n\n"
-                            f"This setup already expired at {ENTRY_EXPIRY_MINUTES} min — no trade was "
-                            f"taken. This is purely for tracking whether entry drift % predicts which "
-                            f"late confirmations are worth catching. No action needed."
-                        )
+                        # 2026-09-08: Telegram alert removed per explicit
+                        # request -- log-only from here. Full detail still
+                        # captured in Railway logs for later analysis.
+                        logger.info(f"{symbol} | Late confirmation observed: "
+                                   f"{res['side']} ({res['direction']}), "
+                                   f"would-be entry {res['would_be_entry']:.4f}, "
+                                   f"elapsed {res['elapsed_minutes']} min, "
+                                   f"drift {res['drift_pct']:.2f}%")
                     else:
                         remaining_drift.append(res)
                 self.engine.pending_drift_results = remaining_drift
@@ -1240,15 +1231,11 @@ class MarketMonitor:
                           if signal.trend_mode else
                           f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}")
 
-            # 2026-08-25 informational only — see Signal.sweep_closed_inside.
-            if signal.sweep_closed_inside is True:
-                sweep_char = "\n*Sweep character:* ✅ HUNT — sweep candle closed back inside the level"
-            elif signal.sweep_closed_inside is False:
-                sweep_char = ("\n*Sweep character:* ⚠️ BREAKOUT RISK — sweep candle closed "
-                              "_beyond_ the level (price accepted above/below it rather than "
-                              "rejecting). Tracking only — trade still taken normally.")
-            else:
-                sweep_char = ""
+            # 2026-09-08: sweep_char removed from this alert per explicit
+            # request -- the HUNT/BREAKOUT RISK classification is already
+            # logged independently at sweep-arm time in strategy.py
+            # (see logger.info calls there), so nothing is lost, this just
+            # stops it appearing in the Telegram trade alert.
 
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
@@ -1256,7 +1243,7 @@ class MarketMonitor:
                 f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}"
                 f"{' — STAGED ENTRY (wide SL, 50% initial)' if signal.use_staged_entry else ''}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"{level_line}{trend_line}{sweep_char}\n\n⏳ Placing order..."
+                f"{level_line}{trend_line}\n\n⏳ Placing order..."
             )
 
             # 2026-08-15: SL distance beyond MAX_SL_DISTANCE_PCT no longer
