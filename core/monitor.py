@@ -63,12 +63,12 @@ POLL_INTERVAL_SECONDS = 15
 DAY_END_HOUR = 23
 DAY_END_MINUTE = 0
 
-TRADE_LEVERAGE = 5   # 2026-08-24: reduced from 10x to 5x. Same notional
-                      # exposure per trade (margin doubled from 55→125 USDT
-                      # offsets the leverage halving), but lower per-unit
-                      # ROE% swing and further liquidation distance on each
-                      # position. Capital added to Railway automatically
-                      # increases available margin without any code change.
+TRADE_LEVERAGE = 10  # 2026-09-08: reverted from 5x back to 10x per explicit
+                      # request. Same margin ($90/trade) at double leverage
+                      # means notional exposure and dollar risk both roughly
+                      # double vs the 5x setup that's been running since
+                      # 24-Aug -- worth knowing going in, same tradeoff
+                      # flagged when 5x was first adopted, just reversed.
 MAX_CONCURRENT_POSITIONS = 2
 
 # Partial take-profit ladder (added per Umar's request after the 7-day MFE
@@ -120,8 +120,21 @@ BREAKEVEN_STAGE2_R = 1.0   # full: move SL all the way to entry
 # Verified against all 3 winners: none cut. Verified against all disasters:
 # both caught. Time window: all winners cleared in 4 candles max; giving 6
 # (50% more) as breathing room for slower-starting setups.
-EARLY_INVALIDATION_R = 0.25
-EARLY_INVALIDATION_CANDLES = 6
+EARLY_INVALIDATION_R = 0.15  # lowered from 0.25 on 2026-09-08. All 8 historical
+                             # firings checked: at 0.25R, 2 genuine near-misses
+                             # (AEROUSD 0.20R -> continued to +0.43R; TAOUSD
+                             # 0.23R -> continued to +0.79R) were cut right
+                             # before real moves. At 0.15R, those 2 plus a 3rd
+                             # (DEXEUSD 0.18R -> continued to +0.26R, still
+                             # rising at log-end) would all survive -- while
+                             # the 5 that stay below 0.15R still include every
+                             # confirmed-correct cut (the original RIF/SOL
+                             # disasters, DEXEUSD 07-Sep which would have hit
+                             # SL if held). Cleaner separation than 0.25R gave.
+EARLY_INVALIDATION_CANDLES = 9  # raised from 6 alongside the R change --
+                                # gives the lower bar proportionally more time
+                                # to clear rather than tightening two
+                                # dimensions in opposite directions at once.
 
 # 2026-09-02: zone_reversal removed, replaced by TREND_TRAIL below. Backtest
 # against all 3 real firings (ZAMAUSD, TAOUSD, RIFUSD) showed zone_reversal
