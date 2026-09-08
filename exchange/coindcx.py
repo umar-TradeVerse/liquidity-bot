@@ -254,6 +254,67 @@ class CoinDCXClient:
             "time": c["time"]
         }
 
+    async def get_recent_daily_candles(self, symbol: str, n: int = 3) -> list:
+        """2026-09-08: RESTORED -- this method was found missing from the
+        live file (call site in strategy.py's fetch_and_set_levels still
+        referenced it, causing 'CoinDCXClient' object has no attribute
+        'get_recent_daily_candles' on every single symbol at daily reset --
+        meaning NO PDH/PDL levels could be set for the entire day, meaning
+        no sweep could ever be detected. Most likely lost during an earlier
+        edit tonight when get_orderbook was inserted nearby. Reconstructed
+        to match get_previous_day_candle's exact fetch pattern, returning
+        the last `n` COMPLETE daily candles (today's in-progress candle
+        excluded), oldest first -- so classifications[-1] is yesterday,
+        classifications[-2] is the day before, matching exactly how
+        fetch_and_set_levels already consumes this list."""
+        coindcx_symbol = SYMBOL_MAP.get(symbol)
+        if not coindcx_symbol:
+            logger.error(f"Unknown symbol: {symbol}")
+            return []
+
+        now_ist = datetime.now(IST)
+        today_date = now_ist.date()
+        start_ts = int((now_ist - timedelta(days=n + 10)).timestamp() * 1000)
+        end_ts = int(now_ist.timestamp() * 1000)
+
+        params = {
+            "pair": coindcx_symbol,
+            "interval": "1d",
+            "from": start_ts,
+            "to": end_ts,
+            "limit": n + 12
+        }
+
+        result = await self._get("/market_data/candles", params=params)
+
+        if not result or not isinstance(result, list) or len(result) == 0:
+            logger.error(f"{symbol} | No daily candle data returned for recent-days fetch")
+            return []
+
+        # Exclude today's still-forming candle, sort oldest -> newest, take last n
+        completed = [
+            c for c in result
+            if datetime.fromtimestamp(int(c["time"]) / 1000, IST).date() < today_date
+        ]
+        completed.sort(key=lambda c: int(c["time"]))
+        recent = completed[-n:] if len(completed) >= n else completed
+
+        if len(recent) < n:
+            logger.warning(f"{symbol} | Only {len(recent)} of {n} requested complete daily "
+                           f"candles available -- trend classification may be less reliable today")
+
+        return [
+            {
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c.get("volume", 0)),
+                "time": c["time"],
+            }
+            for c in recent
+        ]
+
     async def get_orderbook(self, symbol: str, depth: int = 5) -> Optional[dict]:
         """2026-09-03: fetches order book depth for OBI (Order Book Imbalance)
         tracking. INFORMATIONAL ONLY -- this never gates a trade decision,
