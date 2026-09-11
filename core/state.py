@@ -76,6 +76,32 @@ class DailyLevel:
     # — not just noise. See monitor.py's STABILITY_MAX_COUNTER_CONFIRMS.
     counter_trend_confirms: int = 0
 
+    # ── 2026-09-12: INSIDE BAR BREAKOUT — a SEPARATE, ADDITIONAL strategy,
+    # deliberately distinct from the liquidity-sweep logic above.
+    #
+    # HONEST RECORD OF THE EVIDENCE, so future-you knows what this was
+    # built on. Backtested across 699 day-pairs / 140 real inside bars
+    # from this bot's own logged daily candles:
+    #     broke DOWN only .......... 46 (33%)
+    #     broke UP only ............ 39 (28%)
+    #     BOTH sides broken ........ 30 (21%)  <- breakout entry likely loses
+    #     never broke .............. 20 (14%)
+    # Direction is near a coin flip and the 21% whipsaw rate is a
+    # structural drag. This was implemented at explicit request AFTER that
+    # analysis was presented and understood -- NOT because the data
+    # supported it. Watch it closely; if live results match the backtest,
+    # this rule costs money.
+    #
+    # NOTE ON CONFLICT: this is a CONTINUATION/breakout rule bolted onto a
+    # MEAN-REVERSION bot. The two can fire opposite signals on the same
+    # symbol. Precedence is handled in monitor.py: the liquidity-sweep
+    # signal always wins if both are live, and only ONE inside-bar trade
+    # per symbol per day is allowed.
+    inside_bar_armed: bool = False        # yesterday was a true inside bar
+    inside_bar_high: Optional[float] = None   # breakout level (long trigger)
+    inside_bar_low: Optional[float] = None    # breakdown level (short trigger)
+    inside_bar_traded_today: bool = False     # one attempt per symbol per day
+
 
 @dataclass
 class RegimeLevel:
