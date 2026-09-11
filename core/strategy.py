@@ -419,6 +419,28 @@ class StrategyEngine:
                         level.trend_bias = "NONE"
                         bias_note = "day-1 not decisive — sideways"
 
+                    # 2026-09-12: INSIDE BAR detection. recent_days is
+                    # oldest->newest, so [-1] is yesterday and [-2] is the
+                    # day before. A true inside bar means yesterday was
+                    # FULLY contained by the day before: high <= prev high
+                    # AND low >= prev low. If so, arm yesterday's own high
+                    # and low as today's breakout/breakdown triggers.
+                    level.inside_bar_armed = False
+                    level.inside_bar_high = None
+                    level.inside_bar_low = None
+                    level.inside_bar_traded_today = False
+                    if len(recent_days) >= 2:
+                        yday = recent_days[-1]
+                        dbefore = recent_days[-2]
+                        if yday['high'] <= dbefore['high'] and yday['low'] >= dbefore['low']:
+                            level.inside_bar_armed = True
+                            level.inside_bar_high = yday['high']
+                            level.inside_bar_low = yday['low']
+                            logger.info(f"{symbol} | INSIDE BAR detected — yesterday "
+                                        f"(H:{yday['high']} L:{yday['low']}) fully contained by "
+                                        f"the day before (H:{dbefore['high']} L:{dbefore['low']}). "
+                                        f"Armed: LONG above {yday['high']}, SHORT below {yday['low']}")
+
                     logger.info(f"{symbol} | PDH: {prev_candle['high']} | PDL: {prev_candle['low']} "
                                 f"| Trend bias: {level.trend_bias} ({bias_note}) "
                                 f"| last {len(classifications)} days: {classifications}")
@@ -463,6 +485,59 @@ class StrategyEngine:
         effective_pdl = pdl
 
         signal = None
+
+        # ── 2026-09-12: INSIDE BAR BREAKOUT check. Runs FIRST so that the
+        # liquidity-sweep logic further below can overwrite `signal` if it
+        # also fires this candle -- the mean-reversion setup is the bot's
+        # primary, evidenced strategy and deliberately takes precedence
+        # over this additional breakout rule. See the honest evidence note
+        # on the inside_bar_* fields in state.py.
+        if (level.inside_bar_armed and not level.inside_bar_traded_today
+                and level.inside_bar_high and level.inside_bar_low):
+            ib_hi, ib_lo = level.inside_bar_high, level.inside_bar_low
+            ib_entry = ib_sl = ib_side = None
+            if candle['close'] > ib_hi:
+                # bullish breakout -> LONG, SL at the other end of the inside bar
+                ib_side, ib_entry, ib_sl = 'BUY', candle['close'], ib_lo
+            elif candle['close'] < ib_lo:
+                ib_side, ib_entry, ib_sl = 'SELL', candle['close'], ib_hi
+
+            if ib_side:
+                level.inside_bar_traded_today = True   # one attempt per day, win or lose
+                ib_risk = abs(ib_entry - ib_sl)
+                ib_target = pdh if ib_side == 'BUY' else pdl
+                # Reuse the SAME hard-rule gate the sweep strategy uses, so a
+                # breakout with worse reward than risk is rejected identically.
+                ib_reject = None
+                if ib_risk <= 0:
+                    ib_reject = "AMBIGUOUS SETUP — entry and SL identical (zero risk)"
+                elif ib_target and ib_target > 0:
+                    ib_rr = abs(ib_target - ib_entry) / ib_risk
+                    if ib_rr < MIN_REWARD_RISK_RATIO:
+                        ib_reject = (f"Reward:risk too low ({ib_rr:.2f}x < "
+                                     f"{MIN_REWARD_RISK_RATIO:.1f}x) — reward to target "
+                                     f"({abs(ib_target-ib_entry):.4f}) smaller than risk "
+                                     f"({ib_risk:.4f})")
+                ib_staged = (ib_risk / ib_entry) > MAX_SL_DISTANCE_PCT if ib_entry else False
+
+                signal = Signal(symbol, ib_side, ib_entry, ib_sl, pdh, pdl,
+                                counter_trend=False, trend_mode=False,
+                                swept_level=(ib_hi if ib_side == 'BUY' else ib_lo),
+                                reject_reason=ib_reject, use_staged_entry=ib_staged)
+                signal.pattern = "Inside Bar Breakout"
+                if ib_reject:
+                    logger.info(f"{symbol} | INSIDE BAR {'LONG' if ib_side=='BUY' else 'SHORT'} "
+                                f"breakout REJECTED — {ib_reject} | Entry:{ib_entry:.4f} "
+                                f"SL:{ib_sl:.4f}")
+                else:
+                    logger.info(f"{symbol} | INSIDE BAR breakout "
+                                f"{'LONG' if ib_side=='BUY' else 'SHORT'} | close {candle['close']:.4f} "
+                                f"{'above' if ib_side=='BUY' else 'below'} inside-bar "
+                                f"{'high' if ib_side=='BUY' else 'low'} "
+                                f"{ib_hi if ib_side=='BUY' else ib_lo:.4f} | "
+                                f"Entry:{ib_entry:.4f} SL:{ib_sl:.4f}"
+                                f"{' [STAGED ENTRY - wide SL]' if ib_staged else ''}")
+
         is_bullish = candle['close'] > candle['open']
         is_bearish = candle['close'] < candle['open']
         inside_bar = _is_inside_bar(candle, prev_candle)
