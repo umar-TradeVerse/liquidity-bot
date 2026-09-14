@@ -102,6 +102,16 @@ class DailyLevel:
     inside_bar_low: Optional[float] = None    # breakdown level (short trigger)
     inside_bar_traded_today: bool = False     # one attempt per symbol per day
 
+    # 2026-09-14: DELAYED ENTRY. A confirmed liquidity-sweep trigger is
+    # stored here instead of firing immediately -- it fires ENTRY_DELAY_
+    # CANDLES candles later, at that later candle's close, using the SAME
+    # SL computed at confirmation time (never recalculated). Backtest
+    # evidence (4 candles / 60min): avg R +0.033 vs -0.035 immediate entry,
+    # win rate 44.0% vs 41.2%, across 300 matched trades. R:R and staged-
+    # entry sizing are RE-evaluated at the final entry price, since price
+    # may have moved during the wait -- SL and target are not.
+    pending_entry: Optional[dict] = None
+
 
 @dataclass
 class RegimeLevel:
@@ -196,6 +206,12 @@ class BotState:
                 level.pdl_sweep_extreme = None
                 level.pdl_sweep_armed_at = None
                 level.pdl_sweep_closed_inside = None
+                # 2026-09-14: clear any armed-but-not-yet-fired delayed
+                # entry too. A pending entry that was armed before a
+                # position closed (e.g. an unrelated earlier trade on this
+                # symbol) should not silently fire later using stale SL/
+                # target reference points.
+                level.pending_entry = None
                 # trend_bias / trend_ref_high / trend_ref_low deliberately NOT
                 # reset here — they're a daily classification, not per-trade
                 # state, and must persist across position closes within the
