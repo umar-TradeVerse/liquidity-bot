@@ -146,21 +146,22 @@ BREAKEVEN_STAGE2_R = 1.0   # full: move SL all the way to entry
 # Verified against all 3 winners: none cut. Verified against all disasters:
 # both caught. Time window: all winners cleared in 4 candles max; giving 6
 # (50% more) as breathing room for slower-starting setups.
-EARLY_INVALIDATION_R = 0.15  # lowered from 0.25 on 2026-09-08. All 8 historical
-                             # firings checked: at 0.25R, 2 genuine near-misses
-                             # (AEROUSD 0.20R -> continued to +0.43R; TAOUSD
-                             # 0.23R -> continued to +0.79R) were cut right
-                             # before real moves. At 0.15R, those 2 plus a 3rd
-                             # (DEXEUSD 0.18R -> continued to +0.26R, still
-                             # rising at log-end) would all survive -- while
-                             # the 5 that stay below 0.15R still include every
-                             # confirmed-correct cut (the original RIF/SOL
-                             # disasters, DEXEUSD 07-Sep which would have hit
-                             # SL if held). Cleaner separation than 0.25R gave.
-EARLY_INVALIDATION_CANDLES = 9  # raised from 6 alongside the R change --
-                                # gives the lower bar proportionally more time
-                                # to clear rather than tightening two
-                                # dimensions in opposite directions at once.
+#
+# 2026-09-14: EARLY_INVALIDATION_R/CANDLES REMOVED entirely, per explicit
+# request. That whole R-based cutoff mechanism (kept above in history for
+# the record of what it was and why it changed over time) is replaced by
+# EARLY_FAILURE_MAX_CANDLES + DOJI_BODY_RATIO_MAX below -- a pattern-based
+# early exit instead of an R-multiple timer. See _check_early_failure_exit.
+EARLY_FAILURE_MAX_CANDLES = 3   # 45 min at 15m candles. Past this, no
+                                # further check of this kind applies -- the
+                                # trade continues under normal SL/breakeven/
+                                # trend_trail/TP-ladder management only.
+DOJI_BODY_RATIO_MAX = 0.15      # body <= 15% of the candle's own high-low
+                                # range counts as a doji for the "doji
+                                # followed by weakness" condition. A doji
+                                # alone never exits -- only if the NEXT
+                                # candle continues adverse past its close.
+
 
 # 2026-09-02: zone_reversal removed, replaced by TREND_TRAIL below. Backtest
 # against all 3 real firings (ZAMAUSD, TAOUSD, RIFUSD) showed zone_reversal
@@ -716,46 +717,80 @@ class MarketMonitor:
             logger.warning(f"{symbol} | Staged addition order failed — will retry next candle "
                            f"if conditions still hold")
 
-    async def _check_early_invalidation(self, symbol: str, tr: dict, candle: dict):
-        """2026-08-24 — Rule #2: if a trade hasn't reached EARLY_INVALIDATION_R
-        favorable within EARLY_INVALIDATION_CANDLES of entry, close it.
-        Never fires once a trade has already reached that threshold (tracked
-        via 'early_invalidation_cleared' flag set the first time MFE crosses
-        EARLY_INVALIDATION_R). Also never fires after the breakeven ratchet
-        has already moved the SL -- if the ratchet fired, the trade already
-        proved itself enough to deserve the standard exit logic."""
-        if tr.get('early_invalidation_cleared') or tr.get('breakeven_stage1_moved'):
+    async def _check_early_failure_exit(self, symbol: str, tr: dict, candle: dict):
+        """2026-09-14 — REPLACES early_invalidation entirely, per explicit
+        request. Monitors only the first EARLY_FAILURE_MAX_CANDLES candles
+        (45 min at 15m) after entry. Exits immediately the moment a clear
+        adverse rejection appears; does nothing at all once that window
+        has passed -- no R-based cutoff of any kind remains after this.
+
+        Two conditions qualify, deliberately reusing existing, already-
+        proven pattern detection rather than inventing new arbitrary
+        thresholds:
+          1. A genuine rejection candle against the position
+             (_is_bearish_rejection for LONG, _is_bullish_rejection for
+             SHORT -- the same wick:body shape check already used
+             elsewhere for entries: shooting star / hammer / strong
+             reversal are all this shape).
+          2. A doji (body <= DOJI_BODY_RATIO_MAX of its own range) followed
+             by the NEXT candle continuing adverse past the doji's close --
+             "a meaningful doji followed by weakness", not a doji alone.
+
+        Never touches SL, the breakeven ratchet, TP ladder, or trend_trail
+        -- this is purely an additional, independent early check."""
+        if tr.get('early_failure_checked_done'):
             return
+
+        n = tr.get('early_failure_candles', 0) + 1
+        tr['early_failure_candles'] = n
 
         entry, sl, side = tr.get('entry'), tr.get('sl'), tr['side']
         risk = abs(entry - sl) if entry and sl else 0
         if risk <= 0:
+            tr['early_failure_checked_done'] = True
             return
 
-        mfe = tr.get('mfe', entry)
-        mfe_R = (mfe - entry) / risk if side == 'BUY' else (entry - mfe) / risk
+        rejection = (_is_bearish_rejection(candle) if side == 'BUY'
+                     else _is_bullish_rejection(candle))
 
-        if mfe_R >= EARLY_INVALIDATION_R:
-            tr['early_invalidation_cleared'] = True
-            return
+        doji_followup = False
+        if tr.get('early_failure_prior_was_doji'):
+            prior_close = tr.get('early_failure_prior_close')
+            if prior_close is not None:
+                if side == 'BUY' and candle['close'] < prior_close:
+                    doji_followup = True
+                elif side == 'SELL' and candle['close'] > prior_close:
+                    doji_followup = True
 
-        candles_since_entry = tr.get('candles_since_entry', 0) + 1
-        tr['candles_since_entry'] = candles_since_entry
-
-        if candles_since_entry >= EARLY_INVALIDATION_CANDLES:
-            logger.info(f"{symbol} | Early invalidation — never reached {EARLY_INVALIDATION_R}R "
-                       f"in {EARLY_INVALIDATION_CANDLES} candles (peak MFE: {mfe_R:.2f}R)")
+        if rejection or doji_followup:
+            reason_bits = []
+            if rejection: reason_bits.append("rejection candle against the position")
+            if doji_followup: reason_bits.append("doji followed by continued weakness")
+            reason_text = " + ".join(reason_bits)
+            logger.info(f"{symbol} | Early failure exit — {reason_text} within "
+                       f"{n} candle(s) of entry")
+            tr['early_failure_checked_done'] = True
             await self._exit_position(
-                symbol, tr, exit_price=candle['close'],
-                reason="early_invalidation",
-                label=(f"⏱️ Position Closed — Early Invalidation\n\n"
-                       f"Never reached {EARLY_INVALIDATION_R}R favorable within "
-                       f"{EARLY_INVALIDATION_CANDLES} candles (~{EARLY_INVALIDATION_CANDLES*15//60}h "
-                       f"{EARLY_INVALIDATION_CANDLES*15%60}min) of entry.\n"
-                       f"Peak MFE was {mfe_R:.2f}R — closed early rather than waiting for "
-                       f"the full SL.\n\nBased on: this week's two biggest losses (RIFUSD -17%, "
-                       f"SOLUSD -22.5%) both peaked under 0.20R and never recovered.")
+                symbol, tr, exit_price=candle['close'], reason="early_failure_exit",
+                label=(f"⚠️ *Position Closed — Early Failure Exit*\n\n"
+                       f"Clear adverse rejection detected within {n} candle(s) "
+                       f"(~{n*15} min) of entry: {reason_text}.\n"
+                       f"Exiting now rather than risk the full SL play out.")
             )
+            return
+
+        # Track doji state for next candle's follow-up check.
+        rng = candle['high'] - candle['low']
+        body = abs(candle['close'] - candle['open'])
+        tr['early_failure_prior_was_doji'] = (rng > 0 and body <= DOJI_BODY_RATIO_MAX * rng)
+        tr['early_failure_prior_close'] = candle['close']
+
+        if n >= EARLY_FAILURE_MAX_CANDLES:
+            tr['early_failure_checked_done'] = True
+            logger.info(f"{symbol} | Early failure window closed ({EARLY_FAILURE_MAX_CANDLES} "
+                       f"candles / 45 min) with no clear rejection -- trade continues normally, "
+                       f"no further check of this kind applies.")
+
 
     async def _check_trend_trailing_stop(self, symbol: str, tr: dict, candle: dict):
         """2026-09-02 — replaces zone_reversal. Once MFE reaches
@@ -769,8 +804,14 @@ class MarketMonitor:
         post-ROE remainder trail -- that buffer activates only after a much
         larger move (7%+ ROE) and would sit ABOVE breakeven if applied here
         at a 1.0R activation point, causing an immediate false stop-out."""
+        # 2026-09-14: this check is now inert -- early_invalidation (which
+        # used to set this flag) was removed. Left in place harmlessly:
+        # the key is never set anymore, so tr.get(...) is None, and
+        # `None is False` is always False, meaning this never returns
+        # early. Kept rather than deleted so a future re-read of this
+        # method isn't confused by a silently different code shape.
         if tr.get('early_invalidation_cleared') is False:
-            return  # hasn't cleared the 0.25R bar yet, early_invalidation owns this
+            return
 
         entry, sl, side = tr.get('entry'), tr.get('sl'), tr['side']
         risk = abs(entry - sl) if entry and sl else 0
@@ -906,14 +947,14 @@ class MarketMonitor:
         await self._check_breakeven_move(symbol, tr)
         await self._check_staged_addition(symbol, tr, candle, target)
 
-        # 2026-08-24/09-02: two early-exit checks, built from log analysis.
-        # Both run BEFORE the TP ladder so they can exit while profit is still real.
-        # _check_early_invalidation: catches "never got going" trades (RIF -17%, SOL -22%)
-        # _check_trend_trailing_stop: replaces zone_reversal (removed 2026-09-02) --
-        # activates only past full breakeven (1.0R) and trails 0.3R behind the
-        # high-water mark, instead of closing on a single rejection candle at 0.4R
+        # 2026-09-14: early_invalidation REMOVED, replaced by
+        # _check_early_failure_exit (pattern-based, first 3 candles / 45
+        # min only, no R-multiple timer). _check_trend_trailing_stop is
+        # unchanged -- replaces zone_reversal (removed 2026-09-02),
+        # activates past full breakeven (1.0R), trails 0.3R behind
+        # high-water instead of closing on a single rejection candle.
         if not tr.get('position_closed'):
-            await self._check_early_invalidation(symbol, tr, candle)
+            await self._check_early_failure_exit(symbol, tr, candle)
         if not tr.get('position_closed'):
             await self._check_trend_trailing_stop(symbol, tr, candle)
 
