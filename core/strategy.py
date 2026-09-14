@@ -217,7 +217,27 @@ MAX_LIQUIDITY_SWEEP_PCT = 0.10   # 10.0%
 # approached the level. If this window elapses while still SWEPT/TRIGGERED,
 # the setup expires and the side resets to NONE, requiring a completely
 # fresh sweep (not just a fresh trigger on the same old sweep).
-ENTRY_EXPIRY_MINUTES = 90
+ENTRY_EXPIRY_MINUTES = 360  # 2026-09-14: raised from 90 to 360 (6h), per
+                            # explicit request and backtest evidence:
+                            # trades confirmed 90min-3h after sweep won
+                            # 46.6%, 3h-6h won 52.2%, vs 42.2% within 90min
+                            # -- the 90-min window was discarding the
+                            # better-performing later confirmations.
+
+ENTRY_DELAY_CANDLES = 4  # 2026-09-14: DELAYED ENTRY, per explicit request.
+                         # A confirmed trigger waits this many MORE candles
+                         # before actually entering, at that later candle's
+                         # close. Backtested at 4 candles (60min): avg R
+                         # +0.033 vs -0.035 for immediate entry, win rate
+                         # 44.0% vs 41.2%, n=300 matched trades. IMPORTANT
+                         # CAVEAT ON RECORD: in the same backtest, when the
+                         # delay produced a WORSE price (price ran away,
+                         # 47% of cases), avg R went from +0.289 to -0.017
+                         # and risk widened from 1.56% to 2.18% -- the net
+                         # benefit comes from rescuing bad trades on the
+                         # other 53%, not from uniformly better entries.
+                         # Applies ONLY to liquidity-sweep signals, not the
+                         # inside-bar breakout strategy.
 
 # ══════════════════════════════════════════════════════════════════════════
 # INFORMATIONAL-ONLY drift tracker, added 2026-08-18. Does NOT change
@@ -486,6 +506,41 @@ class StrategyEngine:
 
         signal = None
 
+        # ── 2026-09-14: DELAYED ENTRY countdown/fire, checked FIRST so it
+        # takes precedence over anything else that might fire this same
+        # candle. SL and target are NEVER recalculated here -- only entry
+        # price and the R:R/staged-sizing decision, both of which depend
+        # on price and must reflect where price actually is at entry time.
+        if level.pending_entry:
+            pe = level.pending_entry
+            pe['candles_remaining'] -= 1
+            if pe['candles_remaining'] <= 0:
+                level.pending_entry = None
+                final_entry = candle['close']
+                reject_reason, use_staged_entry = _check_hard_rules(
+                    'PDH' if pe['side'] == 'SELL' else 'PDL',
+                    final_entry, pe['sl'], pe['effective_level'], pe['sweep_extreme'],
+                    target=pe['target'])
+                signal = Signal(symbol, pe['side'], final_entry, pe['sl'], pe['pdh'], pe['pdl'],
+                                 counter_trend=pe['counter_trend'], trend_mode=False,
+                                 swept_level=pe['effective_level'], reject_reason=reject_reason,
+                                 use_staged_entry=use_staged_entry,
+                                 sweep_closed_inside=pe['sweep_closed_inside'])
+                signal.pattern = pe['pattern']
+                if reject_reason:
+                    logger.info(f"{symbol} | DELAYED ENTRY ({ENTRY_DELAY_CANDLES} candles after "
+                               f"confirmation) — REJECTED at final price — {reject_reason} | "
+                               f"Entry:{final_entry:.4f} SL:{pe['sl']:.4f}")
+                else:
+                    logger.info(f"{symbol} | DELAYED ENTRY firing, {ENTRY_DELAY_CANDLES} candles "
+                               f"after confirmation | Entry:{final_entry:.4f} SL:{pe['sl']:.4f}"
+                               f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
+                return signal
+            else:
+                logger.info(f"{symbol} | Delayed entry armed — {pe['candles_remaining']} "
+                           f"candle(s) left before entry (side={pe['side']})")
+                return None
+
         # ── 2026-09-12: INSIDE BAR BREAKOUT check. Runs FIRST so that the
         # liquidity-sweep logic further below can overwrite `signal` if it
         # also fires this candle -- the mean-reversion setup is the bot's
@@ -685,24 +740,22 @@ class StrategyEngine:
                         # sizing instead, same mechanism as a wide SL.
                         counter = level.trend_bias == "UPTREND"
 
-                        reject_reason, use_staged_entry = _check_hard_rules(
-                            'PDH', entry, sl, effective_pdh, level.pdh_sweep_extreme,
-                            target=pdl)
-
-                        signal = Signal(symbol, 'SELL', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=False,
-                                         swept_level=effective_pdh, reject_reason=reject_reason,
-                                         use_staged_entry=use_staged_entry,
-                                         sweep_closed_inside=level.pdh_sweep_closed_inside)
-                        if reject_reason:
-                            logger.info(f"{symbol} | SHORT setup confirmed but REJECTED — "
-                                        f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
-                                        f"(sweep extreme {level.pdh_sweep_extreme:.4f})")
-                        else:
-                            logger.info(f"{symbol} | SHORT signal (trigger confirmed) | "
-                                        f"Entry:{entry:.4f} SL:{sl:.4f} "
-                                        f"(sweep extreme {level.pdh_sweep_extreme:.4f})"
-                                        f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
+                        # 2026-09-14: DELAYED ENTRY — arm instead of firing
+                        # immediately. R:R and staged-sizing are evaluated
+                        # later, at the actual entry price (see the
+                        # pending_entry check at the top of process_candle),
+                        # not here at confirmation time.
+                        level.pending_entry = {
+                            'side': 'SELL', 'sl': sl, 'pdh': pdh, 'pdl': pdl,
+                            'effective_level': effective_pdh, 'sweep_extreme': level.pdh_sweep_extreme,
+                            'target': pdl, 'counter_trend': counter,
+                            'sweep_closed_inside': level.pdh_sweep_closed_inside,
+                            'pattern': 'Liquidity Sweep',
+                            'candles_remaining': ENTRY_DELAY_CANDLES,
+                        }
+                        logger.info(f"{symbol} | SHORT trigger confirmed — entry DELAYED "
+                                    f"{ENTRY_DELAY_CANDLES} candles | confirm price {entry:.4f} "
+                                    f"SL:{sl:.4f} (sweep extreme {level.pdh_sweep_extreme:.4f})")
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
@@ -710,7 +763,7 @@ class StrategyEngine:
                         level.pdh_sweep_closed_inside = None
                         level.pdh_event_active = True
                         level.pdh_cisd_ref = None
-                        if counter and not reject_reason:
+                        if counter:
                             level.counter_trend_confirms += 1
                     else:
                         logger.info(f"{symbol} | PDH close {candle['close']:.4f} broke trigger "
@@ -841,24 +894,19 @@ class StrategyEngine:
                         # the mirrored comment in the PDH-side block above.
                         counter = level.trend_bias == "DOWNTREND"
 
-                        reject_reason, use_staged_entry = _check_hard_rules(
-                            'PDL', entry, sl, effective_pdl, level.pdl_sweep_extreme,
-                            target=pdh)
-
-                        signal = Signal(symbol, 'BUY', entry, sl, pdh, pdl,
-                                         counter_trend=counter, trend_mode=False,
-                                         swept_level=effective_pdl, reject_reason=reject_reason,
-                                         use_staged_entry=use_staged_entry,
-                                         sweep_closed_inside=level.pdl_sweep_closed_inside)
-                        if reject_reason:
-                            logger.info(f"{symbol} | LONG setup confirmed but REJECTED — "
-                                        f"{reject_reason} | Entry:{entry:.4f} SL:{sl:.4f} "
-                                        f"(sweep extreme {level.pdl_sweep_extreme:.4f})")
-                        else:
-                            logger.info(f"{symbol} | LONG signal (trigger confirmed) | "
-                                        f"Entry:{entry:.4f} SL:{sl:.4f} "
-                                        f"(sweep extreme {level.pdl_sweep_extreme:.4f})"
-                                        f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
+                        # 2026-09-14: DELAYED ENTRY — arm instead of firing
+                        # immediately, mirroring the SHORT side above.
+                        level.pending_entry = {
+                            'side': 'BUY', 'sl': sl, 'pdh': pdh, 'pdl': pdl,
+                            'effective_level': effective_pdl, 'sweep_extreme': level.pdl_sweep_extreme,
+                            'target': pdh, 'counter_trend': counter,
+                            'sweep_closed_inside': level.pdl_sweep_closed_inside,
+                            'pattern': 'Liquidity Sweep',
+                            'candles_remaining': ENTRY_DELAY_CANDLES,
+                        }
+                        logger.info(f"{symbol} | LONG trigger confirmed — entry DELAYED "
+                                    f"{ENTRY_DELAY_CANDLES} candles | confirm price {entry:.4f} "
+                                    f"SL:{sl:.4f} (sweep extreme {level.pdl_sweep_extreme:.4f})")
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
@@ -866,7 +914,7 @@ class StrategyEngine:
                         level.pdl_sweep_closed_inside = None
                         level.pdl_event_active = True
                         level.pdl_cisd_ref = None
-                        if counter and not reject_reason:
+                        if counter:
                             level.counter_trend_confirms += 1
                     else:
                         logger.info(f"{symbol} | PDL close {candle['close']:.4f} broke trigger "
