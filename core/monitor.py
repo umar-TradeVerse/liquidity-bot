@@ -71,6 +71,32 @@ TRADE_LEVERAGE = 10  # 2026-09-08: reverted from 5x back to 10x per explicit
                       # flagged when 5x was first adopted, just reversed.
 MAX_CONCURRENT_POSITIONS = 2
 
+# 2026-09-14: INR-denominated risk-tier gate, per explicit request. Sizes
+# each trade by how much it would actually lose at SL, in INR, rather than
+# by a fixed %-distance rule.
+#
+#   risk < FULL_SIZE_MAX      -> full size (unchanged)
+#   FULL_SIZE_MAX <= risk <= STAGED_MAX -> staged entry, 50% initial
+#                                (reuses the existing staged-entry mechanism
+#                                and its +1R confirmation-based addition)
+#   risk > STAGED_MAX         -> do NOT trade. Logged only, same as every
+#                                other rejection reason, so it's auditable.
+#
+# This replaces the pure %-distance staging trigger for the purpose of
+# deciding SIZE. A flat, single-threshold $ cap (no staged middle tier) was
+# tested earlier and explicitly rejected -- it either passed a trade at
+# full size or blocked it outright with nothing in between, and blocked
+# ~63% of all setups in backtesting. This tiered version keeps a genuine
+# full-size lane for tight-SL trades and a reduced lane for medium risk,
+# only fully skipping the setups whose SL risk is genuinely large.
+#
+# USD_TO_INR_RATE is a fixed approximation, not a live FX feed -- consistent
+# with how this bot avoids external dependencies unless proven necessary.
+# Revisit this number if USDT/INR drifts meaningfully from it.
+SL_RISK_FULL_SIZE_MAX_INR = 800
+SL_RISK_STAGED_MAX_INR = 1300
+USD_TO_INR_RATE = 88.0
+
 # Partial take-profit ladder (added per Umar's request after the 7-day MFE
 # analysis showed avg MFE ~0.97R vs avg realized ~0.17R). Applies ONLY to
 # non-trend-mode trades — trend-mode (flip) trades keep the existing
@@ -1247,6 +1273,32 @@ class MarketMonitor:
             # day as used. This now fires regardless of what happens next,
             # matching what "one attempt per day" actually means.
             self.state.mark_auto_traded(symbol)
+
+            # 2026-09-14: INR risk-tier gate. Computed once, here, so both
+            # the alert text below and the actual sizing agree. This
+            # REPLACES the earlier %-distance-based use_staged_entry value
+            # from the strategy engine -- signal.use_staged_entry is
+            # overwritten below to reflect the INR-based decision instead.
+            _risk_per_unit = abs(signal.entry_price - signal.sl_price)
+            _risk_usd_at_full_size = (_risk_per_unit / signal.entry_price) * margin_usd * TRADE_LEVERAGE
+            _risk_inr_at_full_size = _risk_usd_at_full_size * USD_TO_INR_RATE
+
+            if _risk_inr_at_full_size > SL_RISK_STAGED_MAX_INR:
+                logger.info(f"{symbol} | SKIPPED (INR risk tier) — full-size SL risk would be "
+                           f"₹{_risk_inr_at_full_size:.0f} (${_risk_usd_at_full_size:.2f}), "
+                           f"above the ₹{SL_RISK_STAGED_MAX_INR} ceiling. Recorded only, no order "
+                           f"placed. Entry:{signal.entry_price:.4f} SL:{signal.sl_price:.4f}")
+                self._open_positions.pop(symbol, None)
+                return
+            elif _risk_inr_at_full_size >= SL_RISK_FULL_SIZE_MAX_INR:
+                signal.use_staged_entry = True
+                logger.info(f"{symbol} | INR risk tier: STAGED 50% — full-size SL risk would be "
+                           f"₹{_risk_inr_at_full_size:.0f} (${_risk_usd_at_full_size:.2f}), "
+                           f"between ₹{SL_RISK_FULL_SIZE_MAX_INR}-{SL_RISK_STAGED_MAX_INR}")
+            else:
+                signal.use_staged_entry = False
+                logger.info(f"{symbol} | INR risk tier: FULL SIZE — SL risk ₹{_risk_inr_at_full_size:.0f} "
+                           f"(${_risk_usd_at_full_size:.2f}), below ₹{SL_RISK_FULL_SIZE_MAX_INR}")
 
             level_line = (f"*Level swept:* {signal.swept_level:.4f} (dynamic re-anchor, "
                           f"not the fixed daily PDH/PDL below)\n*Fixed PDH:* {signal.pdh:.4f} | "
