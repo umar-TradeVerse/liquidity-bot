@@ -1262,8 +1262,19 @@ class MarketMonitor:
         btc_counter = (signal.side == 'BUY' and regime == 'BEARISH') or \
                       (signal.side == 'SELL' and regime == 'BULLISH')
         if btc_counter:
-            logger.info(f"{symbol} | {signal.side} setup — BTC regime is {regime} "
-                       f"(informational only, proceeding with entry)")
+            # 2026-09-20: was informational-only ("proceeding with entry"
+            # regardless). Made a genuine block per explicit request,
+            # mirroring the trend_bias block above exactly. Evidence:
+            # every SHORT this week fired into BULLISH regime; the
+            # earlier full regime backtest showed SHORT+BULLISH at
+            # -₹46,679 across 417 trades. LONG+BEARISH gated too for
+            # symmetry -- weaker evidence on that side (n=60, -₹5,178)
+            # but the same directional sign, and gating only one side
+            # of a symmetric check has no principled justification.
+            # Log-only, no Telegram alert, per explicit request.
+            logger.info(f"{symbol} | {signal.side} setup BLOCKED — BTC regime is {regime}, "
+                       f"fights this trade's direction — alert only, no auto-entry")
+            return
 
         async with self._position_lock:
             open_count = len(self._open_positions)
