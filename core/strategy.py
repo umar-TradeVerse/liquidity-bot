@@ -99,20 +99,27 @@ from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
 logger = setup_logger("strategy")
 
-SL_BUFFER_PCT = 0.01                # 1.0% buffer beyond the sweep extreme --
-                                     # widened from 0.2% on 2026-08-20. Real
-                                     # trade evidence (KAITOUSD, Aug 16-19)
-                                     # showed SL sitting almost exactly at
-                                     # the sweep wick was too tight -- a
+SL_BUFFER_PCT = 0.01                # REMOVED from use 2026-09-20 per explicit,
+                                     # final decision -- SL now sits exactly at
+                                     # the sweep extreme, both sides, no buffer.
+                                     # Kept here, unused, as the historical
+                                     # record of the earlier decision:
+                                     #
+                                     # Widened from 0.2% to 1.0% on 2026-08-20
+                                     # after real trade evidence (KAITOUSD, Aug
+                                     # 16-19) showed SL sitting almost exactly
+                                     # at the sweep wick was too tight -- a
                                      # shallow re-test of the same wick could
                                      # clip the stop before the real reversal
-                                     # played out. This is an explicit,
-                                     # deliberate number, not derived from a
-                                     # backtested structural rule -- an
-                                     # earlier attempt to find a clean,
-                                     # non-percentage "structural" reference
-                                     # (e.g. the pre-sweep candle) didn't
-                                     # hold up against the real data checked.
+                                     # played out. A later backtest (2026-09-08)
+                                     # confirmed the buffer had protected 8 real
+                                     # historical winners worth +$66.77 net,
+                                     # with zero cases where it saved a trade
+                                     # that would otherwise have been a loss --
+                                     # on that evidence it was kept at the time.
+                                     # Removed now on a separate, later, explicit
+                                     # decision to prioritize the tighter stop
+                                     # over that protection.
 MIN_SWEEP_DEPTH_PCT = 0.002          # UNVALIDATED placeholder — 0.2%
 MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
                                        # the reclaim check (close must be back
@@ -729,7 +736,7 @@ class StrategyEngine:
                         reclaim_ref_label = "fixed PDH"
                     if reclaim_ok:
                         entry = candle['close']
-                        sl = level.pdh_sweep_extreme * (1 + SL_BUFFER_PCT)
+                        sl = level.pdh_sweep_extreme
                         # 2026-08-20: flip mechanism removed entirely (see
                         # module docstring / effective_pdh comment above).
                         # counter_trend now purely reflects whether this
@@ -889,7 +896,7 @@ class StrategyEngine:
                         reclaim_ref_label = "fixed PDL"
                     if reclaim_ok:
                         entry = candle['close']
-                        sl = level.pdl_sweep_extreme * (1 - SL_BUFFER_PCT)
+                        sl = level.pdl_sweep_extreme
                         # 2026-08-20: flip mechanism removed entirely -- see
                         # the mirrored comment in the PDH-side block above.
                         counter = level.trend_bias == "DOWNTREND"
