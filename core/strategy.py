@@ -521,14 +521,48 @@ class StrategyEngine:
         if level.pending_entry:
             pe = level.pending_entry
             pe['candles_remaining'] -= 1
+
+            # 2026-09-24 FIX: real production failure traced and confirmed --
+            # a RIFUSD SHORT armed with SL frozen at the confirmation-time
+            # sweep extreme (0.0906, no buffer per the 2026-09-20 decision).
+            # Price continued drifting UP during the 4-candle wait and the
+            # candle it finally fired on closed at 0.0910 -- ABOVE that
+            # frozen SL. CoinDCX correctly rejected the order outright
+            # ("Stop loss trigger price should be higher than order price")
+            # and the trade was never opened, silently, with only an ERROR
+            # log line to show for it.
+            #
+            # Root cause: removing the SL buffer (2026-09-20) removed all
+            # margin for the price movement the delay mechanism (2026-09-14)
+            # deliberately waits through. Fix keeps the no-buffer decision
+            # intact -- it does NOT reintroduce a buffer -- it just keeps
+            # the sweep_extreme reference itself honest: if price makes a
+            # NEW, further extreme at any point during the wait (continuing
+            # the same sweep rather than reversing), that becomes the real
+            # invalidation point, exactly as sweep_extreme already means
+            # everywhere else in this file. The ORIGINAL confirmation-time
+            # extreme is only ever widened, never tightened.
+            if pe['side'] == 'SELL':
+                if candle['high'] > pe['sweep_extreme']:
+                    pe['sweep_extreme'] = candle['high']
+            else:
+                if candle['low'] < pe['sweep_extreme']:
+                    pe['sweep_extreme'] = candle['low']
+
             if pe['candles_remaining'] <= 0:
                 level.pending_entry = None
                 final_entry = candle['close']
+                final_sl = pe['sweep_extreme']  # re-anchored SL, unbuffered
+                if final_sl != pe['sl']:
+                    logger.info(f"{symbol} | Delayed-entry SL re-anchored during the wait: "
+                               f"{pe['sl']:.4f} -> {final_sl:.4f} (price made a new extreme "
+                               f"before the entry candle -- SL widened, never tightened, to "
+                               f"stay a genuine invalidation point beyond the actual entry)")
                 reject_reason, use_staged_entry = _check_hard_rules(
                     'PDH' if pe['side'] == 'SELL' else 'PDL',
-                    final_entry, pe['sl'], pe['effective_level'], pe['sweep_extreme'],
+                    final_entry, final_sl, pe['effective_level'], final_sl,
                     target=pe['target'])
-                signal = Signal(symbol, pe['side'], final_entry, pe['sl'], pe['pdh'], pe['pdl'],
+                signal = Signal(symbol, pe['side'], final_entry, final_sl, pe['pdh'], pe['pdl'],
                                  counter_trend=pe['counter_trend'], trend_mode=False,
                                  swept_level=pe['effective_level'], reject_reason=reject_reason,
                                  use_staged_entry=use_staged_entry,
@@ -537,10 +571,10 @@ class StrategyEngine:
                 if reject_reason:
                     logger.info(f"{symbol} | DELAYED ENTRY ({ENTRY_DELAY_CANDLES} candles after "
                                f"confirmation) — REJECTED at final price — {reject_reason} | "
-                               f"Entry:{final_entry:.4f} SL:{pe['sl']:.4f}")
+                               f"Entry:{final_entry:.4f} SL:{final_sl:.4f}")
                 else:
                     logger.info(f"{symbol} | DELAYED ENTRY firing, {ENTRY_DELAY_CANDLES} candles "
-                               f"after confirmation | Entry:{final_entry:.4f} SL:{pe['sl']:.4f}"
+                               f"after confirmation | Entry:{final_entry:.4f} SL:{final_sl:.4f}"
                                f"{' [STAGED ENTRY - wide SL]' if use_staged_entry else ''}")
                 return signal
             else:
