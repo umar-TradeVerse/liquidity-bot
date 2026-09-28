@@ -36,16 +36,36 @@ LOSER_MAX_WINRATE = 0.35         # candidate loser pattern threshold
 WINNER_MIN_WINRATE = 0.65        # winner patterns: information only
 PROMOTE_MIN_UNSEEN = 20
 PROMOTE_MAX_WINRATE = 0.30
-FEATURES = ("sym", "side", "regime", "bias", "sl", "sess", "obi")
+# 2026-09-28: DIRECTION-NEUTRAL features only, per explicit decision. No
+# symbol, no LONG/SHORT -- market momentum flips over time, and a pattern
+# like "TAO shorts lose" would block exactly the trades that start working
+# once it does. Instead each market condition is expressed RELATIVE to the
+# trade's direction: "with" the market, "against" it, or "neutral" -- so a
+# SHORT in a BEARISH regime and a LONG in a BULLISH regime are the same
+# pattern ("regime_align=with").
+FEATURES = ("regime_align", "bias_align", "sl", "sess", "obi_align")
 
 _SEED = os.path.join(os.path.dirname(__file__), "pattern_seed.json")
 _MEM = os.path.join(os.getenv("PERSIST_DIR", "/data"), "pattern_memory.jsonl")
 
 
-def _obi_bucket(obi):
+def _align(side, value, bullish, bearish):
+    """'with' / 'against' / 'neutral' -- the condition relative to the trade."""
+    if value in (None, "?"):
+        return "?"
+    if value == bullish:
+        return "with" if side == "BUY" else "against"
+    if value == bearish:
+        return "with" if side == "SELL" else "against"
+    return "neutral"
+
+
+def _obi_align(side, obi):
+    """Order book supports the trade (bids for a LONG, asks for a SHORT)?"""
     if obi is None:
         return "?"
-    return "bid-heavy" if obi >= 0.3 else "ask-heavy" if obi <= -0.3 else "balanced"
+    book = "bull" if obi >= 0.3 else "bear" if obi <= -0.3 else "flat"
+    return _align(side, book, "bull", "bear")
 
 
 def build_features(symbol, side, entry, sl, regime, bias, obi=None, now=None) -> dict:
@@ -53,10 +73,11 @@ def build_features(symbol, side, entry, sl, regime, bias, obi=None, now=None) ->
     now = now or datetime.now(timezone.utc)
     slp = abs(entry - sl) / entry * 100 if entry else 0
     hr = now.hour
-    return {"sym": symbol, "side": side, "regime": regime or "?", "bias": bias or "?",
+    return {"regime_align": _align(side, regime, "BULLISH", "BEARISH"),
+            "bias_align": _align(side, bias, "UPTREND", "DOWNTREND"),
             "sl": "tight<1%" if slp < 1 else "mid1-2%" if slp < 2 else "wide>2%",
             "sess": "Asia" if hr < 7 else "EU" if hr < 13 else "US",
-            "obi": _obi_bucket(obi)}
+            "obi_align": _obi_align(side, obi)}
 
 
 class PatternAgent:
