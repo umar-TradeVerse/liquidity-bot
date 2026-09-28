@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 
 from core.agents.decision import Verdict
 
-logger = logging.getLogger("risk_agent")
+from utils.logger import setup_logger
+logger = setup_logger("risk_agent")   # bot's own logger -> visible in Railway
 AGENT = "Risk"
 
 DAILY_LOSS_LIMIT_INR = 2000
