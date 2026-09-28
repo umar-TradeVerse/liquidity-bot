@@ -99,6 +99,48 @@ from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
 logger = setup_logger("strategy")
 
+MIN_SWEEP_DEPTH_PCT = 0.002          # UNVALIDATED placeholder — 0.2%
+MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
+                                       # the reclaim check (close must be back
+                                       # on the correct side of the fixed
+                                       # PDH/PDL) now requires clearing it by
+                                       # this margin, not just technically
+                                       # passing. Real cases supporting this:
+                                       # XRP (0.06% margin, loss), SOL (0.026%
+                                       # margin, loss), LTC (0.17% margin, SL
+                                       # hit) — all thin reclaims followed by
+                                       # a stop-out.
+REJECTION_WICK_RATIO = 2.0           # wick must be >= 2x body to fast-path the trigger
+USE_CISD_FOR_DEEP_SWEEPS = True      # STANDBY SWITCH — flip to False to fully
+                                       # revert to the fixed-level reclaim check
+                                       # for every trade, no code changes needed
+                                       # beyond this one line.
+DEEP_SWEEP_THRESHOLD_PCT = 0.005      # UNVALIDATED placeholder — 0.5%. A sweep
+                                       # whose extreme sits at least this far
+                                       # beyond the fixed PDH/PDL is treated as
+                                       # "deep" and uses CISD (reclaim the open
+                                       # of the last opposite-colour candle
+                                       # before the trigger) instead of the
+                                       # fixed-level reclaim. Shallow sweeps
+                                       # (below this threshold) keep the
+                                       # existing fixed-level reclaim + margin
+                                       # check unchanged — this is the exact
+                                       # case that originally caught KAITO's
+                                       # bad SHORT (entry 2.5% on the wrong
+                                       # side of the level). Real cases behind
+                                       # the deep-sweep side: ICP (sweep ~1%
+                                       # past fixed PDL, CISD would have fired
+                                       # ~8h earlier) and KAITO (sweep ~1.5%
+                                       # past fixed PDL, CISD would have fired
+                                       # ~1.5h earlier) — both 2026-07-22.
+TREND_BODY_RATIO_THRESHOLD = 0.5     # UNVALIDATED placeholder — daily body must
+                                     # cover >= 50% of the day's full range to
+                                     # count as a decisive trend day
+TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
+                                     # for classification (day-1/day-2 are the
+                                     # ones actually used right now; day-3 is
+                                     # fetched and available for future tuning)
+
 # ══════════════════════════════════════════════════════════════════════════
 # HARD RULES added 2026-08-13, following the 7-day no-funds audit. Each was
 # validated against real historical setups before being added — see the
