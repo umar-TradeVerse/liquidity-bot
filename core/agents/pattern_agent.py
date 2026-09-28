@@ -26,7 +26,8 @@ import itertools, json, logging, os
 from datetime import datetime, timezone
 from core.agents.decision import Verdict
 
-logger = logging.getLogger("pattern_agent")
+from utils.logger import setup_logger
+logger = setup_logger("pattern_agent")   # bot's own logger -> visible in Railway
 AGENT = "Pattern"
 
 PATTERN_VETO_ENABLED = False     # stays False until the data justifies it
