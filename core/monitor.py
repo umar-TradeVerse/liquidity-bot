@@ -56,6 +56,7 @@ from notifications.telegram import TelegramBot
 from core import persistence
 from core.obi import compute_obi, summarise_book
 from core.agents import context_agent
+from core.agents.pattern_agent import PatternAgent, build_features
 from core.agents.decision import DecisionRecord, Verdict
 from core.agents.risk_agent import RiskAgent, DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_INR
 from utils.logger import setup_logger
@@ -259,6 +260,8 @@ class MarketMonitor:
         self._open_positions: dict = {}
         self._trailing: dict = {}
         self.risk = RiskAgent()   # multi-agent: owns daily loss halt
+        self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
+        self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
         self._loops_since_save = 0
         self._SAVE_EVERY_N_LOOPS = 4  # ~1 minute at POLL_INTERVAL_SECONDS=15
@@ -369,7 +372,12 @@ class MarketMonitor:
         # allowed to break close logging, so it has its own try.
         try:
             _q = qty if qty is not None else tr.get("qty_open")
-            self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q)
+            _net = self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q)
+            tr["realised_usd"] = tr.get("realised_usd", 0.0) + _net
+            # Pattern memory learns from each FULLY closed real trade:
+            # win = the trade's total realised result (partials included) > 0
+            if event_type == "close" and exit_price is not None and tr.get("features"):
+                self.pattern.record(tr["features"], tr["realised_usd"] > 0)
         except Exception as e:
             logger.error(f"{symbol} | Daily P&L record failed: {e}")
         try:
@@ -498,6 +506,7 @@ class MarketMonitor:
         if obi is None:
             return
 
+        self._last_obi[symbol] = obi
         sweep_str = f"{sweep_extreme:.4f}" if sweep_extreme is not None else "n/a"
         logger.info(f"{symbol} | OBI at {side} sweep-arm (extreme {sweep_str}): "
                    f"{obi:+.3f} (top-5 levels) | {summarise_book(book['bids'], book['asks'])}")
@@ -1250,6 +1259,16 @@ class MarketMonitor:
             record.log("NO TRADE")
             return
 
+        # Pattern Memory Agent — shadow mode unless explicitly enabled.
+        signal.features = build_features(symbol, signal.side, signal.entry_price, signal.sl_price,
+                                         self.state.get_regime(), getattr(level, "trend_bias", None),
+                                         self._last_obi.get(symbol))
+        v = record.add(self.pattern.evaluate(signal.features))
+        if not v.approved:
+            logger.info(f"{symbol} | {signal.side} setup BLOCKED by Pattern — {v.reason} — log only")
+            record.log("NO TRADE")
+            return
+
         async with self._position_lock:
             open_count = len(self._open_positions)
             v = record.add(self.risk.concurrency(open_count, MAX_CONCURRENT_POSITIONS))
@@ -1381,7 +1400,8 @@ class MarketMonitor:
                 opened_at_ist = datetime.now(IST).isoformat()
                 risk = abs(signal.entry_price - signal.sl_price)
 
-                tr = {"side": signal.side, "entry": signal.entry_price,
+                tr = {"features": getattr(signal, "features", None),
+                      "side": signal.side, "entry": signal.entry_price,
                       "sl": signal.sl_price, "live_sl": signal.sl_price,
                       "breakeven_moved": False,
                       "breakeven_stage1_moved": False,
