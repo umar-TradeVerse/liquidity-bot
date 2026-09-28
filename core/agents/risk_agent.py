@@ -80,9 +80,22 @@ class RiskAgent:
             self._save()
 
     # ── P&L recording ─────────────────────────────────────────────────
-    def record_close(self, symbol: str, side: str, entry, exit_price, qty) -> float:
-        """Record one realised close (full or partial). Returns net USD."""
+    def record_close(self, symbol: str, side: str, entry, exit_price, qty,
+                     closed_at_ms=None) -> float:
+        """Record one realised close (full or partial). Returns net USD.
+
+        closed_at_ms: the exchange fill time. If the close actually happened
+        on an EARLIER trading day (e.g. detected after a restart or outage),
+        it is NOT added to today's total -- so an old loss can never push
+        today's daily halt. (2026-09-28, fix B)"""
         self._roll()
+        close_day = None
+        if closed_at_ms:
+            try:
+                close_day = datetime.fromtimestamp(float(closed_at_ms) / 1000,
+                                                   timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                close_day = None
         if not entry or not exit_price or not qty or qty <= 0:
             logger.warning(f"{symbol} | Daily P&L: close not counted — missing "
                            f"entry/exit/qty (entry={entry}, exit={exit_price}, qty={qty})")
@@ -90,6 +103,10 @@ class RiskAgent:
         gross = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
         fees = (entry * qty + exit_price * qty) * TAKER_FEE_PCT / 100
         net = gross - fees
+        if close_day and close_day != self.day:
+            logger.info(f"{symbol} | Daily P&L: {net:+.2f} USD closed on {close_day} (earlier "
+                        f"trading day) — not counted toward today's ({self.day}) halt")
+            return net
         self.realised_usd += net
         self._save()
         logger.info(f"{symbol} | Daily P&L: {net:+.2f} USD (gross {gross:+.2f}, fees {fees:.2f}) "
