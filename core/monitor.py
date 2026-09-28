@@ -217,6 +217,20 @@ def _escape_md(text) -> str:
     return text
 
 
+def _close_dt_ist(fill_ms):
+    """Actual close time from an exchange fill timestamp (ms), else now."""
+    try:
+        if fill_ms:
+            return datetime.fromtimestamp(float(fill_ms) / 1000, IST)
+    except Exception:
+        pass
+    return datetime.now(IST)
+
+
+def _close_time_ist(fill_ms) -> str:
+    return _close_dt_ist(fill_ms).isoformat()
+
+
 def _is_bearish_rejection(candle: dict) -> bool:
     body = abs(candle['close'] - candle['open'])
     upper_wick = candle['high'] - max(candle['open'], candle['close'])
@@ -260,6 +274,7 @@ class MarketMonitor:
         self._open_positions: dict = {}
         self._trailing: dict = {}
         self.risk = RiskAgent()   # multi-agent: owns daily loss halt
+        self._offhours_logged = False
         self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
         self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
@@ -290,8 +305,31 @@ class MarketMonitor:
                     continue
 
                 if not self._is_trading_hours():
-                    await asyncio.sleep(60)
+                    # 2026-09-28 (A): outside ENTRY hours (23:00–05:30 IST)
+                    # open positions are still fully managed -- breakeven,
+                    # trend trail, TP ladder, early failure, reconciliation.
+                    # Only NEW entries stop. Previously the bot did nothing
+                    # overnight and open trades relied solely on the
+                    # exchange-side SL.
+                    if self._trailing:
+                        if not self._offhours_logged:
+                            logger.info(f"Outside entry hours (23:00–05:30 IST) — managing "
+                                        f"{len(self._trailing)} open position(s): "
+                                        f"{list(self._trailing.keys())} — no new entries")
+                            self._offhours_logged = True
+                        await self._reconcile_positions()
+                        tasks = [self._process_symbol(sym, entries_allowed=False)
+                                 for sym in list(self._trailing.keys())]
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        self._loops_since_save += 1
+                        if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
+                            persistence.save_state(self.state, self._trailing)
+                            self._loops_since_save = 0
+                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    else:
+                        await asyncio.sleep(60)
                     continue
+                self._offhours_logged = False
 
                 await self._reconcile_positions()
                 await self._update_regime()
@@ -348,6 +386,7 @@ class MarketMonitor:
 
         price = fill["price"]
         tr["_last_fill_price"] = price   # used for realised P&L on reconciled closes
+        tr["_last_fill_ts"] = fill.get("timestamp")   # actual exchange close time (ms)
         sl = tr.get("live_sl", tr.get("sl"))
         tp = tr.get("tp")
         tolerance = 0.005
@@ -372,7 +411,9 @@ class MarketMonitor:
         # allowed to break close logging, so it has its own try.
         try:
             _q = qty if qty is not None else tr.get("qty_open")
-            _net = self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q)
+            _closed_ms = tr.get("_last_fill_ts") if event_type == "close" else None
+            _net = self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q,
+                                          closed_at_ms=_closed_ms)
             tr["realised_usd"] = tr.get("realised_usd", 0.0) + _net
             # Pattern memory learns from each FULLY closed real trade:
             # win = the trade's total realised result (partials included) > 0
@@ -388,7 +429,8 @@ class MarketMonitor:
             if opened_at:
                 try:
                     opened_dt = datetime.fromisoformat(opened_at)
-                    duration_minutes = round((datetime.now(IST) - opened_dt).total_seconds() / 60, 1)
+                    _end = _close_dt_ist(tr.get("_last_fill_ts") if event_type == "close" else None)
+                    duration_minutes = round((_end - opened_dt).total_seconds() / 60, 1)
                 except Exception:
                     pass
 
@@ -412,6 +454,7 @@ class MarketMonitor:
                 "mfe_price": tr.get("mfe"),
                 "mae_price": tr.get("mae"),
                 "opened_at_ist": opened_at,
+                "closed_at_ist": _close_time_ist(tr.get("_last_fill_ts") if event_type == "close" else None),
                 "duration_minutes": duration_minutes,
                 "realized_rr": rr,
             })
@@ -514,7 +557,7 @@ class MarketMonitor:
         # stays log-only. Still fully recorded in Railway logs for later
         # analysis, just no longer pings the phone for an unproven tracker.
 
-    async def _process_symbol(self, symbol: str):
+    async def _process_symbol(self, symbol: str, entries_allowed: bool = True):
         try:
             candle = await self.coindcx.get_latest_15m_candle(symbol)
             if not candle:
@@ -533,6 +576,12 @@ class MarketMonitor:
 
             if symbol in self._trailing:
                 await self._check_exit_conditions(symbol, candle, prev_candle)
+
+            if not entries_allowed:
+                # Off-hours: manage the open trade only. The strategy engine
+                # does not see this candle, exactly as before, so no setups
+                # arm overnight and entry behaviour is unchanged.
+                return
 
             signal = self.engine.process_candle(symbol, candle)
 
@@ -1140,6 +1189,7 @@ class MarketMonitor:
                 try:
                     _fill = await self.coindcx.get_last_fill(symbol)
                     _fill_px = _fill.get("price") if _fill else None
+                    if _fill: tr["_last_fill_ts"] = _fill.get("timestamp")
                 except Exception as e:
                     logger.error(f"{symbol} | Last-fill lookup failed on already-closed exit: {e}")
             self._log_close(symbol, tr, exit_price=_fill_px, reason=f"{reason}_already_closed")
