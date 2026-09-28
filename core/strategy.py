@@ -25,8 +25,8 @@ reference (trend_bias set):
      (price is already well past the fixed level by definition of
      being in a trend) while remaining a real filter for genuine
      sideways-market reversals.
-  4. Stop Loss — beyond the sweep extreme for this cycle, buffered by
-     SL_BUFFER_PCT.
+  4. Stop Loss — exactly at the sweep extreme for this cycle (no buffer),
+     re-anchored if price makes a new extreme during the entry delay.
   5. Invalidation — close breaks back through the trigger's other side
      first — scrapped, re-arms immediately.
 
@@ -99,69 +99,6 @@ from exchange.coindcx import CoinDCXClient
 from utils.logger import setup_logger
 logger = setup_logger("strategy")
 
-SL_BUFFER_PCT = 0.01                # REMOVED from use 2026-09-20 per explicit,
-                                     # final decision -- SL now sits exactly at
-                                     # the sweep extreme, both sides, no buffer.
-                                     # Kept here, unused, as the historical
-                                     # record of the earlier decision:
-                                     #
-                                     # Widened from 0.2% to 1.0% on 2026-08-20
-                                     # after real trade evidence (KAITOUSD, Aug
-                                     # 16-19) showed SL sitting almost exactly
-                                     # at the sweep wick was too tight -- a
-                                     # shallow re-test of the same wick could
-                                     # clip the stop before the real reversal
-                                     # played out. A later backtest (2026-09-08)
-                                     # confirmed the buffer had protected 8 real
-                                     # historical winners worth +$66.77 net,
-                                     # with zero cases where it saved a trade
-                                     # that would otherwise have been a loss --
-                                     # on that evidence it was kept at the time.
-                                     # Removed now on a separate, later, explicit
-                                     # decision to prioritize the tighter stop
-                                     # over that protection.
-MIN_SWEEP_DEPTH_PCT = 0.002          # UNVALIDATED placeholder — 0.2%
-MIN_RECLAIM_MARGIN_PCT = 0.0015       # 0.15%, confirmed by user 2026-07-21 —
-                                       # the reclaim check (close must be back
-                                       # on the correct side of the fixed
-                                       # PDH/PDL) now requires clearing it by
-                                       # this margin, not just technically
-                                       # passing. Real cases supporting this:
-                                       # XRP (0.06% margin, loss), SOL (0.026%
-                                       # margin, loss), LTC (0.17% margin, SL
-                                       # hit) — all thin reclaims followed by
-                                       # a stop-out.
-REJECTION_WICK_RATIO = 2.0           # wick must be >= 2x body to fast-path the trigger
-USE_CISD_FOR_DEEP_SWEEPS = True      # STANDBY SWITCH — flip to False to fully
-                                       # revert to the fixed-level reclaim check
-                                       # for every trade, no code changes needed
-                                       # beyond this one line.
-DEEP_SWEEP_THRESHOLD_PCT = 0.005      # UNVALIDATED placeholder — 0.5%. A sweep
-                                       # whose extreme sits at least this far
-                                       # beyond the fixed PDH/PDL is treated as
-                                       # "deep" and uses CISD (reclaim the open
-                                       # of the last opposite-colour candle
-                                       # before the trigger) instead of the
-                                       # fixed-level reclaim. Shallow sweeps
-                                       # (below this threshold) keep the
-                                       # existing fixed-level reclaim + margin
-                                       # check unchanged — this is the exact
-                                       # case that originally caught KAITO's
-                                       # bad SHORT (entry 2.5% on the wrong
-                                       # side of the level). Real cases behind
-                                       # the deep-sweep side: ICP (sweep ~1%
-                                       # past fixed PDL, CISD would have fired
-                                       # ~8h earlier) and KAITO (sweep ~1.5%
-                                       # past fixed PDL, CISD would have fired
-                                       # ~1.5h earlier) — both 2026-07-22.
-TREND_BODY_RATIO_THRESHOLD = 0.5     # UNVALIDATED placeholder — daily body must
-                                     # cover >= 50% of the day's full range to
-                                     # count as a decisive trend day
-TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
-                                     # for classification (day-1/day-2 are the
-                                     # ones actually used right now; day-3 is
-                                     # fetched and available for future tuning)
-
 # ══════════════════════════════════════════════════════════════════════════
 # HARD RULES added 2026-08-13, following the 7-day no-funds audit. Each was
 # validated against real historical setups before being added — see the
@@ -174,7 +111,7 @@ TREND_LOOKBACK_DAYS = 3              # how many complete daily candles to fetch
 # Rule 1 — Maximum Stop Loss Distance. If the calculated SL is more than
 # this far from entry, reject the trade outright (alert-only, no execution).
 MAX_SL_DISTANCE_PCT = 0.03  # 3.0% — raised from 2.0% on 2026-08-27. The
-                             # 2026-08-20 SL_BUFFER_PCT change (0.2% -> 1.0%)
+                             # 2026-08-20 SL buffer change (0.2% -> 1.0%, since removed)
                              # shifted the whole SL-distance distribution
                              # right, so the old 2.0% trigger was staging 97%
                              # of signals (32/33) instead of the ~30% it was
@@ -231,7 +168,7 @@ ENTRY_EXPIRY_MINUTES = 360  # 2026-09-14: raised from 90 to 360 (6h), per
                             # -- the 90-min window was discarding the
                             # better-performing later confirmations.
 
-ENTRY_DELAY_CANDLES = 4  # 2026-09-14: DELAYED ENTRY, per explicit request.
+ENTRY_DELAY_CANDLES = 3  # 2026-09-28: reduced 4 -> 3 per explicit request. (Introduced 2026-09-14.)
                          # A confirmed trigger waits this many MORE candles
                          # before actually entering, at that later candle's
                          # close. Backtested at 4 candles (60min): avg R
@@ -246,26 +183,11 @@ ENTRY_DELAY_CANDLES = 4  # 2026-09-14: DELAYED ENTRY, per explicit request.
                          # Applies ONLY to liquidity-sweep signals, not the
                          # inside-bar breakout strategy.
 
-# ══════════════════════════════════════════════════════════════════════════
-# INFORMATIONAL-ONLY drift tracker, added 2026-08-18. Does NOT change
-# ENTRY_EXPIRY_MINUTES, does NOT re-arm or extend real trading state, does
-# NOT auto-trade anything. Purely observes: after a setup expires, does
-# price EVENTUALLY do what would have confirmed it, and if so, how far had
-# it drifted from the sweep extreme by then? Early evidence (4 traced
-# cases) suggested low drift (<~1.5%) correlated with the eventual move
-# being real, while high drift (>~2.5%) correlated with it reversing --
-# but that's from 4 data points, nowhere near proven. This tracker exists
-# to accumulate more real cases before ever considering acting on it.
-POST_EXPIRY_DRIFT_OBSERVATION_MINUTES = 180  # how long to keep watching
-                                              # after expiry before giving up
-                                              # on this specific observation
-
 
 class Signal:
     def __init__(self, symbol, side, entry_price, sl_price, pdh, pdl,
                  counter_trend=False, trend_mode=False, swept_level=None,
-                 reject_reason=None, use_staged_entry=False,
-                 sweep_closed_inside=None):
+                 reject_reason=None, use_staged_entry=False):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -295,7 +217,6 @@ class Signal:
         # (breakout risk). None = unknown. Surfaced in alerts so the
         # hunt-vs-breakout split can be evaluated on real trades before
         # it is ever allowed to gate an entry.
-        self.sweep_closed_inside = sweep_closed_inside
         # The level actually swept to produce this signal -- the FIXED
         # daily PDH/PDL. (Prior to 2026-08-20 this could also be a dynamic
         # re-anchored trend-flip reference; that mechanism was removed
@@ -400,14 +321,6 @@ class StrategyEngine:
         # confirmed entry to alert on in the normal sense, so this is a
         # separate small side-channel rather than overloading Signal for it.
         self.pending_expiry_alerts: list = []
-        # 2026-08-18 informational drift tracker -- see constant comment
-        # above. drift_observations holds setups currently being watched
-        # post-expiry; pending_drift_results holds completed observations
-        # (confirmed-late or timed-out) waiting to be drained into an
-        # alert by monitor.py. Neither ever touches level.pdh_state /
-        # level.pdl_state or any real trading field.
-        self.drift_observations: list = []
-        self.pending_drift_results: list = []
 
     async def fetch_and_set_levels(self) -> bool:
         success_count = 0
@@ -445,28 +358,6 @@ class StrategyEngine:
                     else:
                         level.trend_bias = "NONE"
                         bias_note = "day-1 not decisive — sideways"
-
-                    # 2026-09-12: INSIDE BAR detection. recent_days is
-                    # oldest->newest, so [-1] is yesterday and [-2] is the
-                    # day before. A true inside bar means yesterday was
-                    # FULLY contained by the day before: high <= prev high
-                    # AND low >= prev low. If so, arm yesterday's own high
-                    # and low as today's breakout/breakdown triggers.
-                    level.inside_bar_armed = False
-                    level.inside_bar_high = None
-                    level.inside_bar_low = None
-                    level.inside_bar_traded_today = False
-                    if len(recent_days) >= 2:
-                        yday = recent_days[-1]
-                        dbefore = recent_days[-2]
-                        if yday['high'] <= dbefore['high'] and yday['low'] >= dbefore['low']:
-                            level.inside_bar_armed = True
-                            level.inside_bar_high = yday['high']
-                            level.inside_bar_low = yday['low']
-                            logger.info(f"{symbol} | INSIDE BAR detected — yesterday "
-                                        f"(H:{yday['high']} L:{yday['low']}) fully contained by "
-                                        f"the day before (H:{dbefore['high']} L:{dbefore['low']}). "
-                                        f"Armed: LONG above {yday['high']}, SHORT below {yday['low']}")
 
                     logger.info(f"{symbol} | PDH: {prev_candle['high']} | PDL: {prev_candle['low']} "
                                 f"| Trend bias: {level.trend_bias} ({bias_note}) "
@@ -565,8 +456,7 @@ class StrategyEngine:
                 signal = Signal(symbol, pe['side'], final_entry, final_sl, pe['pdh'], pe['pdl'],
                                  counter_trend=pe['counter_trend'], trend_mode=False,
                                  swept_level=pe['effective_level'], reject_reason=reject_reason,
-                                 use_staged_entry=use_staged_entry,
-                                 sweep_closed_inside=pe['sweep_closed_inside'])
+                                 use_staged_entry=use_staged_entry)
                 signal.pattern = pe['pattern']
                 if reject_reason:
                     logger.info(f"{symbol} | DELAYED ENTRY ({ENTRY_DELAY_CANDLES} candles after "
@@ -581,58 +471,6 @@ class StrategyEngine:
                 logger.info(f"{symbol} | Delayed entry armed — {pe['candles_remaining']} "
                            f"candle(s) left before entry (side={pe['side']})")
                 return None
-
-        # ── 2026-09-12: INSIDE BAR BREAKOUT check. Runs FIRST so that the
-        # liquidity-sweep logic further below can overwrite `signal` if it
-        # also fires this candle -- the mean-reversion setup is the bot's
-        # primary, evidenced strategy and deliberately takes precedence
-        # over this additional breakout rule. See the honest evidence note
-        # on the inside_bar_* fields in state.py.
-        if (level.inside_bar_armed and not level.inside_bar_traded_today
-                and level.inside_bar_high and level.inside_bar_low):
-            ib_hi, ib_lo = level.inside_bar_high, level.inside_bar_low
-            ib_entry = ib_sl = ib_side = None
-            if candle['close'] > ib_hi:
-                # bullish breakout -> LONG, SL at the other end of the inside bar
-                ib_side, ib_entry, ib_sl = 'BUY', candle['close'], ib_lo
-            elif candle['close'] < ib_lo:
-                ib_side, ib_entry, ib_sl = 'SELL', candle['close'], ib_hi
-
-            if ib_side:
-                level.inside_bar_traded_today = True   # one attempt per day, win or lose
-                ib_risk = abs(ib_entry - ib_sl)
-                ib_target = pdh if ib_side == 'BUY' else pdl
-                # Reuse the SAME hard-rule gate the sweep strategy uses, so a
-                # breakout with worse reward than risk is rejected identically.
-                ib_reject = None
-                if ib_risk <= 0:
-                    ib_reject = "AMBIGUOUS SETUP — entry and SL identical (zero risk)"
-                elif ib_target and ib_target > 0:
-                    ib_rr = abs(ib_target - ib_entry) / ib_risk
-                    if ib_rr < MIN_REWARD_RISK_RATIO:
-                        ib_reject = (f"Reward:risk too low ({ib_rr:.2f}x < "
-                                     f"{MIN_REWARD_RISK_RATIO:.1f}x) — reward to target "
-                                     f"({abs(ib_target-ib_entry):.4f}) smaller than risk "
-                                     f"({ib_risk:.4f})")
-                ib_staged = (ib_risk / ib_entry) > MAX_SL_DISTANCE_PCT if ib_entry else False
-
-                signal = Signal(symbol, ib_side, ib_entry, ib_sl, pdh, pdl,
-                                counter_trend=False, trend_mode=False,
-                                swept_level=(ib_hi if ib_side == 'BUY' else ib_lo),
-                                reject_reason=ib_reject, use_staged_entry=ib_staged)
-                signal.pattern = "Inside Bar Breakout"
-                if ib_reject:
-                    logger.info(f"{symbol} | INSIDE BAR {'LONG' if ib_side=='BUY' else 'SHORT'} "
-                                f"breakout REJECTED — {ib_reject} | Entry:{ib_entry:.4f} "
-                                f"SL:{ib_sl:.4f}")
-                else:
-                    logger.info(f"{symbol} | INSIDE BAR breakout "
-                                f"{'LONG' if ib_side=='BUY' else 'SHORT'} | close {candle['close']:.4f} "
-                                f"{'above' if ib_side=='BUY' else 'below'} inside-bar "
-                                f"{'high' if ib_side=='BUY' else 'low'} "
-                                f"{ib_hi if ib_side=='BUY' else ib_lo:.4f} | "
-                                f"Entry:{ib_entry:.4f} SL:{ib_sl:.4f}"
-                                f"{' [STAGED ENTRY - wide SL]' if ib_staged else ''}")
 
         is_bullish = candle['close'] > candle['open']
         is_bearish = candle['close'] < candle['open']
@@ -668,29 +506,10 @@ class StrategyEngine:
                                     f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
                                     f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
                                     f"waiting for a completely fresh sweep")
-                        # Informational-only snapshot, taken BEFORE the real
-                        # state resets below. Read-only from here on.
-                        # 2026-08-25 FIX: a setup can expire while still in
-                        # SWEPT state (no trigger candle ever formed), leaving
-                        # pdh_trigger as None. Reading ['high'] on it raised
-                        # TypeError and killed the whole process_candle call —
-                        # meaning that symbol silently stopped being evaluated
-                        # for the rest of the run. Only record a drift
-                        # observation when a trigger actually exists.
-                        if level.pdh_trigger is not None:
-                            self.drift_observations.append({
-                            'symbol': symbol, 'side': 'PDH', 'direction': 'SHORT',
-                            'trigger_high': level.pdh_trigger['high'],
-                            'trigger_low': level.pdh_trigger['low'],
-                            'sweep_extreme': level.pdh_sweep_extreme,
-                            'sweep_armed_at': level.pdh_sweep_armed_at,
-                            'expired_at': candle['time'],
-                            })
                         level.pdh_state = "NONE"
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_sweep_armed_at = None
-                        level.pdh_sweep_closed_inside = None
                         level.pdh_cisd_ref = None
                         level.pdh_event_active = True  # prevents re-arming on THIS same
                                                         # candle too, via the guard below
@@ -721,12 +540,9 @@ class StrategyEngine:
                         # acceptance — i.e. a breakout, where a reversal
                         # short is fighting real momentum rather than fading
                         # a stop-hunt. Alert-only; does not gate anything.
-                        level.pdh_sweep_closed_inside = candle['close'] < effective_pdh
-                        _char = "HUNT (closed back inside)" if level.pdh_sweep_closed_inside \
-                                else "BREAKOUT RISK (closed beyond level)"
                         logger.info(f"{symbol} | PDH-side swept (H:{candle['high']:.4f}, "
                                     f"C:{candle['close']:.4f} vs level {effective_pdh:.4f}) "
-                                    f"— {_char} — watching for the first bearish trigger candle")
+                                    f"— watching for the first bearish trigger candle")
 
                         body = abs(candle['close'] - candle['open'])
                         upper_wick = candle['high'] - max(candle['open'], candle['close'])
@@ -790,7 +606,6 @@ class StrategyEngine:
                             'side': 'SELL', 'sl': sl, 'pdh': pdh, 'pdl': pdl,
                             'effective_level': effective_pdh, 'sweep_extreme': level.pdh_sweep_extreme,
                             'target': pdl, 'counter_trend': counter,
-                            'sweep_closed_inside': level.pdh_sweep_closed_inside,
                             'pattern': 'Liquidity Sweep',
                             'candles_remaining': ENTRY_DELAY_CANDLES,
                         }
@@ -801,7 +616,6 @@ class StrategyEngine:
                         level.pdh_trigger = None
                         level.pdh_sweep_extreme = None
                         level.pdh_sweep_armed_at = None
-                        level.pdh_sweep_closed_inside = None
                         level.pdh_event_active = True
                         level.pdh_cisd_ref = None
                         if counter:
@@ -841,27 +655,10 @@ class StrategyEngine:
                                     f"{elapsed_minutes:.0f} min since sweep armed, no confirmed "
                                     f"entry within {ENTRY_EXPIRY_MINUTES} min — resetting, "
                                     f"waiting for a completely fresh sweep")
-                        # 2026-08-25 FIX: a setup can expire while still in
-                        # SWEPT state (no trigger candle ever formed), leaving
-                        # pdl_trigger as None. Reading ['high'] on it raised
-                        # TypeError and killed the whole process_candle call —
-                        # meaning that symbol silently stopped being evaluated
-                        # for the rest of the run. Only record a drift
-                        # observation when a trigger actually exists.
-                        if level.pdl_trigger is not None:
-                            self.drift_observations.append({
-                            'symbol': symbol, 'side': 'PDL', 'direction': 'LONG',
-                            'trigger_high': level.pdl_trigger['high'],
-                            'trigger_low': level.pdl_trigger['low'],
-                            'sweep_extreme': level.pdl_sweep_extreme,
-                            'sweep_armed_at': level.pdl_sweep_armed_at,
-                            'expired_at': candle['time'],
-                            })
                         level.pdl_state = "NONE"
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_sweep_armed_at = None
-                        level.pdl_sweep_closed_inside = None
                         level.pdl_cisd_ref = None
                         level.pdl_event_active = True
                         pdl_expired_this_candle = True
@@ -881,12 +678,9 @@ class StrategyEngine:
                         level.pdl_day_extreme = candle['low']
                         level.pdl_sweep_armed_at = candle['time']
                         # Mirror of the PDH-side classification above.
-                        level.pdl_sweep_closed_inside = candle['close'] > effective_pdl
-                        _char = "HUNT (closed back inside)" if level.pdl_sweep_closed_inside \
-                                else "BREAKOUT RISK (closed beyond level)"
                         logger.info(f"{symbol} | PDL-side swept (L:{candle['low']:.4f}, "
                                     f"C:{candle['close']:.4f} vs level {effective_pdl:.4f}) "
-                                    f"— {_char} — watching for the first bullish trigger candle")
+                                    f"— watching for the first bullish trigger candle")
 
                         body = abs(candle['close'] - candle['open'])
                         lower_wick = min(candle['open'], candle['close']) - candle['low']
@@ -941,7 +735,6 @@ class StrategyEngine:
                             'side': 'BUY', 'sl': sl, 'pdh': pdh, 'pdl': pdl,
                             'effective_level': effective_pdl, 'sweep_extreme': level.pdl_sweep_extreme,
                             'target': pdh, 'counter_trend': counter,
-                            'sweep_closed_inside': level.pdl_sweep_closed_inside,
                             'pattern': 'Liquidity Sweep',
                             'candles_remaining': ENTRY_DELAY_CANDLES,
                         }
@@ -952,7 +745,6 @@ class StrategyEngine:
                         level.pdl_trigger = None
                         level.pdl_sweep_extreme = None
                         level.pdl_sweep_armed_at = None
-                        level.pdl_sweep_closed_inside = None
                         level.pdl_event_active = True
                         level.pdl_cisd_ref = None
                         if counter:
@@ -973,49 +765,4 @@ class StrategyEngine:
                     level.pdl_trigger = None
                     level.pdl_cisd_ref = None
 
-        # Informational-only drift observation check -- entirely read-only,
-        # never touches level.pdh_state/pdl_state or `signal`. See the
-        # POST_EXPIRY_DRIFT_OBSERVATION_MINUTES comment above.
-        self._check_drift_observations(symbol, candle, level)
-
         return signal
-
-    def _check_drift_observations(self, symbol: str, candle: dict, level) -> None:
-        """Watches previously-expired setups to see if price eventually
-        does what would have confirmed them, purely for later analysis.
-        Never re-arms real state, never produces a Signal, never affects
-        auto-trading. Drops an observation if it goes stale (too old) or
-        if a genuinely fresh sweep has since re-armed that same side,
-        since a new real cycle supersedes the old informational watch."""
-        still_watching = []
-        for obs in self.drift_observations:
-            if obs['symbol'] != symbol:
-                still_watching.append(obs)
-                continue
-
-            elapsed_min = (candle['time'] - obs['expired_at']) / 1000 / 60
-            if elapsed_min > POST_EXPIRY_DRIFT_OBSERVATION_MINUTES:
-                continue  # too old, drop silently -- no verdict either way
-
-            fresh_state = level.pdh_state if obs['side'] == 'PDH' else level.pdl_state
-            if fresh_state != "NONE":
-                continue  # a genuinely new cycle has started, old watch is stale
-
-            if obs['direction'] == 'SHORT':
-                confirmed = candle['close'] < obs['trigger_low'] and candle['close'] < candle['open']
-            else:
-                confirmed = candle['close'] > obs['trigger_high'] and candle['close'] > candle['open']
-
-            if confirmed:
-                drift_pct = abs(candle['close'] - obs['sweep_extreme']) / obs['sweep_extreme'] * 100
-                total_elapsed_min = (candle['time'] - obs['sweep_armed_at']) / 1000 / 60
-                self.pending_drift_results.append({
-                    'symbol': symbol, 'side': obs['side'], 'direction': obs['direction'],
-                    'would_be_entry': candle['close'], 'elapsed_minutes': round(total_elapsed_min),
-                    'drift_pct': round(drift_pct, 2),
-                })
-                continue  # found it, drop the observation
-
-            still_watching.append(obs)
-
-        self.drift_observations = still_watching
