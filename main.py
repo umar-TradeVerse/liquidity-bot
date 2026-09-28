@@ -1,3 +1,4 @@
+import dataclasses
 """
 Liquidity Strategy Bot — CoinDCX
 Entry point: starts scheduler + monitoring loop
@@ -115,6 +116,12 @@ async def main():
     restored = persistence.load_state()
     if restored:
         for sym, level_dict in restored["levels"].items():
+            # Drop keys that no longer exist on DailyLevel (e.g. fields removed
+            # in a later version) so an older snapshot on the volume can never
+            # crash startup with an unexpected-keyword TypeError.
+            if level_dict is not None:
+                _known = {f.name for f in dataclasses.fields(DailyLevel)}
+                level_dict = {k: v for k, v in level_dict.items() if k in _known}
             state.levels[sym] = DailyLevel(**level_dict) if level_dict is not None else None
         monitor.restore_trailing(restored["trailing"])
         await telegram.send_alert(
