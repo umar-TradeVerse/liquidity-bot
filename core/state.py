@@ -39,14 +39,12 @@ class DailyLevel:
     # level (a genuine liquidity hunt — wick pierces, body rejects), or did
     # it close beyond the level (acceptance / breakout)? Captured at arm
     # time and carried through to the signal for alerting only.
-    pdh_sweep_closed_inside: Optional[bool] = None
     pdl_state: str = "NONE"
     pdl_trigger: Optional[dict] = None
     pdl_event_active: bool = False
     pdl_sweep_extreme: Optional[float] = None
     pdl_day_extreme: Optional[float] = None
     pdl_sweep_armed_at: Optional[int] = None
-    pdl_sweep_closed_inside: Optional[bool] = None
     # Trend bias, set once at the daily reset from the last 3 daily candles.
     # "NONE" = sideways OR a matured/exhausted trend (2+ consecutive same-
     # direction days) — keep the original dual-sided sweep-reversal logic.
@@ -75,32 +73,6 @@ class DailyLevel:
     # classification itself may be wrong or the trend is reversing intraday
     # — not just noise. See monitor.py's STABILITY_MAX_COUNTER_CONFIRMS.
     counter_trend_confirms: int = 0
-
-    # ── 2026-09-12: INSIDE BAR BREAKOUT — a SEPARATE, ADDITIONAL strategy,
-    # deliberately distinct from the liquidity-sweep logic above.
-    #
-    # HONEST RECORD OF THE EVIDENCE, so future-you knows what this was
-    # built on. Backtested across 699 day-pairs / 140 real inside bars
-    # from this bot's own logged daily candles:
-    #     broke DOWN only .......... 46 (33%)
-    #     broke UP only ............ 39 (28%)
-    #     BOTH sides broken ........ 30 (21%)  <- breakout entry likely loses
-    #     never broke .............. 20 (14%)
-    # Direction is near a coin flip and the 21% whipsaw rate is a
-    # structural drag. This was implemented at explicit request AFTER that
-    # analysis was presented and understood -- NOT because the data
-    # supported it. Watch it closely; if live results match the backtest,
-    # this rule costs money.
-    #
-    # NOTE ON CONFLICT: this is a CONTINUATION/breakout rule bolted onto a
-    # MEAN-REVERSION bot. The two can fire opposite signals on the same
-    # symbol. Precedence is handled in monitor.py: the liquidity-sweep
-    # signal always wins if both are live, and only ONE inside-bar trade
-    # per symbol per day is allowed.
-    inside_bar_armed: bool = False        # yesterday was a true inside bar
-    inside_bar_high: Optional[float] = None   # breakout level (long trigger)
-    inside_bar_low: Optional[float] = None    # breakdown level (short trigger)
-    inside_bar_traded_today: bool = False     # one attempt per symbol per day
 
     # 2026-09-14: DELAYED ENTRY. A confirmed liquidity-sweep trigger is
     # stored here instead of firing immediately -- it fires ENTRY_DELAY_
@@ -200,12 +172,10 @@ class BotState:
                 level.pdh_trigger = None
                 level.pdh_sweep_extreme = None
                 level.pdh_sweep_armed_at = None
-                level.pdh_sweep_closed_inside = None
                 level.pdl_state = "NONE"
                 level.pdl_trigger = None
                 level.pdl_sweep_extreme = None
                 level.pdl_sweep_armed_at = None
-                level.pdl_sweep_closed_inside = None
                 # 2026-09-14: clear any armed-but-not-yet-fired delayed
                 # entry too. A pending entry that was armed before a
                 # position closed (e.g. an unrelated earlier trade on this
