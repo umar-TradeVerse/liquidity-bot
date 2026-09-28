@@ -54,7 +54,10 @@ from core.strategy import StrategyEngine, Signal, ENTRY_EXPIRY_MINUTES
 from exchange.coindcx import CoinDCXClient
 from notifications.telegram import TelegramBot
 from core import persistence
-from core.obi import compute_obi
+from core.obi import compute_obi, summarise_book
+from core.agents import context_agent
+from core.agents.decision import DecisionRecord, Verdict
+from core.agents.risk_agent import RiskAgent, DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_INR
 from utils.logger import setup_logger
 logger = setup_logger("monitor")
 IST = pytz.timezone("Asia/Kolkata")
@@ -255,6 +258,7 @@ class MarketMonitor:
         self._last_regime_candle_time = None
         self._open_positions: dict = {}
         self._trailing: dict = {}
+        self.risk = RiskAgent()   # multi-agent: owns daily loss halt
         self._position_lock = asyncio.Lock()
         self._loops_since_save = 0
         self._SAVE_EVERY_N_LOOPS = 4  # ~1 minute at POLL_INTERVAL_SECONDS=15
@@ -340,6 +344,7 @@ class MarketMonitor:
             return "reason unknown (no fill data returned)"
 
         price = fill["price"]
+        tr["_last_fill_price"] = price   # used for realised P&L on reconciled closes
         sl = tr.get("live_sl", tr.get("sl"))
         tp = tr.get("tp")
         tolerance = 0.005
@@ -352,7 +357,7 @@ class MarketMonitor:
         return f"unclear — fill ~{price:.4f} (entry {tr.get('entry')}, SL {sl}, TP {tp})"
 
     def _log_close(self, symbol: str, tr: dict, exit_price: Optional[float], reason: str,
-                    event_type: str = "close"):
+                    event_type: str = "close", qty: Optional[float] = None):
         """Writes one line to trades.jsonl using whatever we tracked in
         self._trailing for this symbol (entry/sl/tp/mfe/mae/opened_at).
         event_type='close' means the position is fully done (used for win-rate
@@ -360,6 +365,13 @@ class MarketMonitor:
         ladder fill — the trade is still open, and get_pattern_stats
         deliberately excludes these from win-rate/occurrence counting so a
         single trade with two partial fills doesn't get counted as three."""
+        # Risk Agent: record realised P&L for the daily loss halt. Never
+        # allowed to break close logging, so it has its own try.
+        try:
+            _q = qty if qty is not None else tr.get("qty_open")
+            self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q)
+        except Exception as e:
+            logger.error(f"{symbol} | Daily P&L record failed: {e}")
         try:
             entry = tr.get("entry")
             side = tr.get("side")
@@ -432,7 +444,8 @@ class MarketMonitor:
                 reason_line = await self._classify_reconciled_exit(symbol)
                 tr = self._trailing.get(symbol)
                 if tr:
-                    self._log_close(symbol, tr, exit_price=None, reason=reason_line)
+                    self._log_close(symbol, tr, exit_price=tr.get("_last_fill_price"),
+                                    reason=reason_line)
                 self.state.reset_symbol_watch(symbol)
                 self._trailing.pop(symbol, None)
                 logger.info(f"{symbol} | Position closed ({reason_line}) — resuming watch for fresh setups")
@@ -472,7 +485,9 @@ class MarketMonitor:
         """2026-09-03 informational-only. See the wiring comment in
         _process_symbol for what this does and does not affect."""
         try:
-            book = await self.coindcx.get_orderbook(symbol, depth=5)
+            # depth=20 (was 5): OBI is still computed on the top 5 levels,
+            # identical to before; the deeper book feeds walls/gaps.
+            book = await self.coindcx.get_orderbook(symbol, depth=20)
         except Exception as e:
             logger.error(f"{symbol} | OBI fetch failed: {e}", exc_info=True)
             return
@@ -485,7 +500,7 @@ class MarketMonitor:
 
         sweep_str = f"{sweep_extreme:.4f}" if sweep_extreme is not None else "n/a"
         logger.info(f"{symbol} | OBI at {side} sweep-arm (extreme {sweep_str}): "
-                   f"{obi:+.3f} (top-5 levels)")
+                   f"{obi:+.3f} (top-5 levels) | {summarise_book(book['bids'], book['asks'])}")
         # 2026-09-08: Telegram alert removed per explicit request -- this
         # stays log-only. Still fully recorded in Railway logs for later
         # analysis, just no longer pings the phone for an unproven tracker.
@@ -551,27 +566,6 @@ class MarketMonitor:
                     else:
                         remaining.append(ev)
                 self.engine.pending_expiry_alerts = remaining
-
-            # 2026-08-18 informational-only drift tracker — drained the same
-            # way. This NEVER triggers a trade and never re-arms anything;
-            # it only reports what price did after a setup already expired,
-            # purely for later analysis of whether entry-drift % predicts
-            # which late confirmations are worth having versus not.
-            if self.engine.pending_drift_results:
-                remaining_drift = []
-                for res in self.engine.pending_drift_results:
-                    if res['symbol'] == symbol:
-                        # 2026-09-08: Telegram alert removed per explicit
-                        # request -- log-only from here. Full detail still
-                        # captured in Railway logs for later analysis.
-                        logger.info(f"{symbol} | Late confirmation observed: "
-                                   f"{res['side']} ({res['direction']}), "
-                                   f"would-be entry {res['would_be_entry']:.4f}, "
-                                   f"elapsed {res['elapsed_minutes']} min, "
-                                   f"drift {res['drift_pct']:.2f}%")
-                    else:
-                        remaining_drift.append(res)
-                self.engine.pending_drift_results = remaining_drift
 
             if signal:
                 await self._handle_signal(signal)
@@ -700,6 +694,7 @@ class MarketMonitor:
             tr["deployed_margin_usd"] = tr.get("planned_margin_usd", 0)
             tr["staged_stage2_added"] = True
             self._open_positions[symbol] = self._open_positions.get(symbol, 0) + added_qty
+            tr["qty_open"] = (tr.get("qty_open") or 0) + added_qty
             logger.info(f"{symbol} | Staged addition filled — remaining 50% (${remaining_margin:.2f} "
                        f"margin) added at {candle['close']:.4f}, MFE was {mfe_R:.2f}R")
             persistence.log_trade_event({
@@ -804,14 +799,7 @@ class MarketMonitor:
         post-ROE remainder trail -- that buffer activates only after a much
         larger move (7%+ ROE) and would sit ABOVE breakeven if applied here
         at a 1.0R activation point, causing an immediate false stop-out."""
-        # 2026-09-14: this check is now inert -- early_invalidation (which
-        # used to set this flag) was removed. Left in place harmlessly:
-        # the key is never set anymore, so tr.get(...) is None, and
-        # `None is False` is always False, meaning this never returns
-        # early. Kept rather than deleted so a future re-read of this
-        # method isn't confused by a silently different code shape.
-        if tr.get('early_invalidation_cleared') is False:
-            return
+
 
         entry, sl, side = tr.get('entry'), tr.get('sl'), tr['side']
         risk = abs(entry - sl) if entry and sl else 0
@@ -900,7 +888,8 @@ class MarketMonitor:
             if success:
                 tr[filled_key] = True
                 self._log_close(symbol, tr, exit_price=tp_price, reason=f"tp{tier}_partial",
-                                 event_type="partial_close")
+                                 event_type="partial_close", qty=close_qty)
+                tr["qty_open"] = max(0.0, (tr.get("qty_open") or live_qty) - close_qty)
                 pct_of_position = round(100 * tier_weight, 0)
                 await self.telegram.send_alert(
                     f"🎯 *TP{tier} Hit — Partial Close*\n\n"
@@ -1054,7 +1043,8 @@ class MarketMonitor:
                     tr["roe_partial_done"] = True
                     tr["trailing_high_water"] = candle['close']
                     self._log_close(symbol, tr, exit_price=candle['close'], reason="roe_protection_partial",
-                                     event_type="partial_close")
+                                     event_type="partial_close", qty=close_qty)
+                    tr["qty_open"] = max(0.0, (tr.get("qty_open") or live_qty) - close_qty)
                     await self.telegram.send_alert(
                         f"✅ *Take Profit – ROE Protection (Partial)*\n\n"
                         f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if side == 'BUY' else '📉 SHORT'}\n"
@@ -1119,18 +1109,31 @@ class MarketMonitor:
                               label: str, roe: Optional[float] = None):
         side = tr["side"]
 
+        positions_ok = True
         try:
             live_positions = await self.coindcx.get_open_positions()
         except Exception as e:
             logger.error(f"{symbol} | Failed to fetch live position before close: {e}", exc_info=True)
             live_positions = {}
+            positions_ok = False
 
         quantity = abs(live_positions.get(symbol, 0))
 
         if quantity <= 0:
             logger.warning(f"{symbol} | No live position found on exchange at exit time "
                            f"(reason={reason}) — skipping close call, resetting local state only")
-            self._log_close(symbol, tr, exit_price=None, reason=f"{reason}_already_closed")
+            # The exchange-side SL/TP most likely fired first. Price the
+            # realised close from the last fill so the daily loss halt still
+            # counts it -- but only when the positions call actually
+            # succeeded, never on a guess after an API failure.
+            _fill_px = None
+            if positions_ok:
+                try:
+                    _fill = await self.coindcx.get_last_fill(symbol)
+                    _fill_px = _fill.get("price") if _fill else None
+                except Exception as e:
+                    logger.error(f"{symbol} | Last-fill lookup failed on already-closed exit: {e}")
+            self._log_close(symbol, tr, exit_price=_fill_px, reason=f"{reason}_already_closed")
             self.state.reset_symbol_watch(symbol)
             self._trailing.pop(symbol, None)
             self._open_positions.pop(symbol, None)
@@ -1169,7 +1172,10 @@ class MarketMonitor:
             )
             logger.error(f"{symbol} | Failed to auto-close on {reason} trigger")
 
-        self._log_close(symbol, tr, exit_price=exit_price, reason=reason)
+        # qty=0 on a FAILED close so the Risk Agent never books P&L for a
+        # position that is actually still open on the exchange.
+        self._log_close(symbol, tr, exit_price=exit_price, reason=reason,
+                        qty=quantity if success else 0)
         self.state.reset_symbol_watch(symbol)
         self._trailing.pop(symbol, None)
         self._open_positions.pop(symbol, None)
@@ -1178,107 +1184,77 @@ class MarketMonitor:
         symbol = signal.symbol
         level = self.state.get_level(symbol)
 
-        # Rules 1-3 (2026-08-13) — SL too wide, or sweep too shallow/too
-        # deep. Checked FIRST, ahead of every other routing decision: a
-        # rejected setup is always alert-only, regardless of what the
-        # trend/stability/counter-trend routing would otherwise have done
-        # with it, since it never should have reached execution at all.
-        if signal.reject_reason:
-            # 2026-08-15: also surface whether this setup would ALSO have
-            # been alert-only for counter-trend/flip reasons, so a hard-rule
-            # rejection never leaves ambiguity about whether the trend gate
-            # is still active — it's checked here even though the hard-rule
-            # check fires first and would have blocked execution regardless.
-            also_note = ""
-            if signal.trend_mode:
-                also_note = "\n\n_Note: this was also a trend-aligned flip setup — would have been alert-only for that reason too, independent of the hard-rule rejection above._"
-            elif signal.counter_trend:
-                also_note = "\n\n_Note: this setup also fights today's trend bias — would have been alert-only as counter-trend too, independent of the hard-rule rejection above._"
+        # ── MULTI-AGENT DECISION FLOW (2026-09-28) ─────────────────────
+        # Structure Agent (StrategyEngine) proposed this signal. Risk and
+        # Context now approve or veto it, in the SAME order the checks ran
+        # before the restructure. One DECISION line is logged per setup.
+        record = DecisionRecord(symbol, signal.side, signal.entry_price, signal.sl_price)
 
-            logger.info(f"{symbol} | {signal.side} setup REJECTED — {signal.reject_reason} — alert only"
-                       f"{' (also counter-trend/flip)' if also_note else ''}")
-            await self.telegram.send_alert(
-                f"🚫 *Setup Rejected — Hard Rule*\n\n"
-                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"*Level swept:* {signal.swept_level:.4f}\n\n"
-                f"*Reason:* {signal.reject_reason}\n\n"
-                f"No auto-entry executed. This setup was rejected by a hard rule, not by "
-                f"trend/stability routing — review manually on CoinDCX if you disagree."
-                f"{also_note}"
-            )
+        # Risk Agent — pre-checks (hard rules, one-per-day, daily loss halt)
+        v = record.add(self.risk.pre_check(signal, level))
+        if not v.approved:
+            record.log("NO TRADE")
+            if signal.reject_reason:
+                also_note = ""
+                if signal.trend_mode:
+                    also_note = "\n\n_Note: this was also a trend-aligned flip setup — would have been alert-only for that reason too, independent of the hard-rule rejection above._"
+                elif signal.counter_trend:
+                    also_note = "\n\n_Note: this setup also fights today's trend bias — would have been alert-only as counter-trend too, independent of the hard-rule rejection above._"
+
+                logger.info(f"{symbol} | {signal.side} setup REJECTED — {signal.reject_reason} — alert only"
+                           f"{' (also counter-trend/flip)' if also_note else ''}")
+                await self.telegram.send_alert(
+                    f"🚫 *Setup Rejected — Hard Rule*\n\n"
+                    f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
+                    f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
+                    f"*Level swept:* {signal.swept_level:.4f}\n\n"
+                    f"*Reason:* {signal.reject_reason}\n\n"
+                    f"No auto-entry executed. This setup was rejected by a hard rule, not by "
+                    f"trend/stability routing — review manually on CoinDCX if you disagree."
+                    f"{also_note}"
+                )
+            elif level and level.auto_traded_today:
+                logger.info(f"{symbol} | Fresh {signal.side} setup, but today's auto-trade "
+                           f"already used — alert only")
+                await self.telegram.send_alert(
+                    f"⚠️ *New Liquidity Setup Detected*\n\n"
+                    f"*Symbol:* {symbol}\n"
+                    f"*Time:* {datetime.now(IST).strftime('%H:%M IST')}\n"
+                    f"*Direction:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
+                    f"*Entry:* {signal.entry_price:.4f}\n"
+                    f"*SL:* {signal.sl_price:.4f}\n"
+                    f"*Level swept:* {signal.swept_level:.4f}\n\n"
+                    f"*Reason:* This symbol's one automatic trade for today has already been used.\n\n"
+                    f"No auto-entry executed. Review and enter manually on CoinDCX if you agree."
+                )
+            elif self.risk.halted and not self.risk.halt_alerted:
+                # One alert when the halt first bites; later blocked setups
+                # the same day are log-only (the DECISION line above).
+                self.risk.halt_alerted = True
+                self.risk._save()
+                await self.telegram.send_alert(
+                    f"🛑 *Daily Loss Limit Reached*\n\n"
+                    f"Realised P&L today: *${self.risk.realised_usd:+.2f}* "
+                    f"(limit -${DAILY_LOSS_LIMIT_USD:.2f} / ₹{DAILY_LOSS_LIMIT_INR}).\n\n"
+                    f"No new entries until the 05:30 IST reset. Open positions "
+                    f"are still managed to their SL/TP."
+                )
             return
 
-        if level and level.auto_traded_today:
-            logger.info(f"{symbol} | Fresh {signal.side} setup, but today's auto-trade "
-                       f"already used — alert only")
-            await self.telegram.send_alert(
-                f"⚠️ *New Liquidity Setup Detected*\n\n"
-                f"*Symbol:* {symbol}\n"
-                f"*Time:* {datetime.now(IST).strftime('%H:%M IST')}\n"
-                f"*Direction:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n"
-                f"*SL:* {signal.sl_price:.4f}\n"
-                f"*Level swept:* {signal.swept_level:.4f}\n\n"
-                f"*Reason:* This symbol's one automatic trade for today has already been used.\n\n"
-                f"No auto-entry executed. Review and enter manually on CoinDCX if you agree."
-            )
-            return
-
-        # 2026-08-20: Fix 3 (staged entry for counter-trend) was built and
-        # tested, but parked per explicit decision -- the "good run since
-        # Friday" contains zero real counter-trend trades, so unlike Fix 1
-        # and Fix 2, this one has no track record to lean on at all.
-        # Reverted to the original full alert-only block until revisited.
-        if level.counter_trend_confirms >= STABILITY_MAX_COUNTER_CONFIRMS:
-            logger.info(f"{symbol} | {signal.side} setup — {level.counter_trend_confirms} "
-                       f"counter-trend confirmations already seen today, day's "
-                       f"{level.trend_bias} classification no longer trusted — alert only")
-            await self.telegram.send_alert(
-                f"⚠️ *New Liquidity Setup Detected*\n\n"
-                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"*Level swept:* {signal.swept_level:.4f}\n\n"
-                f"*Reason:* This symbol has had {level.counter_trend_confirms} counter-trend "
-                f"confirmations today — today's {level.trend_bias} bias is no longer treated "
-                f"as reliable. No auto-entry executed."
-            )
-            return
-
-        if signal.counter_trend:
-            logger.info(f"{symbol} | {signal.side} setup fights today's {level.trend_bias} "
-                       f"bias — alert only")
-            await self.telegram.send_alert(
-                f"⚠️ *New Liquidity Setup Detected*\n\n"
-                f"*Symbol:* {symbol}\n*Direction:* {'📈 LONG' if signal.side=='BUY' else '📉 SHORT'}\n"
-                f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"*Level swept:* {signal.swept_level:.4f}\n\n"
-                f"*Reason:* Today's bias is {level.trend_bias} — this setup fights that bias. "
-                f"No auto-entry executed."
-            )
-            return
-
-        regime = self.state.get_regime()
-        btc_counter = (signal.side == 'BUY' and regime == 'BEARISH') or \
-                      (signal.side == 'SELL' and regime == 'BULLISH')
-        if btc_counter:
-            # 2026-09-20: was informational-only ("proceeding with entry"
-            # regardless). Made a genuine block per explicit request,
-            # mirroring the trend_bias block above exactly. Evidence:
-            # every SHORT this week fired into BULLISH regime; the
-            # earlier full regime backtest showed SHORT+BULLISH at
-            # -₹46,679 across 417 trades. LONG+BEARISH gated too for
-            # symmetry -- weaker evidence on that side (n=60, -₹5,178)
-            # but the same directional sign, and gating only one side
-            # of a symmetric check has no principled justification.
-            # Log-only, no Telegram alert, per explicit request.
-            logger.info(f"{symbol} | {signal.side} setup BLOCKED — BTC regime is {regime}, "
-                       f"fights this trade's direction — alert only, no auto-entry")
+        # Context Agent — trend stability, trend bias, BTC regime. LOG ONLY.
+        v = record.add(context_agent.evaluate(signal, level, self.state.get_regime(),
+                                              STABILITY_MAX_COUNTER_CONFIRMS))
+        if not v.approved:
+            logger.info(f"{symbol} | {signal.side} setup BLOCKED by Context — {v.reason} "
+                       f"— log only, no auto-entry")
+            record.log("NO TRADE")
             return
 
         async with self._position_lock:
             open_count = len(self._open_positions)
-            if open_count >= MAX_CONCURRENT_POSITIONS:
+            v = record.add(self.risk.concurrency(open_count, MAX_CONCURRENT_POSITIONS))
+            if not v.approved:
+                record.log("NO TRADE")
                 logger.info(f"SKIPPED {symbol} — {open_count}/{MAX_CONCURRENT_POSITIONS} positions already open")
                 await self.telegram.send_alert(
                     f"⏭️ *Setup Skipped* — Max concurrent positions reached ({open_count}/{MAX_CONCURRENT_POSITIONS})\n\n"
@@ -1331,24 +1307,30 @@ class MarketMonitor:
             # REPLACES the earlier %-distance-based use_staged_entry value
             # from the strategy engine -- signal.use_staged_entry is
             # overwritten below to reflect the INR-based decision instead.
-            _risk_per_unit = abs(signal.entry_price - signal.sl_price)
-            _risk_usd_at_full_size = (_risk_per_unit / signal.entry_price) * margin_usd * TRADE_LEVERAGE
-            _risk_inr_at_full_size = _risk_usd_at_full_size * USD_TO_INR_RATE
+            _tier, _risk_usd_at_full_size, _risk_inr_at_full_size = RiskAgent.inr_tier(
+                signal.entry_price, signal.sl_price, margin_usd, TRADE_LEVERAGE,
+                SL_RISK_FULL_SIZE_MAX_INR, SL_RISK_STAGED_MAX_INR, USD_TO_INR_RATE)
 
-            if _risk_inr_at_full_size > SL_RISK_STAGED_MAX_INR:
+            if _tier == "SKIP":
+                record.add(Verdict("Risk", False, f"INR tier SKIP ₹{_risk_inr_at_full_size:.0f}"))
+                record.log("NO TRADE")
                 logger.info(f"{symbol} | SKIPPED (INR risk tier) — full-size SL risk would be "
                            f"₹{_risk_inr_at_full_size:.0f} (${_risk_usd_at_full_size:.2f}), "
                            f"above the ₹{SL_RISK_STAGED_MAX_INR} ceiling. Recorded only, no order "
                            f"placed. Entry:{signal.entry_price:.4f} SL:{signal.sl_price:.4f}")
                 self._open_positions.pop(symbol, None)
                 return
-            elif _risk_inr_at_full_size >= SL_RISK_FULL_SIZE_MAX_INR:
+            elif _tier == "STAGED":
                 signal.use_staged_entry = True
+                record.add(Verdict("Risk", True, f"INR tier STAGED ₹{_risk_inr_at_full_size:.0f}"))
+                record.log("TRADE (staged 50%)")
                 logger.info(f"{symbol} | INR risk tier: STAGED 50% — full-size SL risk would be "
                            f"₹{_risk_inr_at_full_size:.0f} (${_risk_usd_at_full_size:.2f}), "
                            f"between ₹{SL_RISK_FULL_SIZE_MAX_INR}-{SL_RISK_STAGED_MAX_INR}")
             else:
                 signal.use_staged_entry = False
+                record.add(Verdict("Risk", True, f"INR tier FULL ₹{_risk_inr_at_full_size:.0f}"))
+                record.log("TRADE (full size)")
                 logger.info(f"{symbol} | INR risk tier: FULL SIZE — SL risk ₹{_risk_inr_at_full_size:.0f} "
                            f"(${_risk_usd_at_full_size:.2f}), below ₹{SL_RISK_FULL_SIZE_MAX_INR}")
 
@@ -1358,11 +1340,6 @@ class MarketMonitor:
                           if signal.trend_mode else
                           f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}")
 
-            # 2026-09-08: sweep_char removed from this alert per explicit
-            # request -- the HUNT/BREAKOUT RISK classification is already
-            # logged independently at sweep-arm time in strategy.py
-            # (see logger.info calls there), so nothing is lost, this just
-            # stops it appearing in the Telegram trade alert.
 
             await self.telegram.send_alert(
                 f"🔍 *Setup Detected*\n\n"
@@ -1439,6 +1416,7 @@ class MarketMonitor:
                         tr["tp2_filled"] = False
                         tr["tp1_weight"], tr["tp2_weight"], tr["tp3_weight"] = TP_LADDER_WEIGHTS
 
+                tr["qty_open"] = quantity_filled
                 self._trailing[symbol] = tr
                 self._open_positions[symbol] = quantity_filled
                 persistence.log_trade_event({
