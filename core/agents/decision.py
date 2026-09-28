@@ -3,7 +3,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-logger = logging.getLogger("decision")
+from utils.logger import setup_logger
+logger = setup_logger("decision")   # bot's own logger -> visible in Railway
 
 
 @dataclass
