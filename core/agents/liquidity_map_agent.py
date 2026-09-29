@@ -178,6 +178,7 @@ class LiquidityMapAgent:
         sig.pattern = f"Liquidity Map — proven level (respected {len(v['touch'])}x)"
         sig.source = "pool"          # own daily slot, like the pool agent
         sig.simple_exit = True       # SL / next-pool target only, as tested
+        sig.skip_context = True      # tested without trend/regime blocks
         sig.liqmap_story = story
         sig.liqmap_pools = pools[:3]
         logger.info(f"{symbol} | LIQMAP {side} SIGNAL — {story} | target pool {tp:.6g} "
