@@ -123,7 +123,8 @@ class RiskAgent:
         """Checks that run BEFORE the Context Agent (same order as before)."""
         if signal.reject_reason:
             return Verdict(AGENT, False, f"hard rule: {signal.reject_reason}")
-        if level and level.auto_traded_today:
+        # Pool-agent signals have their own daily slot (tracked in pool_agent.py)
+        if level and level.auto_traded_today and getattr(signal, 'source', '') != 'pool':
             return Verdict(AGENT, False, "today's auto-trade for this symbol already used")
         if self.halted:
             return Verdict(AGENT, False,
