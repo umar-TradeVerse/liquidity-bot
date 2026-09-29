@@ -58,6 +58,7 @@ from core.obi import compute_obi, summarise_book
 from core.agents import context_agent
 from core.agents.pattern_agent import PatternAgent, build_features
 from core.agents.pool_agent import PoolAgent
+from core.agents.liquidity_map_agent import LiquidityMapAgent
 from core.agents.decision import DecisionRecord, Verdict
 from core.agents.risk_agent import RiskAgent, DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_INR
 from utils.logger import setup_logger
@@ -278,6 +279,8 @@ class MarketMonitor:
         self._offhours_logged = False
         # Liquidity Pool Agent (equal highs/lows, session highs/lows) — separate sub-agent
         self.pool_agent = PoolAgent(coindcx, float(os.getenv('TRADE_SIZE_USD', 40)), TRADE_LEVERAGE)
+        # Liquidity Map Agent (proven-level sweeps) — separate sub-agent
+        self.liqmap = LiquidityMapAgent(coindcx)
         self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
         self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
@@ -647,6 +650,18 @@ class MarketMonitor:
             except Exception as e:
                 logger.error(f"{symbol} | Pool agent error (main flow unaffected): {e}", exc_info=True)
 
+            # ── Liquidity Map Agent (separate sub-agent, 2026-09-30) ───────
+            # Same isolation as the pool agent: own try, never affects the
+            # main flow; live signals use the full safety chain.
+            try:
+                for msig in await self.liqmap.on_candle(symbol, candle, self.state.levels.get(symbol)):
+                    if symbol in self._trailing:
+                        logger.info(f"{symbol} | LIQMAP signal skipped — symbol already in a trade")
+                        break
+                    await self._handle_signal(msig)
+            except Exception as e:
+                logger.error(f"{symbol} | Liquidity map error (main flow unaffected): {e}", exc_info=True)
+
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
 
@@ -990,6 +1005,21 @@ class MarketMonitor:
             return
 
         side = tr["side"]
+
+        # 2026-09-30: Liquidity Map trades use the SIMPLE exit they were
+        # tested with -- stop at the sweep extreme, target at the next pool.
+        # No breakeven, trailing, TP ladder, staged add or early failure.
+        # (SL and TP are also set on the exchange; this is the bot-side check.)
+        if tr.get("simple_exit"):
+            sl_hit = candle['low'] <= tr["live_sl"] if side == 'BUY' else candle['high'] >= tr["live_sl"]
+            tp_hit = candle['high'] >= tr["tp"] if side == 'BUY' else candle['low'] <= tr["tp"]
+            if sl_hit:
+                await self._exit_position(symbol, tr, exit_price=tr["live_sl"], reason="sl_hit",
+                                          label="Stop Loss Hit (Liquidity Map)")
+            elif tp_hit:
+                await self._exit_position(symbol, tr, exit_price=tr["tp"], reason="target_achieved",
+                                          label="Take Profit — next liquidity pool reached")
+            return
 
         # Track max favorable / max adverse excursion every candle, regardless
         # of exit priority outcome below — this is what makes the "if I'd
@@ -1436,7 +1466,11 @@ class MarketMonitor:
                 f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}"
                 f"{' — STAGED ENTRY (wide SL, 50% initial)' if signal.use_staged_entry else ''}\n"
                 f"*Entry:* {signal.entry_price:.4f}\n*SL:* {signal.sl_price:.4f}\n"
-                f"{level_line}{trend_line}\n\n⏳ Placing order..."
+                f"{level_line}{trend_line}"
+                + (f"\n*Why:* {signal.liqmap_story}\n*Target pool:* "
+                   f"{', '.join(f'{p:.6g}' for p in signal.liqmap_pools)}"
+                   if getattr(signal, 'liqmap_story', None) else "")
+                + "\n\n⏳ Placing order..."
             )
 
             # 2026-08-15: SL distance beyond MAX_SL_DISTANCE_PCT no longer
@@ -1466,7 +1500,7 @@ class MarketMonitor:
                 # committed to attempting this order — see the Rule 10 fix
                 # comment there. Not repeated here anymore.
 
-                tp_price = signal.pdh if signal.side == 'BUY' else signal.pdl
+                tp_price = getattr(signal, 'target', None) or (signal.pdh if signal.side == 'BUY' else signal.pdl)
                 opened_at_ist = datetime.now(IST).isoformat()
                 risk = abs(signal.entry_price - signal.sl_price)
 
@@ -1476,6 +1510,7 @@ class MarketMonitor:
                       "breakeven_moved": False,
                       "breakeven_stage1_moved": False,
                       "tp": tp_price,
+                      "simple_exit": getattr(signal, "simple_exit", False),
                       "trend_mode": signal.trend_mode,
                       "opened_at": opened_at_ist,
                       "mfe": signal.entry_price, "mae": signal.entry_price,
@@ -1489,7 +1524,7 @@ class MarketMonitor:
                 # closer than the original single target (tp_price). If TP1
                 # would already be beyond that target, skip the ladder
                 # entirely for this trade — it behaves exactly as before.
-                if not signal.trend_mode and risk > 0:
+                if not signal.trend_mode and risk > 0 and not getattr(signal, 'simple_exit', False):
                     candidate_prices = []
                     for r in TP_LADDER_R:
                         p = (signal.entry_price + r * risk if signal.side == 'BUY'
