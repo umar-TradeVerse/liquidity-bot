@@ -1350,8 +1350,15 @@ class MarketMonitor:
             return
 
         # Context Agent — trend stability, trend bias, BTC regime. LOG ONLY.
-        v = record.add(context_agent.evaluate(signal, level, self.state.get_regime(),
-                                              STABILITY_MAX_COUNTER_CONFIRMS))
+        # 2026-09-30: Liquidity Map signals skip Context. They were tested
+        # WITHOUT these blocks, and Context would have removed 59 of 183
+        # replay trades worth +Rs10,392 (29% win rate vs 20% for the rest):
+        # a proven level being swept often marks a turn AGAINST the trend.
+        if getattr(signal, "skip_context", False):
+            v = record.add(Verdict("Context", True, "skipped — Liquidity Map trades by level history"))
+        else:
+            v = record.add(context_agent.evaluate(signal, level, self.state.get_regime(),
+                                                  STABILITY_MAX_COUNTER_CONFIRMS))
         if not v.approved:
             logger.info(f"{symbol} | {signal.side} setup BLOCKED by Context — {v.reason} "
                        f"— log only, no auto-entry")
