@@ -57,6 +57,7 @@ from core import persistence
 from core.obi import compute_obi, summarise_book
 from core.agents import context_agent
 from core.agents.pattern_agent import PatternAgent, build_features
+from core.agents.pool_agent import PoolAgent
 from core.agents.decision import DecisionRecord, Verdict
 from core.agents.risk_agent import RiskAgent, DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_INR
 from utils.logger import setup_logger
@@ -275,6 +276,8 @@ class MarketMonitor:
         self._trailing: dict = {}
         self.risk = RiskAgent()   # multi-agent: owns daily loss halt
         self._offhours_logged = False
+        # Liquidity Pool Agent (equal highs/lows, session highs/lows) — separate sub-agent
+        self.pool_agent = PoolAgent(coindcx, float(os.getenv('TRADE_SIZE_USD', 40)), TRADE_LEVERAGE)
         self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
         self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
@@ -627,6 +630,22 @@ class MarketMonitor:
 
             if signal:
                 await self._handle_signal(signal)
+
+            # ── Liquidity Pool Agent (separate sub-agent, 2026-09-29) ──────
+            # Runs AFTER the main strategy, in its own try, so it can never
+            # break or delay the existing flow. Live pool signals go through
+            # the same full Risk -> Context -> Pattern -> INR -> execution
+            # chain as main-strategy signals.
+            try:
+                pool_signals = await self.pool_agent.on_candle(
+                    symbol, candle, self.state.levels.get(symbol))
+                for psig in pool_signals:
+                    if symbol in self._trailing:
+                        logger.info(f"{symbol} | POOL signal skipped — symbol already in a trade")
+                        break
+                    await self._handle_signal(psig)
+            except Exception as e:
+                logger.error(f"{symbol} | Pool agent error (main flow unaffected): {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
@@ -1272,7 +1291,7 @@ class MarketMonitor:
                     f"trend/stability routing — review manually on CoinDCX if you disagree."
                     f"{also_note}"
                 )
-            elif level and level.auto_traded_today:
+            elif level and level.auto_traded_today and getattr(signal, 'source', '') != 'pool':
                 logger.info(f"{symbol} | Fresh {signal.side} setup, but today's auto-trade "
                            f"already used — alert only")
                 await self.telegram.send_alert(
@@ -1369,7 +1388,8 @@ class MarketMonitor:
             # because every one of them failed and none ever marked the
             # day as used. This now fires regardless of what happens next,
             # matching what "one attempt per day" actually means.
-            self.state.mark_auto_traded(symbol)
+            if getattr(signal, 'source', '') != 'pool':   # pool trades use their own daily slot
+                self.state.mark_auto_traded(symbol)
 
             # 2026-09-14: INR risk-tier gate. Computed once, here, so both
             # the alert text below and the actual sizing agree. This
