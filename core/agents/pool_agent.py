@@ -19,7 +19,7 @@ Flow per pool (same shape the backtest used, 2026-09-29):
 
 Modes, set per pool with Railway variables (live / shadow / off):
   POOL_EQUAL_MODE    default live
-  POOL_SESSION_MODE  default shadow
+  POOL_SESSION_MODE  default live
 LIVE signals are returned to the monitor and go through the full existing
 Risk -> Context -> Pattern -> INR tier -> execution chain. SHADOW signals
 place nothing: the agent tracks them on real candles and logs the result.
@@ -42,7 +42,7 @@ logger = setup_logger("pool_agent")
 
 POOL_MODES = {
     "EQUAL": os.getenv("POOL_EQUAL_MODE", "live").strip().lower(),
-    "SESSION": os.getenv("POOL_SESSION_MODE", "shadow").strip().lower(),
+    "SESSION": os.getenv("POOL_SESSION_MODE", "live").strip().lower(),   # default live (2026-09-30)
 }
 PATTERN_NAMES = {"EQUAL": "Equal Highs/Lows", "SESSION": "Session High/Low (Asia range)"}
 
