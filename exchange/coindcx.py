@@ -5,7 +5,6 @@ Single order placement with integrated stop_loss_price (no separate SL order).
 """
 
 import asyncio
-import logging
 import math
 import time
 import hmac
@@ -364,62 +363,6 @@ class CoinDCXClient:
             return None
 
         return {"bids": bids, "asks": asks, "timestamp": result.get("timestamp")}
-
-
-        """
-        Returns the last n COMPLETE daily candles (today's in-progress candle
-        excluded), oldest first, for multi-day trend classification. Reuses
-        the same endpoint/params as get_previous_day_candle rather than making
-        a second kind of call — just keeps more of the response instead of
-        discarding everything but "yesterday".
-        """
-        coindcx_symbol = SYMBOL_MAP.get(symbol)
-        if not coindcx_symbol:
-            logger.error(f"Unknown symbol: {symbol}")
-            return []
-
-        now_ist = datetime.now(IST)
-        start_ts = int((now_ist - timedelta(days=15)).timestamp() * 1000)
-        end_ts = int(now_ist.timestamp() * 1000)
-
-        params = {
-            "pair": coindcx_symbol,
-            "interval": "1d",
-            "from": start_ts,
-            "to": end_ts,
-            "limit": 20
-        }
-
-        result = await self._get("/market_data/candles", params=params)
-        if not result or not isinstance(result, list) or len(result) == 0:
-            logger.error(f"{symbol} | No daily candle data returned for trend classification")
-            return []
-
-        today_date = now_ist.date()
-        parsed = []
-        for c in result:
-            try:
-                c_date = datetime.fromtimestamp(int(c["time"]) / 1000, IST).date()
-                if c_date >= today_date:
-                    continue  # exclude today's still-forming candle
-                parsed.append({
-                    "date": c_date,
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                })
-            except (KeyError, ValueError, TypeError):
-                continue
-
-        parsed.sort(key=lambda c: c["date"])
-        recent = parsed[-n:] if len(parsed) >= n else parsed
-
-        if len(recent) < n:
-            logger.warning(f"{symbol} | Only {len(recent)}/{n} complete daily candles "
-                           f"available for trend classification")
-
-        return recent
 
     async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
         if coindcx_symbol in self._instrument_cache:
