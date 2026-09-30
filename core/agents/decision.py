@@ -1,5 +1,4 @@
 """One auditable decision record per proposed setup."""
-import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
