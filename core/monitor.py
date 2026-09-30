@@ -286,6 +286,7 @@ class MarketMonitor:
         self._position_lock = asyncio.Lock()
         self._loops_since_save = 0
         self._SAVE_EVERY_N_LOOPS = 4  # ~1 minute at POLL_INTERVAL_SECONDS=15
+        self._saved_open = None       # open symbols in the last saved snapshot
         self._orphan_alerted: set = set()  # symbols already flagged this run —
 
     def restore_trailing(self, trailing: dict):
@@ -297,6 +298,17 @@ class MarketMonitor:
         self._trailing = trailing or {}
         if self._trailing:
             logger.info(f"Restored trailing state for: {list(self._trailing.keys())}")
+
+    def _save_if_positions_changed(self):
+        """2026-10-01 fix: save the snapshot IMMEDIATELY whenever a position
+        opens or closes. Previously a trade that closed overnight left the
+        old snapshot (still showing it open) on disk; each later restart
+        'rediscovered' the close and booked its P&L again."""
+        now_open = sorted(self._trailing.keys())
+        if now_open != self._saved_open:
+            persistence.save_state(self.state, self._trailing)
+            self._saved_open = now_open
+            self._loops_since_save = 0
 
     def _is_trading_hours(self) -> bool:
         now = datetime.now(IST)
@@ -331,8 +343,10 @@ class MarketMonitor:
                         if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
                             persistence.save_state(self.state, self._trailing)
                             self._loops_since_save = 0
+                        self._save_if_positions_changed()
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     else:
+                        self._save_if_positions_changed()
                         await asyncio.sleep(60)
                     continue
                 self._offhours_logged = False
@@ -358,6 +372,7 @@ class MarketMonitor:
                 if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
                     persistence.save_state(self.state, self._trailing)
                     self._loops_since_save = 0
+                self._save_if_positions_changed()
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}", exc_info=True)
@@ -418,8 +433,13 @@ class MarketMonitor:
         try:
             _q = qty if qty is not None else tr.get("qty_open")
             _closed_ms = tr.get("_last_fill_ts") if event_type == "close" else None
+            # A trade is identified by symbol + its open time; partial closes
+            # also by their reason. Same key again = duplicate -> ignored.
+            _key = f"{symbol}|{tr.get('opened_at')}|{event_type}|{reason if event_type != 'close' else ''}"
             _net = self.risk.record_close(symbol, tr.get("side"), tr.get("entry"), exit_price, _q,
-                                          closed_at_ms=_closed_ms)
+                                          closed_at_ms=_closed_ms, key=_key)
+            if _net is None:
+                return   # duplicate: not re-booked, not re-learned, not re-logged
             tr["realised_usd"] = tr.get("realised_usd", 0.0) + _net
             # Pattern memory learns from each FULLY closed real trade:
             # win = the trade's total realised result (partials included) > 0
