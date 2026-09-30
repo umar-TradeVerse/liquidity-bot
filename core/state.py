@@ -1,7 +1,7 @@
 """
 BotState — single source of truth for daily levels and per-symbol setup state.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 from datetime import date
 import threading
