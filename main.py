@@ -4,7 +4,6 @@ Liquidity Strategy Bot — CoinDCX
 Entry point: starts scheduler + monitoring loop
 """
 import asyncio
-import logging
 import sys
 import os
 from typing import Optional
