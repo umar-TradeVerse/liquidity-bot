@@ -92,7 +92,6 @@ breakout logic of any kind — this engine only ever trades liquidity
 sweeps, on either the fixed daily level or a trend-re-anchored one.
 """
 
-import logging
 from typing import Optional
 from core.state import BotState, SYMBOLS, REGIME_SYMBOL
 from exchange.coindcx import CoinDCXClient
