@@ -1013,9 +1013,16 @@ class MarketMonitor:
         if tr.get("simple_exit"):
             sl_hit = candle['low'] <= tr["live_sl"] if side == 'BUY' else candle['high'] >= tr["live_sl"]
             tp_hit = candle['high'] >= tr["tp"] if side == 'BUY' else candle['low'] <= tr["tp"]
+            lvl = tr.get("invalidate_level")
+            closed_through = lvl is not None and (
+                candle['close'] < lvl if side == 'BUY' else candle['close'] > lvl)
             if sl_hit:
                 await self._exit_position(symbol, tr, exit_price=tr["live_sl"], reason="sl_hit",
-                                          label="Stop Loss Hit (Liquidity Map)")
+                                          label="Hard Stop Hit (Liquidity Map)")
+            elif closed_through:
+                await self._exit_position(symbol, tr, exit_price=candle['close'], reason="level_invalidated",
+                                          label=f"Level broken — candle closed "
+                                                f"{'below' if side == 'BUY' else 'above'} {lvl:.6g} (Liquidity Map)")
             elif tp_hit:
                 await self._exit_position(symbol, tr, exit_price=tr["tp"], reason="target_achieved",
                                           label="Take Profit — next liquidity pool reached")
@@ -1518,6 +1525,7 @@ class MarketMonitor:
                       "breakeven_stage1_moved": False,
                       "tp": tp_price,
                       "simple_exit": getattr(signal, "simple_exit", False),
+                      "invalidate_level": getattr(signal, "invalidate_level", None),
                       "trend_mode": signal.trend_mode,
                       "opened_at": opened_at_ist,
                       "mfe": signal.entry_price, "mae": signal.entry_price,
