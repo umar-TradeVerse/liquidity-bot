@@ -15,7 +15,12 @@ No fixed sweep-depth percentage: the level's own history decides.
   SWEPT     wick through the level, close back on its side. If the level
             was respected >= MIN_RESPECTED times -> trade signal.
   BROKEN    candle CLOSES beyond the level -> level retired (accepted).
-  ENTRY     close of the sweep candle.   SL: the sweep extreme.
+  ENTRY     close of the sweep candle.
+  EXIT      a candle CLOSING back beyond the swept level (option 2, chosen
+            2026-09-30). Hard stop on the exchange at the next liquidity
+            level beyond the sweep (fallback: same distance again past the
+            sweep extreme). Tested -Rs3,133 vs +Rs21,077 for the sweep-candle
+            stop over 10 weeks; chosen deliberately -- revert if live agrees.
   TARGET    the nearest still-active opposite-side level (the next pool).
             Trade only if that pool is at least 1R away.
   EXITS     SIMPLE, as tested: SL or target only (no breakeven, trail, TP
@@ -156,13 +161,25 @@ class LiquidityMapAgent:
 
     def _build(self, symbol, v, c, side, L):
         e = c["close"]
-        sl = c["low"] if side == "BUY" else c["high"]
+        sweep = c["low"] if side == "BUY" else c["high"]
+        # 2026-09-30 (option 2): invalidation is a CLOSE back beyond the swept
+        # level, not a wick -- a wick through is still the hunt. The hard stop
+        # (placed on the exchange for safety) sits at the next liquidity level
+        # beyond the sweep; if none exists, the same distance again past the
+        # sweep extreme.
+        deeper = [x["p"] for x in L if x is not v and x["k"] == ("low" if side == "BUY" else "high")
+                  and ((x["p"] < sweep) if side == "BUY" else (x["p"] > sweep))]
+        if deeper:
+            sl = max(deeper) if side == "BUY" else min(deeper)
+        else:
+            sl = sweep - (e - sweep) if side == "BUY" else sweep + (sweep - e)
         pools = sorted((x["p"] for x in L if x["k"] == ("high" if side == "BUY" else "low")
                         and x is not v and ((x["p"] > e) if side == "BUY" else (x["p"] < e))),
                        reverse=(side == "SELL"))
         story = (f"level {v['p']:.6g} formed {_ist(v['t'])}, respected {len(v['touch'])}x "
                  f"({', '.join(_ist(t) for t in v['touch'][-3:])}), swept {_ist(c['time'])} "
-                 f"to {sl:.6g}, closed back {e:.6g}")
+                 f"to {sweep:.6g}, closed back {e:.6g} | exit on a close "
+                 f"{'below' if side == 'BUY' else 'above'} {v['p']:.6g}, hard stop {sl:.6g}")
         if not pools:
             logger.info(f"{symbol} | LIQMAP {side} skipped — {story} — no pool ahead to target")
             return None
@@ -177,7 +194,8 @@ class LiquidityMapAgent:
         sig.target = tp              # next pool; monitor uses this as the TP
         sig.pattern = f"Liquidity Map — proven level (respected {len(v['touch'])}x)"
         sig.source = "pool"          # own daily slot, like the pool agent
-        sig.simple_exit = True       # SL / next-pool target only, as tested
+        sig.simple_exit = True       # hard SL / close-invalidation / next-pool target
+        sig.invalidate_level = v["p"]  # exit on a candle CLOSE beyond this level
         sig.skip_context = True      # tested without trend/regime blocks
         sig.liqmap_story = story
         sig.liqmap_pools = pools[:3]
