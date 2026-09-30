@@ -22,7 +22,7 @@ setups) + PERSIST_DIR/pattern_memory.jsonl (every real closed trade,
 appended automatically). Winner patterns are tracked for information
 only and can never create or force a trade.
 """
-import itertools, json, logging, os
+import itertools, json, os
 from datetime import datetime, timezone
 from core.agents.decision import Verdict
 
