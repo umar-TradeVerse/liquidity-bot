@@ -1610,9 +1610,9 @@ class MarketMonitor:
                     tp_note = (f"🎯 Resting take-profit (dead-man's-switch) set at {tp_price:.4f} — "
                               f"fires if the bot itself ever goes down before managing exits."
                               if tp_set else
-                              f"⚠️ Could not set the resting take-profit safety order — the bot's own "
-                              f"candle-by-candle logic will still enforce all exits, but there's no "
-                              f"exchange-side backstop if the bot is down. Check CoinDCX manually if concerned.")
+                              "⚠️ Could not set the resting take-profit safety order — the bot's own "
+                              "candle-by-candle logic will still enforce all exits, but there's no "
+                              "exchange-side backstop if the bot is down. Check CoinDCX manually if concerned.")
 
                     if "tp1_price" in tr:
                         tp_lines = (f"*TP1:* {tr['tp1_price']:.4f} (34%)\n"
