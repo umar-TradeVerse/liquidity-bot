@@ -46,6 +46,7 @@ class RiskAgent:
         self.day = trading_day()
         self.realised_usd = 0.0
         self.halt_alerted = False
+        self.seen = []            # keys of closes already booked (any day)
         self._load()
 
     # ── persistence ───────────────────────────────────────────────────
@@ -53,6 +54,7 @@ class RiskAgent:
         try:
             with open(_PNL_PATH) as f:
                 d = json.load(f)
+            self.seen = list(d.get("seen", []))
             if d.get("day") == self.day:
                 self.realised_usd = float(d.get("realised_usd", 0.0))
                 self.halt_alerted = bool(d.get("halt_alerted", False))
@@ -67,7 +69,7 @@ class RiskAgent:
             os.makedirs(_PERSIST_DIR, exist_ok=True)
             with open(_PNL_PATH, "w") as f:
                 json.dump({"day": self.day, "realised_usd": round(self.realised_usd, 4),
-                           "halt_alerted": self.halt_alerted}, f)
+                           "halt_alerted": self.halt_alerted, "seen": self.seen}, f)
         except Exception as e:
             logger.error(f"Could not write {_PNL_PATH}: {e}")
 
@@ -81,7 +83,7 @@ class RiskAgent:
 
     # ── P&L recording ─────────────────────────────────────────────────
     def record_close(self, symbol: str, side: str, entry, exit_price, qty,
-                     closed_at_ms=None) -> float:
+                     closed_at_ms=None, key=None):
         """Record one realised close (full or partial). Returns net USD.
 
         closed_at_ms: the exchange fill time. If the close actually happened
@@ -89,6 +91,13 @@ class RiskAgent:
         it is NOT added to today's total -- so an old loss can never push
         today's daily halt. (2026-09-28, fix B)"""
         self._roll()
+        # 2026-10-01 fix: the same close must never be booked twice (seen
+        # after restarts replaying an out-of-date snapshot). Returns None.
+        if key and key in self.seen:
+            logger.info(f"{symbol} | Daily P&L: duplicate close ignored ({key})")
+            return None
+        if key and entry and exit_price and qty and qty > 0:
+            self.seen.append(key); self.seen = self.seen[-300:]
         close_day = None
         if closed_at_ms:
             try:
