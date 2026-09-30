@@ -18,7 +18,6 @@ Daily loss halt (added 2026-09-28):
     mid-day cannot reset the counter.
 """
 import json
-import logging
 import os
 from datetime import datetime, timezone
 
