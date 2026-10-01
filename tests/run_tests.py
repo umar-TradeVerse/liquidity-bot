@@ -299,6 +299,37 @@ def off_hours_manages_but_never_enters():
 
 
 @test
+def trend_trail_no_same_candle_exit():
+    """Regression: 01-Oct XRPUSD. A candle must never hit the trail it just
+    created (its low came BEFORE its high). Exit only on a later candle."""
+    m = make_monitor(symbol="XRPUSD", pdh=1.5443, pdl=1.4852)
+
+    class X(FakeExchange):
+        async def update_stop_loss(self, sym, new_sl_price=None):
+            return True
+
+        async def get_open_positions(self):
+            return {"XRPUSD": 100.0}
+
+        async def get_position_details(self, sym):
+            return {"roe": 0.0}
+    m.coindcx = X()
+    m._trailing["XRPUSD"] = {"side": "BUY", "entry": 1.4814, "sl": 1.4744, "live_sl": 1.4744,
+                             "mfe": 1.4814, "tp": 1.5443, "qty_open": 100, "opened_at": "t"}
+    m._open_positions["XRPUSD"] = 100
+
+    async def go():
+        await m._check_exit_conditions("XRPUSD", {"open": 1.4814, "high": 1.4923, "low": 1.4810,
+                                                  "close": 1.4918, "time": 1}, None)
+        check("XRPUSD" in m._trailing, "exited on the same candle that set the trail (look-ahead bug)")
+        check(abs(m._trailing["XRPUSD"].get("trail_sl", 0) - 1.4902) < 1e-4, "trail not set to 1.4902")
+        await m._check_exit_conditions("XRPUSD", {"open": 1.4918, "high": 1.4920, "low": 1.4895,
+                                                  "close": 1.4900, "time": 2}, None)
+        check("XRPUSD" not in m._trailing, "a later candle through the trail must exit")
+    run(go())
+
+
+@test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
     import core.agents.liquidity_map_agent as LM
