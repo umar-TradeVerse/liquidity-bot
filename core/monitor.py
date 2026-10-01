@@ -924,12 +924,23 @@ class MarketMonitor:
         if mfe_R < TREND_TRAIL_ACTIVATE_R:
             return  # not yet earned trailing -- stage-2 ratchet already covers this trade
 
+        # 2026-10-02 FIX (look-ahead bug): the high-water mark already includes
+        # THIS candle's high, so a trail built from it and then tested against
+        # this same candle's low was "hit" by moves that happened BEFORE the
+        # high (e.g. XRPUSD 01-Oct 10:45 pm: O 1.4814 L 1.4810 H 1.4923
+        # C 1.4918 -> exited at 1.4902 although price never came back down).
+        # Now a candle can only hit a trail that existed BEFORE it formed;
+        # a new trail level takes effect from the next candle (and is sent
+        # to the exchange immediately, which enforces it in real time).
+        prev_trail = tr.get('trail_sl')
+        hit = prev_trail is not None and (
+            (candle['low'] <= prev_trail) if side == 'BUY' else (candle['high'] >= prev_trail))
         trail_sl = mfe - TREND_TRAIL_BUFFER_R * risk if side == 'BUY' else mfe + TREND_TRAIL_BUFFER_R * risk
         current_live_sl = tr.get('live_sl', sl)
         improved = (trail_sl > current_live_sl) if side == 'BUY' else (trail_sl < current_live_sl)
 
-        hit = (candle['low'] <= trail_sl) if side == 'BUY' else (candle['high'] >= trail_sl)
         if hit:
+            trail_sl = prev_trail
             logger.info(f"{symbol} | Trend trail hit at {mfe_R:.2f}R MFE — trail was "
                        f"{trail_sl:.4f} ({TREND_TRAIL_BUFFER_R}R behind high-water)")
             await self._exit_position(
@@ -943,6 +954,10 @@ class MarketMonitor:
             return
 
         if improved:
+            # remembered for the NEXT candle's hit check, even if the exchange
+            # update fails (the bot then still enforces it itself)
+            tr['trail_sl'] = trail_sl if prev_trail is None else (
+                max(prev_trail, trail_sl) if side == 'BUY' else min(prev_trail, trail_sl))
             success = await self.coindcx.update_stop_loss(symbol, new_sl_price=trail_sl)
             if success:
                 tr['live_sl'] = trail_sl
