@@ -127,6 +127,7 @@ class ExecutionMixin:
                 "mfe_price": tr.get("mfe"),
                 "mae_price": tr.get("mae"),
                 "opened_at_ist": opened_at,
+                "entry_candle": tr.get("entry_candle"),
                 "closed_at_ist": _close_time_ist(tr.get("_last_fill_ts") if event_type == "close" else None),
                 "duration_minutes": duration_minutes,
                 "realized_rr": rr,
@@ -508,6 +509,7 @@ class ExecutionMixin:
                 risk = abs(signal.entry_price - signal.sl_price)
 
                 tr = {"features": getattr(signal, "features", None),
+                      "entry_candle": getattr(self, "_last_pattern", {}).get(symbol),
                       "side": signal.side, "entry": signal.entry_price,
                       "sl": signal.sl_price, "live_sl": signal.sl_price,
                       "breakeven_moved": False,
