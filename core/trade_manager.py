@@ -282,8 +282,11 @@ class TradeManagerMixin:
         risk = abs(entry - tr.get("sl", entry)) or 1
         r_now = ((candle["close"] - entry) if side == "BUY" else (entry - candle["close"])) / risk
         trigger = rise >= OBI_RISE_CANDLES and pressure > OBI_EXIT_LEVEL
+        from core.candle_patterns import classify as _classify
+        pattern = _classify(candle, tr.get("_prev_c"))
+        tr["_prev_c"] = {k: candle[k] for k in ("open", "high", "low", "close")}
         logger.info(f"{symbol} | OBI in-trade {obi:+.3f} (pressure against {side}: {pressure:+.3f}, "
-                    f"rising {rise}/{OBI_RISE_CANDLES} candles) | {r_now:+.2f}R"
+                    f"rising {rise}/{OBI_RISE_CANDLES} candles) | {r_now:+.2f}R | candle: {pattern}"
                     f"{' | ESCALATION reached' if trigger else ''}")
         if not (trigger and losing):
             return False
