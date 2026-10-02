@@ -67,6 +67,19 @@ IST = pytz.timezone("Asia/Kolkata")
 
 POLL_INTERVAL_SECONDS = 15
 DAY_END_HOUR = 23
+# 2026-10-02: in-trade OBI exit (see _obi_watch). Railway: OBI_EXIT_MODE=off disables
+# the exit but keeps the logging.
+OBI_EXIT_MODE = os.getenv('OBI_EXIT_MODE', 'live').strip().lower()
+# Escalation rule (2026-10-02, designed by Umar): exit only when order-book
+# pressure AGAINST the trade rises on OBI_RISE_CANDLES consecutive candles
+# while the book is actually against the trade (pressure > OBI_EXIT_LEVEL,
+# default 0 = no fixed level -- the sustained rise IS the signal).
+# Any drop = pullback -> continue, count restarts. Applies to LONG and SHORT.
+OBI_RISE_CANDLES = int(os.getenv('OBI_RISE_CANDLES', '4'))
+OBI_EXIT_LEVEL = float(os.getenv('OBI_EXIT_LEVEL', '0'))
+# Early-failure exit (first 3 candles): kept ON by default -- replay evidence
+# 2026-10-02: removing it cost Rs1,317 over 10 weeks, worse in both halves.
+EARLY_FAILURE_MODE = os.getenv('EARLY_FAILURE_MODE', 'on').strip().lower()
 DAY_END_MINUTE = 0
 
 TRADE_LEVERAGE = 10  # 2026-09-08: reverted from 5x back to 10x per explicit
@@ -899,6 +912,56 @@ class MarketMonitor:
                        f"no further check of this kind applies.")
 
 
+    async def _obi_watch(self, symbol: str, tr: dict, candle: dict) -> bool:
+        """2026-10-02: OBI logged on EVERY candle of an open trade, plus the
+        ESCALATION exit (rule designed by Umar).
+
+        Pressure = OBI against the trade (OBI for a SHORT, -OBI for a LONG).
+        If pressure RISES on OBI_RISE_CANDLES consecutive candles while the
+        book is actually against the trade (pressure > OBI_EXIT_LEVEL,
+        default 0), the reversal is real -> exit at market.
+        Example (SHORT): 0.46 -> 0.55 -> 0.60 -> 0.70 -> 0.82 = exit.
+        Mirrored for a LONG: -0.46 -> -0.55 -> ... = rising SELL pressure.
+        Any drop (e.g. 0.70 -> 0.55) = a pullback -> continue; the count
+        restarts from that candle.
+        Safeguard: only exits a trade that is LOSING on that candle -- a
+        winner is never closed by this rule. Any API failure is skipped.
+        Live but UNTESTED when added (no in-trade OBI history existed)."""
+        try:
+            book = await self.coindcx.get_orderbook(symbol, depth=20)
+            obi = compute_obi(book["bids"], book["asks"]) if book else None
+        except Exception as e:
+            logger.warning(f"{symbol} | OBI in-trade fetch failed ({e}) — skipped this candle")
+            return False
+        if obi is None:
+            return False
+        side, entry = tr["side"], tr["entry"]
+        pressure = obi if side == "SELL" else -obi
+        prev = tr.get("obi_prev")
+        rise = tr.get("obi_rise", 0)
+        rise = rise + 1 if (prev is not None and pressure > prev) else 0
+        tr["obi_prev"], tr["obi_rise"] = pressure, rise
+        losing = candle["close"] < entry if side == "BUY" else candle["close"] > entry
+        risk = abs(entry - tr.get("sl", entry)) or 1
+        r_now = ((candle["close"] - entry) if side == "BUY" else (entry - candle["close"])) / risk
+        trigger = rise >= OBI_RISE_CANDLES and pressure > OBI_EXIT_LEVEL
+        logger.info(f"{symbol} | OBI in-trade {obi:+.3f} (pressure against {side}: {pressure:+.3f}, "
+                    f"rising {rise}/{OBI_RISE_CANDLES} candles) | {r_now:+.2f}R"
+                    f"{' | ESCALATION reached' if trigger else ''}")
+        if not (trigger and losing):
+            return False
+        if OBI_EXIT_MODE != "live":
+            logger.info(f"{symbol} | OBI escalation exit WOULD fire (OBI_EXIT_MODE=off — logging only)")
+            return False
+        await self._exit_position(
+            symbol, tr, exit_price=candle["close"], reason="obi_escalation",
+            label=(f"📕 *Position Closed — Order Book Escalation*\n\n"
+                   f"Pressure against the {'LONG' if side == 'BUY' else 'SHORT'} rose on "
+                   f"{rise} consecutive candles to {pressure:+.2f} "
+                   f"while the trade was losing ({r_now:+.2f}R).\n"
+                   f"Treated as a real reversal, not a pullback."))
+        return True
+
     async def _check_trend_trailing_stop(self, symbol: str, tr: dict, candle: dict):
         """2026-09-02 — replaces zone_reversal. Once MFE reaches
         TREND_TRAIL_ACTIVATE_R (1.0R, same threshold as the stage-2
@@ -1041,6 +1104,10 @@ class MarketMonitor:
 
         side = tr["side"]
 
+        # 2026-10-02: in-trade order-book watch (all strategies, 24/7).
+        if await self._obi_watch(symbol, tr, candle):
+            return
+
         # 2026-09-30: Liquidity Map trades use the SIMPLE exit they were
         # tested with -- stop at the sweep extreme, target at the next pool.
         # No breakeven, trailing, TP ladder, staged add or early failure.
@@ -1092,7 +1159,8 @@ class MarketMonitor:
         # activates past full breakeven (1.0R), trails 0.3R behind
         # high-water instead of closing on a single rejection candle.
         if not tr.get('position_closed'):
-            await self._check_early_failure_exit(symbol, tr, candle)
+            if EARLY_FAILURE_MODE == 'on':
+                await self._check_early_failure_exit(symbol, tr, candle)
         if not tr.get('position_closed'):
             await self._check_trend_trailing_stop(symbol, tr, candle)
 
