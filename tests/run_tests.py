@@ -329,6 +329,108 @@ def trend_trail_no_same_candle_exit():
     run(go())
 
 
+def _obi_monitor(obi_seq):
+    """ZAMAUSD SHORT at 0.07916 (02-Oct), fake book returning OBI values in order."""
+    m = make_monitor(symbol="ZAMAUSD", pdh=0.0850, pdl=0.0724)
+
+    class X(FakeExchange):
+        seq = list(obi_seq)
+
+        next_obi = 0.0
+
+        async def get_orderbook(self, sym, depth=20):
+            v = self.next_obi
+            if v is None:
+                raise RuntimeError("api timeout")
+            b, a = (1 + v) * 50, (1 - v) * 50          # (b-a)/(b+a) = v
+            return {"bids": {0.0790: b}, "asks": {0.0791: a}}
+
+        async def get_open_positions(self):
+            return {"ZAMAUSD": 9474.0}
+
+        async def get_position_details(self, sym):
+            return {"roe": 0.0}
+
+        async def update_stop_loss(self, *a, **k):
+            return True
+    m.coindcx = X()
+    m._trailing["ZAMAUSD"] = {"side": "SELL", "entry": 0.07916, "sl": 0.07993, "live_sl": 0.07993,
+                              "mfe": 0.07916, "tp": 0.0760, "qty_open": 9474, "opened_at": "t",
+                              "simple_exit": True, "invalidate_level": 0.0795}
+    m._open_positions["ZAMAUSD"] = 9474
+    return m
+
+
+def _candle(close, t):
+    return {"open": close, "high": close + 0.00002, "low": close - 0.00002, "close": close, "time": t}
+
+
+def _feed(m, sym, readings_and_closes):
+    out = []
+    for t, (obi, close) in enumerate(readings_and_closes, 1):
+        m.coindcx.next_obi = obi
+        run(m._check_exit_conditions(sym, _candle(close, t), None))
+        out.append(sym in m._trailing)
+    return out
+
+
+@test
+def obi_escalation_umars_example_exits():
+    # SHORT at 0.07916; book pressure 0.46 -> 0.55 -> 0.60 -> 0.70 -> 0.82, trade losing
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
+                                 (0.70, 0.07935), (0.82, 0.07940)])
+    check(open_ == [True, True, True, True, False],
+          f"must stay open through the rise and exit when it passes 0.80 on the 4th rise: {open_}")
+
+
+@test
+def obi_escalation_pullback_continues():
+    # 0.46 -> 0.55 -> 0.60 -> 0.70 -> 0.55 (drop = pullback) -> keep trading, count restarts
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
+                                 (0.70, 0.07935), (0.55, 0.07935), (0.82, 0.07940)])
+    check(all(open_), f"a drop must reset the count, so 0.82 right after it must NOT exit: {open_}")
+    check(m._trailing["ZAMAUSD"]["obi_rise"] == 1, "count must have restarted after the drop")
+
+
+@test
+def obi_escalation_needs_level_and_losing():
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(-0.60, 0.07920), (-0.50, 0.07925), (-0.40, 0.07930),
+                                 (-0.30, 0.07935), (-0.20, 0.07940)])
+    check(all(open_), "rising but book still ON the SHORT's side (negative) must not exit")
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(0.10, 0.07920), (0.20, 0.07925), (0.30, 0.07930), (0.40, 0.07935)])
+    check(all(open_), "only 3 rises must not exit")
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.0789), (0.55, 0.0788), (0.60, 0.0787),
+                                 (0.70, 0.0786), (0.85, 0.0785)])
+    check(all(open_), "a SHORT in profit must never be closed, however strong the book")
+
+
+@test
+def obi_escalation_long_mirror_and_safety():
+    import core.monitor as M
+    m = _obi_monitor([])
+    m._trailing["ZAMAUSD"].update({"side": "BUY", "sl": 0.0784, "live_sl": 0.0784, "tp": 0.0820,
+                                   "invalidate_level": 0.0785})
+    open_ = _feed(m, "ZAMAUSD", [(-0.46, 0.0790), (-0.55, 0.0789), (-0.60, 0.0789),
+                                 (-0.70, 0.0788), (-0.85, 0.0788)])
+    check(open_[-1] is False, f"LONG: rising sell-side pressure past 0.80 while losing must exit: {open_}")
+    m = _obi_monitor([])
+    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (None, 0.07925), (0.60, 0.07930)])
+    check(all(open_), "an order-book API failure must never close the trade")
+    orig = M.OBI_EXIT_MODE; M.OBI_EXIT_MODE = "off"
+    try:
+        m = _obi_monitor([])
+        open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
+                                     (0.70, 0.07935), (0.82, 0.07940)])
+        check(all(open_), "OBI_EXIT_MODE=off must log only, never exit")
+    finally:
+        M.OBI_EXIT_MODE = orig
+
+
 @test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
