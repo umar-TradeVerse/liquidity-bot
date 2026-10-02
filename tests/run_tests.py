@@ -123,7 +123,7 @@ def no_undefined_names():
     for d in ("core", "exchange", "utils"):
         pyflakes.api.checkRecursive([d], rep)
     pyflakes.api.checkPath("main.py", rep)
-    bad = [l for l in out.getvalue().splitlines() if "undefined name" in l]
+    bad = [l for l in out.getvalue().splitlines() if "undefined name" in l or "may be undefined" in l]
     check(not bad, "undefined names:\n" + "\n".join(bad))
 
 
@@ -157,9 +157,20 @@ def inr_tiers():
 
 
 @test
+def inr_rate_single_source():
+    import core.monitor as M
+    import core.agents.risk_agent as R
+    check(R.USD_TO_INR_RATE == 99.51, f"rate is {R.USD_TO_INR_RATE}, expected CoinDCX 99.51")
+    check(M.USD_TO_INR_RATE is R.USD_TO_INR_RATE, "monitor must use risk_agent's rate, not its own copy")
+    # ZAMAUSD 02-Oct real fill: entry 0.07885, SL 0.07993, 75 USDT x10 -> CoinDCX showed Rs1,018
+    tier, usd, inr = R.RiskAgent.inr_tier(0.07885, 0.07993, 75, 10, 800, 1300, R.USD_TO_INR_RATE)
+    check(tier == "STAGED" and 1000 < inr < 1040, f"ZAMA fill must be STAGED near Rs1,018 (got {tier} Rs{inr:.0f})")
+
+
+@test
 def daily_halt_and_persistence():
     from core.agents.risk_agent import RiskAgent, DAILY_LOSS_LIMIT_USD
-    check(DAILY_LOSS_LIMIT_USD == 22.73, f"limit is {DAILY_LOSS_LIMIT_USD}")
+    check(DAILY_LOSS_LIMIT_USD == 20.10, f"limit is {DAILY_LOSS_LIMIT_USD} (Rs2000 / 99.51)")
     r = RiskAgent(); r.realised_usd = 0.0; r.seen = []
     for i, (e, x, q) in enumerate(((0.3545, 0.3612, 1128.3), (0.0906, 0.0897, 8830), (304.72, 306.59, 2.625))):
         side = "SELL" if i != 1 else "BUY"
@@ -411,7 +422,6 @@ def obi_escalation_needs_level_and_losing():
 
 @test
 def obi_escalation_long_mirror_and_safety():
-    import core.monitor as M
     m = _obi_monitor([])
     m._trailing["ZAMAUSD"].update({"side": "BUY", "sl": 0.0784, "live_sl": 0.0784, "tp": 0.0820,
                                    "invalidate_level": 0.0785})
@@ -421,14 +431,43 @@ def obi_escalation_long_mirror_and_safety():
     m = _obi_monitor([])
     open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (None, 0.07925), (0.60, 0.07930)])
     check(all(open_), "an order-book API failure must never close the trade")
-    orig = M.OBI_EXIT_MODE; M.OBI_EXIT_MODE = "off"
+    import core.trade_manager as TM   # the OBI rule lives in the Trade Manager since the 02-Oct split
+    orig = TM.OBI_EXIT_MODE; TM.OBI_EXIT_MODE = "off"
     try:
         m = _obi_monitor([])
         open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
                                      (0.70, 0.07935), (0.82, 0.07940)])
         check(all(open_), "OBI_EXIT_MODE=off must log only, never exit")
     finally:
-        M.OBI_EXIT_MODE = orig
+        TM.OBI_EXIT_MODE = orig
+
+
+@test
+def candle_store_shared_and_failsafe():
+    from core.candle_store import CandleStore
+    import core.agents.pool_agent as PA
+    import core.agents.liquidity_map_agent as LM
+
+    class CDX:
+        calls, fail = 0, False
+
+        async def _get(self, path, params=None):
+            CDX.calls += 1
+            if CDX.fail:
+                raise RuntimeError("api down")
+            return [{"time": i * 900000, "open": 1, "high": 1, "low": 1, "close": 1} for i in range(1, 12)]
+    cdx = CDX(); st = CandleStore(cdx)
+    pa, lm = PA.PoolAgent(cdx, 75, 10, store=st), LM.LiquidityMapAgent(cdx, store=st)
+    c = {"time": 11 * 900000, "open": 1, "high": 1, "low": 1, "close": 1}
+    run(pa.on_candle("XRPUSD", c, None)); run(lm.on_candle("XRPUSD", c, None))
+    check(CDX.calls == 1, f"two agents on the same candle must share ONE download (got {CDX.calls})")
+    check(pa.store is lm.store, "both agents must use the same store")
+    # a failed reload must never wipe the Liquidity Map's saved levels
+    lm.levels["XRPUSD"] = [{"k": "low", "p": 0.9, "zone": 0.95, "t": 0, "touch": [1, 2], "inz": False}]
+    CDX.fail = True
+    gap = {"time": 40 * 900000, "open": 1, "high": 1, "low": 1, "close": 1}
+    run(pa.on_candle("XRPUSD", gap, None)); run(lm.on_candle("XRPUSD", gap, None))
+    check(len(lm.levels["XRPUSD"]) == 1, "a failed history download must keep existing levels")
 
 
 @test
