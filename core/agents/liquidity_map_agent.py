@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 
 from utils.logger import setup_logger
 from core.strategy import Signal
+from core.candle_store import CandleStore
 
 logger = setup_logger("liquidity_map")
 
@@ -57,9 +58,10 @@ def _ist(ms):
 
 
 class LiquidityMapAgent:
-    def __init__(self, coindcx):
+    def __init__(self, coindcx, store=None):
+        self.store = store or CandleStore(coindcx)   # shared candle history (2026-10-02)
+        self._gen, self._last_t = {}, {}
         self.cdx = coindcx
-        self.hist = {}      # symbol -> candles
         self.levels = {}    # symbol -> [level dicts]
         self._level = {}    # symbol -> today's DailyLevel (for alert text)
         self._load()
@@ -85,26 +87,8 @@ class LiquidityMapAgent:
             logger.error(f"Liquidity map save failed: {e}")
 
     # ── history ────────────────────────────────────────────────────────
-    async def _backfill(self, symbol):
-        from exchange.coindcx import SYMBOL_MAP
-        try:
-            now = int(datetime.now(timezone.utc).timestamp() * 1000)
-            res = await self.cdx._get("/market_data/candles", params={
-                "pair": SYMBOL_MAP[symbol], "interval": "15m",
-                "from": now - HISTORY * 900 * 1000, "to": now, "limit": HISTORY})
-            cs = sorted(res or [], key=lambda c: int(c["time"]))[:-1]
-            self.hist[symbol] = [{k: float(c[k]) for k in ("open", "high", "low", "close")}
-                                 | {"time": int(c["time"])} for c in cs]
-            self._rebuild(symbol)
-            logger.info(f"{symbol} | Liquidity map: {len(self.hist[symbol])} candles, "
-                        f"{len(self.levels.get(symbol, []))} active levels")
-        except Exception as e:
-            self.hist[symbol] = []
-            logger.error(f"{symbol} | Liquidity map backfill failed ({e})")
-
-    def _rebuild(self, symbol):
-        """Replay stored history to rebuild levels exactly (no trades)."""
-        cs = self.hist[symbol]
+    def _rebuild(self, symbol, cs):
+        """Replay history to rebuild levels exactly (no trades)."""
         self.levels[symbol] = []
         for i in range(len(cs)):
             self._step(symbol, cs[:i + 1], trade=False)
@@ -207,15 +191,21 @@ class LiquidityMapAgent:
         self._level[symbol] = level
         if LIQMAP_MODE != "live":
             return []
-        last = self.hist.get(symbol)
-        if not last or int(candle["time"]) - last[-1]["time"] > 900 * 1000 * 1.5:
-            await self._backfill(symbol)
-        cs = self.hist[symbol]
-        if cs and int(candle["time"]) <= cs[-1]["time"]:
-            return []
-        cs.append({k: float(candle[k]) for k in ("open", "high", "low", "close")}
-                  | {"time": int(candle["time"])})
-        del cs[:-HISTORY]
+        cs = await self.store.update(symbol, candle)
+        t = int(candle["time"])
+        g = self.store.gen.get(symbol, 0)
+        reloaded, self._gen[symbol] = self._gen.get(symbol) != g, g
+        if self._last_t.get(symbol, -1) >= t:
+            return []                     # this candle was already processed
+        self._last_t[symbol] = t
+        if reloaded and self.store.ok.get(symbol):
+            # rebuild level memory from the reloaded history, exactly as before:
+            # including this candle only if the reload already contained it
+            self._rebuild(symbol, cs if self.store.from_backfill.get(symbol) else cs[:-1])
+            logger.info(f"{symbol} | Liquidity map: {len(cs)} candles, "
+                        f"{len(self.levels.get(symbol, []))} active levels")
+        if reloaded and self.store.from_backfill.get(symbol):
+            return []                     # candle already inside the reloaded history
         sig = self._step(symbol, cs)
         self._save()
         return [sig] if sig else []
