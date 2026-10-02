@@ -31,6 +31,7 @@ import core.trading_common as _common
 globals().update({_n: getattr(_common, _n) for _n in _common.__all__ if _n not in globals()})
 from core.execution import ExecutionMixin
 from core.candle_store import CandleStore
+from core.candle_patterns import classify as classify_candle
 from core.trade_manager import TradeManagerMixin
 
 
@@ -211,8 +212,11 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
             prev_candle = self._last_candle.get(symbol)
             self._last_candle_time[symbol] = candle['time']
             self._last_candle[symbol] = candle
+            # 2026-10-03: candlestick pattern appended to every candle line (log-only)
+            self._last_pattern = getattr(self, "_last_pattern", {})
+            self._last_pattern[symbol] = classify_candle(candle, prev_candle)
             logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} "
-                       f"L={candle['low']:.4f} C={candle['close']:.4f}")
+                       f"L={candle['low']:.4f} C={candle['close']:.4f} | pattern: {self._last_pattern[symbol]}")
 
             if symbol in self._trailing:
                 await self._check_exit_conditions(symbol, candle, prev_candle)
