@@ -48,6 +48,13 @@ LIQMAP_MODE = os.getenv("LIQMAP_MODE", "live").strip().lower()
 SWING = 8            # 2 hours each side on 15m = a MAJOR swing
 MAX_AGE = 480        # 5 days of 15m candles
 MIN_RESPECTED = 2
+# 2026-10-03: minimum sweep depth past the level. The 8 losing live trades
+# (30-Sep to 02-Oct) were nearly all wicks of 0.02-0.12% -- noise around the
+# level, not stops actually taken. 10-week replay: sweeps < 0.30% lost
+# Rs13,099 (102 trades, both halves negative); >= 0.30% made Rs9,741
+# (18 trades, 50% win, both halves positive). Every cut-off 0.25-0.40% was
+# positive. Railway: LIQMAP_MIN_SWEEP_PCT.
+MIN_SWEEP_PCT = float(os.getenv("LIQMAP_MIN_SWEEP_PCT", "0.30"))
 HISTORY = 500
 _PATH = os.path.join(os.getenv("PERSIST_DIR", "/data"), "liquidity_map.json")
 
@@ -164,6 +171,11 @@ class LiquidityMapAgent:
                  f"({', '.join(_ist(t) for t in v['touch'][-3:])}), swept {_ist(c['time'])} "
                  f"to {sweep:.6g}, closed back {e:.6g} | exit on a close "
                  f"{'below' if side == 'BUY' else 'above'} {v['p']:.6g}, hard stop {sl:.6g}")
+        depth = abs(sweep - v["p"]) / v["p"] * 100
+        if depth < MIN_SWEEP_PCT:
+            logger.info(f"{symbol} | LIQMAP {side} skipped — {story} — sweep only {depth:.2f}% past "
+                        f"the level (< {MIN_SWEEP_PCT:.2f}%): stops not genuinely taken")
+            return None
         if not pools:
             logger.info(f"{symbol} | LIQMAP {side} skipped — {story} — no pool ahead to target")
             return None
