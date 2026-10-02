@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 
 from utils.logger import setup_logger
 from core.strategy import Signal, ENTRY_DELAY_CANDLES, MIN_REWARD_RISK_RATIO
+from core.candle_store import CandleStore
 
 logger = setup_logger("pool_agent")
 
@@ -69,10 +70,11 @@ def _utc(c):
 
 
 class PoolAgent:
-    def __init__(self, coindcx, margin_usd: float, leverage: float):
+    def __init__(self, coindcx, margin_usd: float, leverage: float, store=None):
+        self.store = store or CandleStore(coindcx)   # shared candle history (2026-10-02)
+        self._gen, self._last_t = {}, {}
         self.cdx = coindcx
         self.margin, self.lev = margin_usd, leverage
-        self.hist = {}       # symbol -> [candle dicts], oldest first
         self.armed = {}      # symbol -> {key: {...}}
         self.pending = {}    # symbol -> [pending entries]
         self.shadow = {}     # symbol -> [shadow positions]
@@ -81,22 +83,6 @@ class PoolAgent:
         logger.info(f"Pool agent modes: {POOL_MODES} — active: {list(active)}")
 
     # ── history ────────────────────────────────────────────────────────
-    async def _backfill(self, symbol):
-        from exchange.coindcx import SYMBOL_MAP
-        try:
-            now = int(datetime.now(timezone.utc).timestamp() * 1000)
-            res = await self.cdx._get("/market_data/candles", params={
-                "pair": SYMBOL_MAP[symbol], "interval": "15m",
-                "from": now - HISTORY * 900 * 1000, "to": now, "limit": HISTORY})
-            cs = sorted(res or [], key=lambda c: int(c["time"]))[:-1]  # drop forming candle
-            self.hist[symbol] = [{k: float(c[k]) for k in ("open", "high", "low", "close")}
-                                 | {"time": int(c["time"])} for c in cs]
-            logger.info(f"{symbol} | Pool agent history loaded: {len(self.hist[symbol])} candles")
-        except Exception as e:
-            self.hist[symbol] = []
-            logger.error(f"{symbol} | Pool agent backfill failed ({e}) — building history live")
-
-    # ── pools known BEFORE the current candle (no look-ahead) ─────────
     def _pools(self, cs):
         i = len(cs) - 1          # current candle index; pools use cs[:i]
         out = []
@@ -129,20 +115,15 @@ class PoolAgent:
     # ── main entry: called once per closed candle ─────────────────────
     async def on_candle(self, symbol, candle, level):
         """Returns a list of LIVE Signals for the monitor to process."""
-        # Reload full history on first use AND after any gap (e.g. the
-        # 23:00–05:30 IST window when the agent isn't called), so a level
-        # broken overnight can never wrongly look "untouched" next morning.
-        last = self.hist.get(symbol)
-        if not last or int(candle["time"]) - last[-1]["time"] > 900 * 1000 * 1.5:
-            if last:
-                logger.info(f"{symbol} | Pool agent: candle gap detected — reloading history")
-            await self._backfill(symbol)
-        cs = self.hist[symbol]
-        if cs and int(candle["time"]) <= cs[-1]["time"]:
-            return []
-        cs.append({k: float(candle[k]) for k in ("open", "high", "low", "close")}
-                  | {"time": int(candle["time"])})
-        del cs[:-HISTORY]
+        cs = await self.store.update(symbol, candle)
+        t = int(candle["time"])
+        g = self.store.gen.get(symbol, 0)
+        reloaded, self._gen[symbol] = self._gen.get(symbol) != g, g
+        if self._last_t.get(symbol, -1) >= t:
+            return []                     # this candle was already processed
+        self._last_t[symbol] = t
+        if reloaded and self.store.from_backfill.get(symbol):
+            return []                     # candle already inside the reloaded history
         day = _utc(cs[-1]).strftime("%Y-%m-%d")
         self._manage_shadow(symbol, cs[-1])
         out = self._advance_pending(symbol, cs[-1], level, day)
