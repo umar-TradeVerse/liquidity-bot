@@ -28,8 +28,12 @@ logger = setup_logger("risk_agent")   # bot's own logger -> visible in Railway
 AGENT = "Risk"
 
 DAILY_LOSS_LIMIT_INR = 2000
-USD_TO_INR_RATE = 88.0                       # must match monitor.USD_TO_INR_RATE
-DAILY_LOSS_LIMIT_USD = round(DAILY_LOSS_LIMIT_INR / USD_TO_INR_RATE, 2)   # 22.73
+# 2026-10-02: CoinDCX's actual USDT/INR rate (Instant Buy USDT, 02-Oct: Rs99.51).
+# Was a fixed 88.0, which understated every INR risk figure by ~13% (ZAMAUSD
+# 02-Oct: bot said Rs642, CoinDCX showed Rs1,018). SINGLE SOURCE for the whole
+# bot -- monitor.py imports it from here. Update via Railway USD_INR_RATE.
+USD_TO_INR_RATE = float(os.getenv("USD_INR_RATE", "99.51"))
+DAILY_LOSS_LIMIT_USD = round(DAILY_LOSS_LIMIT_INR / USD_TO_INR_RATE, 2)   # 20.10 at 99.51
 TAKER_FEE_PCT = 0.059                        # CoinDCX alt-perp taker, per side
 
 _PERSIST_DIR = os.getenv("PERSIST_DIR", "/data")
