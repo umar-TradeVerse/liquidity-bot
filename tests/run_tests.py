@@ -244,7 +244,9 @@ def liquidity_map_option2_tao_example():
         {"k": "low", "p": 298.92, "zone": 299.2, "t": 0, "touch": [1, 2], "inz": False},
         {"k": "low", "p": 296.50, "zone": 296.8, "t": 0, "touch": [], "inz": False},
         {"k": "high", "p": 305.86, "zone": 305.5, "t": 0, "touch": [], "inz": False}]}
-    sig = a._step("TAOUSD", [{"open": 300.73, "high": 301.27, "low": 298.58, "close": 298.98, "time": 10 ** 7}])
+    # a GENUINE sweep: wick to 297.90 = 0.34% past 298.92 (the real 30-Sep wick of
+    # 0.11% is now skipped as noise -- see liquidity_map_min_sweep_depth)
+    sig = a._step("TAOUSD", [{"open": 300.73, "high": 301.27, "low": 297.90, "close": 298.98, "time": 10 ** 7}])
     check(sig is not None, "no signal on the proven-level sweep")
     check(sig.sl_price == 296.50 and sig.target == 305.86 and sig.invalidate_level == 298.92,
           f"sl/target/invalidate = {sig.sl_price}/{sig.target}/{sig.invalidate_level}")
@@ -468,6 +470,52 @@ def candle_store_shared_and_failsafe():
     gap = {"time": 40 * 900000, "open": 1, "high": 1, "low": 1, "close": 1}
     run(pa.on_candle("XRPUSD", gap, None)); run(lm.on_candle("XRPUSD", gap, None))
     check(len(lm.levels["XRPUSD"]) == 1, "a failed history download must keep existing levels")
+
+
+@test
+def liquidity_map_min_sweep_depth():
+    import core.agents.liquidity_map_agent as LM
+    from core.state import DailyLevel
+    def agent(level, deeper, pool):
+        a = LM.LiquidityMapAgent(None); a._level["X"] = DailyLevel(pdh=2.0, pdl=1.0)
+        a.levels = {"X": [{"k": "high", "p": level, "zone": level * 0.999, "t": 0, "touch": [1, 2], "inz": False},
+                          {"k": "high", "p": deeper, "zone": deeper * 0.999, "t": 0, "touch": [], "inz": False},
+                          {"k": "low", "p": pool, "zone": pool * 1.001, "t": 0, "touch": [], "inz": False}]}
+        return a
+    # XRPUSD 02-Oct live loser: level 1.5094, wick to 1.5099 = 0.03% -> must be skipped
+    a = agent(1.5094, 1.5200, 1.4700)
+    sig = a._step("X", [{"open": 1.5080, "high": 1.5099, "low": 1.5070, "close": 1.5087, "time": 10 ** 7}])
+    check(sig is None, "a 0.03% sweep must be skipped as noise")
+    # RIFUSD 02-Oct: level 0.0837, wick to 0.0841 = 0.48% -> passes the depth rule
+    a = agent(0.0837, 0.0850, 0.0800)
+    sig = a._step("X", [{"open": 0.0836, "high": 0.0841, "low": 0.0834, "close": 0.0836, "time": 10 ** 7}])
+    check(sig is not None, "a 0.48% sweep must be allowed")
+
+
+@test
+def candle_patterns_classified():
+    from core.candle_patterns import classify
+    cases = [
+        ({"open": 10.0, "high": 10.05, "low": 9.00, "close": 10.02}, None, "hammer"),
+        ({"open": 10.0, "high": 11.00, "low": 9.97, "close": 9.98}, None, "shooting_star"),
+        ({"open": 10.0, "high": 10.50, "low": 9.50, "close": 10.01}, None, "doji"),
+        ({"open": 10.0, "high": 11.02, "low": 9.99, "close": 11.00}, None, "bull_marubozu"),
+        ({"open": 9.80, "high": 10.60, "low": 9.75, "close": 10.50}, {"open": 10.3, "high": 10.35, "low": 9.85, "close": 9.9}, "bull_engulfing"),
+        ({"open": 10.0, "high": 10.20, "low": 9.90, "close": 10.15}, {"open": 9.8, "high": 10.5, "low": 9.6, "close": 10.3}, "inside_bar"),
+    ]
+    for c, prev, want in cases:
+        got = classify(c, prev)
+        check(want in got.split("+"), f"expected {want}, got {got} for {c}")
+
+
+@test
+def entry_candle_saved_on_trade():
+    from core.strategy import Signal
+    m = make_monitor()
+    m._last_pattern = {"ETHUSD": "shooting_star"}
+    run(m._handle_signal(main_signal()))
+    check(m._trailing.get("ETHUSD", {}).get("entry_candle") == "shooting_star",
+          "entry candle pattern must be saved on the trade record")
 
 
 @test
