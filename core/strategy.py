@@ -484,6 +484,19 @@ class StrategyEngine:
             if pe['candles_remaining'] <= 0:
                 level.pending_entry = None
                 final_entry = candle['close']
+                # 2026-10-03: BREAKOUT GUARD. A liquidity hunt must end with price
+                # back INSIDE the level it swept. If the entry candle still closes
+                # beyond it (above yesterday's high for a SHORT, below yesterday's
+                # low for a LONG), price has ACCEPTED past the level -- a breakout,
+                # not a hunt. ZAMAUSD 03-Oct 10:45 pm: swept 0.0840, every close
+                # stayed above it, entry 0.0864 -> stopped in 4 min. 10-week replay:
+                # removes 52 such trades worth -Rs4,953; better in both halves.
+                lvl_ = pe['effective_level']
+                if (pe['side'] == 'SELL' and final_entry >= lvl_) or (pe['side'] == 'BUY' and final_entry <= lvl_):
+                    logger.info(f"{symbol} | DELAYED ENTRY cancelled — entry candle closed at {final_entry:.4f}, "
+                               f"still {'above' if pe['side'] == 'SELL' else 'below'} the swept level {lvl_:.4f}: "
+                               f"price accepted past it (breakout, not a liquidity hunt)")
+                    return None
                 final_sl = pe['sweep_extreme']  # re-anchored SL, unbuffered
                 if final_sl != pe['sl']:
                     logger.info(f"{symbol} | Delayed-entry SL re-anchored during the wait: "
