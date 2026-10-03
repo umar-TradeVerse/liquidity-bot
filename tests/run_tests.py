@@ -611,6 +611,26 @@ def orderflow_on_candle_line_and_trade_record():
 
 
 @test
+def breakout_guard_cancels_accepted_sweeps():
+    from core.state import BotState, DailyLevel
+    from core.strategy import StrategyEngine
+    def fire(close):
+        st = BotState(); st.levels["ZAMAUSD"] = DailyLevel(pdh=0.0840, pdl=0.0780)
+        eng = StrategyEngine(object(), st)
+        st.levels["ZAMAUSD"].pending_entry = {
+            "side": "SELL", "sl": 0.0864, "pdh": 0.0840, "pdl": 0.0780, "effective_level": 0.0840,
+            "sweep_extreme": 0.0864, "target": 0.0780, "counter_trend": False,
+            "pattern": "Liquidity Sweep", "candles_remaining": 1}
+        return eng.process_candle("ZAMAUSD", {"time": 1, "open": close + 0.0002, "high": close + 0.0003,
+                                              "low": close - 0.0003, "close": close})
+    # ZAMAUSD 03-Oct 10:45 pm: entry candle closed 0.0864, still ABOVE the swept 0.0840 -> breakout
+    check(fire(0.0864) is None, "a SHORT whose entry candle closes above the swept level must be cancelled")
+    sig = fire(0.0832)   # closed back BELOW 0.0840 -> guard passes; normal rules then decide
+    check(sig is not None and sig.entry_price == 0.0832,
+          "a close back inside the level must reach the normal entry rules, not be cancelled by the guard")
+
+
+@test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
     import core.agents.liquidity_map_agent as LM
