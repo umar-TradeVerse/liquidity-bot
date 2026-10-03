@@ -526,6 +526,13 @@ def orderflow_volume_and_profile():
         vt.add("X", 100.0)
     check(abs(vt.add("X", 300.0) - 3.0) < 1e-9, "rvol of 300 vs average 100 must be 3.0x")
     check(VolumeTracker().add("Y", 50.0) is None, "rvol needs at least 5 earlier candles")
+    # restart sequence: 1st candle before history loads -> n/a; history loads;
+    # the very next candle must already have rvol (not wait ~75 minutes)
+    late = VolumeTracker()
+    late.seed("Z", [])
+    check(late.add("Z", 100.0) is None, "no history yet -> rvol n/a on the first candle")
+    late.seed("Z", [{"volume": 100.0}] * 20)
+    check(abs(late.add("Z", 200.0) - 2.0) < 1e-9, "2nd candle after restart must use loaded history (2.0x)")
     cs = [{"high": 101, "low": 99, "volume": 1000}] * 6 + [{"high": 110, "low": 90, "volume": 50}] * 6
     vp = volume_profile(cs)
     check(vp and 99 <= vp["vpoc"] <= 101, f"VPOC must sit where most volume traded: {vp}")
