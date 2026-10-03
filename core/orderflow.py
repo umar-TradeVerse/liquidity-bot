@@ -46,10 +46,14 @@ class VolumeTracker:
         self.vols = {}   # symbol -> deque of recent candle volumes
 
     def seed(self, symbol, candles):
-        if self.vols.get(symbol):
+        """Fill from loaded history while fewer than 5 volumes are known --
+        e.g. right after a restart, the shared candle history loads a moment
+        AFTER the first candle line, so seed again on the next candle
+        instead of waiting ~75 minutes to rebuild from scratch (2026-10-03)."""
+        if len(self.vols.get(symbol) or ()) >= 5:
             return
         v = [c.get("volume") for c in candles if c.get("volume") is not None]
-        if v:
+        if len(v) >= 5:
             self.vols[symbol] = deque(v[-RVOL_LOOKBACK:], maxlen=RVOL_LOOKBACK)
 
     def add(self, symbol, volume):
