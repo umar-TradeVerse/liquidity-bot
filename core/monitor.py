@@ -31,6 +31,7 @@ import core.trading_common as _common
 globals().update({_n: getattr(_common, _n) for _n in _common.__all__ if _n not in globals()})
 from core.execution import ExecutionMixin
 from core.candle_store import CandleStore
+from core.agents.breakout_agent import BreakoutAgent
 from core.candle_patterns import classify as classify_candle
 from core.orderflow import VolumeTracker, TradeFlow, volume_profile, fmt_flow, fmt_vp
 from core.trade_manager import TradeManagerMixin
@@ -61,6 +62,8 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         self.vol = VolumeTracker()
         self.flow = TradeFlow(coindcx)
         self._last_flow: dict = {}
+        # Breakout Sub-Agent (2026-10-03) — PAPER TRADING ONLY, never places orders
+        self.breakout = BreakoutAgent(self.candles, float(os.getenv('TRADE_SIZE_USD', 40)), TRADE_LEVERAGE)
         self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
         self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
@@ -332,6 +335,15 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                     await self._handle_signal(msig)
             except Exception as e:
                 logger.error(f"{symbol} | Liquidity map error (main flow unaffected): {e}", exc_info=True)
+
+            # ── Breakout Sub-Agent (paper only, 2026-10-03) ─────────────────
+            # Own try: can never affect the liquidity strategies. It has no
+            # exchange access and only records what it WOULD have traded.
+            try:
+                await self.breakout.on_candle(symbol, candle, self.state.levels.get(symbol),
+                                              self._last_flow.get(symbol))
+            except Exception as e:
+                logger.error(f"{symbol} | Breakout agent error (liquidity strategies unaffected): {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"{symbol} | _process_symbol error: {e}", exc_info=True)
