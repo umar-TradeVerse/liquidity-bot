@@ -519,6 +519,91 @@ def entry_candle_saved_on_trade():
 
 
 @test
+def orderflow_volume_and_profile():
+    from core.orderflow import VolumeTracker, volume_profile
+    vt = VolumeTracker()
+    for _ in range(5):
+        vt.add("X", 100.0)
+    check(abs(vt.add("X", 300.0) - 3.0) < 1e-9, "rvol of 300 vs average 100 must be 3.0x")
+    check(VolumeTracker().add("Y", 50.0) is None, "rvol needs at least 5 earlier candles")
+    cs = [{"high": 101, "low": 99, "volume": 1000}] * 6 + [{"high": 110, "low": 90, "volume": 50}] * 6
+    vp = volume_profile(cs)
+    check(vp and 99 <= vp["vpoc"] <= 101, f"VPOC must sit where most volume traded: {vp}")
+    check(vp["val"] < vp["vpoc"] < vp["vah"], "value area must surround the VPOC")
+
+
+@test
+def orderflow_trade_feed_delta_cvd():
+    from core.orderflow import TradeFlow
+    T0 = 1790000000000 // 900000 * 900000
+
+    class CDX:
+        batch, base_works = [], True
+
+        async def _get_base(self, path, params=None):
+            return [dict(t) for t in CDX.batch] if CDX.base_works else None
+
+        async def _get(self, path, params=None):
+            return {"data": [dict(t) for t in CDX.batch]}
+    tr = lambda ms, q, maker: {"timestamp": T0 + ms, "price": 1.5, "quantity": q, "is_maker": maker}
+    f = TradeFlow(CDX())
+    CDX.batch = [tr(1000, 10, False), tr(2000, 4, True)]            # buy 10, sell 4
+    run(f.poll("XRPUSD"))
+    CDX.batch = [tr(2000, 4, True), tr(3000, 6, False)]             # overlap + new buy 6
+    run(f.poll("XRPUSD"))
+    d = f.candle("XRPUSD", T0)
+    check(d["n"] == 3 and abs(d["delta"] - 12) < 1e-9, f"dedupe/delta wrong: {d}")
+    check(not d["gap"], "overlapping polls must not be flagged as a gap")
+    CDX.batch = [tr(900000 + 5000, 5, True)]                         # next candle, but jumps past what we saw
+    run(f.poll("XRPUSD"))
+    CDX.batch = [tr(900000 + 600000, 1, True)]                       # oldest newer than last seen -> GAP
+    run(f.poll("XRPUSD"))
+    d2 = f.candle("XRPUSD", T0 + 900000)
+    check(d2["gap"] and abs(d2["cvd"] - (12 - 6)) < 1e-9, f"gap flag / CVD wrong: {d2}")
+    nxt = (T0 // 86400000 + 1) * 86400000
+    CDX.batch = [{"timestamp": nxt + 1000, "price": 1.5, "quantity": 2, "is_maker": False}]
+    run(f.poll("XRPUSD"))
+    check(abs(f.candle("XRPUSD", nxt)["cvd"] - 2) < 1e-9, "CVD must reset on a new day")
+    g = TradeFlow(CDX()); CDX.base_works = False; CDX.batch = [tr(1000, 3, False)]
+    run(g.poll("XRPUSD"))
+    check(g.endpoint == ("public", "/market_data/v3/trade_history"), "must fall back to the 2nd endpoint")
+
+    class Dead:
+        async def _get_base(self, *a, **k): return None
+        async def _get(self, *a, **k): raise RuntimeError("404")
+    h = TradeFlow(Dead())
+    try:
+        run(h.poll("XRPUSD"))
+    except Exception:
+        pass
+    check(h.disabled_until > 0 and h.candle("XRPUSD", T0) is None,
+          "no working endpoint must disable delta quietly, never crash")
+    h.disabled_until = 0                         # an hour later: retry fails again...
+    run(h.poll("XRPUSD"))
+    check(h.disabled_until > time.time() + 3000, "a failed hourly retry must back off again")
+
+
+@test
+def orderflow_on_candle_line_and_trade_record():
+    m = make_monitor()
+    from core.orderflow import VolumeTracker, TradeFlow
+    from core.candle_store import CandleStore
+    m.vol, m.flow, m.candles, m._last_flow = VolumeTracker(), TradeFlow(None), CandleStore(None), {}
+    base = 1790000000000 // 86400000 * 86400000          # start of a UTC day (05:30 IST)
+    m.candles.hist["ETHUSD"] = [{"time": base + i * 900000, "open": 1, "high": 2, "low": 1, "close": 1.5,
+                                 "volume": 100.0} for i in range(5)]
+    for i in range(5, 11):
+        txt = m._update_flow("ETHUSD", {"time": base + i * 900000, "open": 1, "high": 2,
+                                        "low": 1, "close": 1.5, "volume": 100.0 * (3 if i == 10 else 1)})
+    check("rvol 3.00x" in txt, f"candle line must carry volume and rvol: {txt}")
+    check(m._last_flow["ETHUSD"]["vp"] is not None, "volume profile must be computed")
+    m._last_pattern = {"ETHUSD": "hammer"}
+    run(m._handle_signal(main_signal()))
+    check(m._trailing["ETHUSD"].get("entry_flow", {}).get("rvol") is not None,
+          "entry order-flow context must be saved on the trade record")
+
+
+@test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
     import core.agents.liquidity_map_agent as LM
