@@ -32,6 +32,7 @@ globals().update({_n: getattr(_common, _n) for _n in _common.__all__ if _n not i
 from core.execution import ExecutionMixin
 from core.candle_store import CandleStore
 from core.candle_patterns import classify as classify_candle
+from core.orderflow import VolumeTracker, TradeFlow, volume_profile, fmt_flow, fmt_vp
 from core.trade_manager import TradeManagerMixin
 
 
@@ -56,6 +57,10 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                                     store=self.candles)
         # Liquidity Map Agent (proven-level sweeps) — separate sub-agent
         self.liqmap = LiquidityMapAgent(coindcx, store=self.candles)
+        # Order-flow measurements (2026-10-03, log-only): volume, volume profile, delta/CVD
+        self.vol = VolumeTracker()
+        self.flow = TradeFlow(coindcx)
+        self._last_flow: dict = {}
         self.pattern = PatternAgent()   # multi-agent: pattern memory (shadow mode)
         self._last_obi: dict = {}       # latest OBI per symbol, for pattern features
         self._position_lock = asyncio.Lock()
@@ -172,6 +177,25 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
             logger.error(f"{REGIME_SYMBOL} (regime ref) | update error: {e}", exc_info=True)
 
 
+    def _update_flow(self, symbol: str, candle: dict) -> str:
+        """2026-10-03 order flow (log-only): relative volume, delta/CVD for this
+        candle, and today's volume profile. Never raises."""
+        try:
+            hist = self.candles.hist.get(symbol, [])
+            self.vol.seed(symbol, hist)
+            vol = float(candle.get("volume") or 0)
+            rvol = self.vol.add(symbol, vol)
+            d = self.flow.candle(symbol, candle["time"])
+            day_start = int(candle["time"]) // 86_400_000 * 86_400_000
+            today = [c for c in hist if c["time"] >= day_start and c["time"] < int(candle["time"])]
+            today.append({"high": candle["high"], "low": candle["low"], "volume": vol})
+            vp = volume_profile(today)
+            self._last_flow[symbol] = {"vol": vol, "rvol": rvol, "delta": d, "vp": vp}
+            return fmt_flow(rvol, vol, d)
+        except Exception as e:
+            logger.warning(f"{symbol} | order-flow summary error ({e})")
+            return "flow n/a"
+
     async def _log_obi(self, symbol: str, side: str, candle: dict, sweep_extreme):
         """2026-09-03 informational-only. See the wiring comment in
         _process_symbol for what this does and does not affect."""
@@ -192,7 +216,8 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         self._last_obi[symbol] = obi
         sweep_str = f"{sweep_extreme:.4f}" if sweep_extreme is not None else "n/a"
         logger.info(f"{symbol} | OBI at {side} sweep-arm (extreme {sweep_str}): "
-                   f"{obi:+.3f} (top-5 levels) | {summarise_book(book['bids'], book['asks'])}")
+                   f"{obi:+.3f} (top-5 levels) | {summarise_book(book['bids'], book['asks'])}"
+                   f" | {fmt_vp((self._last_flow.get(symbol) or {}).get('vp'), candle['close'])}")
 
         # 2026-09-08: Telegram alert removed per explicit request -- this
         # stays log-only. Still fully recorded in Railway logs for later
@@ -205,6 +230,12 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                 logger.debug(f"{symbol} | No candle data")
                 return
 
+            # Order flow: pull recent trades every loop so each candle's delta is complete
+            try:
+                await self.flow.poll(symbol)
+            except Exception as e:
+                logger.warning(f"{symbol} | order-flow poll error ({e})")
+
             if self._last_candle_time[symbol] == candle['time']:
                 logger.debug(f"{symbol} | Candle already processed")
                 return
@@ -215,8 +246,10 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
             # 2026-10-03: candlestick pattern appended to every candle line (log-only)
             self._last_pattern = getattr(self, "_last_pattern", {})
             self._last_pattern[symbol] = classify_candle(candle, prev_candle)
+            flow_txt = self._update_flow(symbol, candle)
             logger.info(f"{symbol} | Candle: O={candle['open']:.4f} H={candle['high']:.4f} "
-                       f"L={candle['low']:.4f} C={candle['close']:.4f} | pattern: {self._last_pattern[symbol]}")
+                       f"L={candle['low']:.4f} C={candle['close']:.4f} | pattern: {self._last_pattern[symbol]}"
+                       f" | {flow_txt}")
 
             if symbol in self._trailing:
                 await self._check_exit_conditions(symbol, candle, prev_candle)
