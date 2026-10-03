@@ -24,7 +24,8 @@ GAP_MS = 900 * 1000 * 1.5
 
 
 def _norm(c):
-    return {k: float(c[k]) for k in ("open", "high", "low", "close")} | {"time": int(c["time"])}
+    return ({k: float(c[k]) for k in ("open", "high", "low", "close")}
+            | {"time": int(c["time"]), "volume": float(c.get("volume") or 0)})
 
 
 class CandleStore:
