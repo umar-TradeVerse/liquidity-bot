@@ -630,6 +630,75 @@ def breakout_guard_cancels_accepted_sweeps():
           "a close back inside the level must reach the normal entry rules, not be cancelled by the guard")
 
 
+def _bo_agent():
+    import tempfile, os
+    from core.candle_store import CandleStore
+    import core.agents.breakout_agent as B
+    from core.agents.breakout_agent import BreakoutAgent
+    d = tempfile.mkdtemp()                       # fresh state per agent: tests can't leak into each other
+    B._STATE, B._RESULTS = os.path.join(d, "state.json"), os.path.join(d, "paper.jsonl")
+
+    class Dead:
+        async def _get(self, *a, **k):
+            raise RuntimeError("offline")
+    return BreakoutAgent(CandleStore(Dead()), 50, 10)
+
+
+def _bo_feed(ag, closes, level, start=1790035200000):
+    from core.state import DailyLevel
+    lv = DailyLevel(pdh=level[0], pdl=level[1])
+    for i, (o, h, l, c) in enumerate(closes):
+        run(ag.on_candle("XRPUSD", {"time": start + i * 900000, "open": o, "high": h, "low": l, "close": c}, lv,
+                         {"rvol": 3.9 if i == 1 else 1.0, "vol": 1000.0, "delta": None, "vp": None}))
+
+
+@test
+def breakout_agent_paper_entry_and_result():
+    import json, os
+    ag = _bo_agent()
+    check(not hasattr(ag, "cdx") and not hasattr(ag, "coindcx"), "breakout agent must have NO exchange access")
+    # 1.49 (below 1.50) -> 1.51 break -> 1.52 hold -> entry; SL = min low 1.505; R = 0.015; TP = 1.565
+    _bo_feed(ag, [(1.48, 1.495, 1.47, 1.49), (1.49, 1.512, 1.505, 1.51), (1.51, 1.522, 1.506, 1.52)], (1.50, 1.40))
+    pos = ag.open.get("XRPUSD")
+    check(pos and pos["side"] == "BUY" and pos["entry"] == 1.52 and pos["sl"] == 1.505,
+          f"fresh break + hold must open a paper LONG: {pos}")
+    check(pos["break_rvol"] == 3.9, "the breakout candle's rvol must be recorded")
+    _bo_feed(ag, [(1.52, 1.53, 1.515, 1.528), (1.528, 1.57, 1.52, 1.566)], (1.50, 1.40), start=1790035200000 + 3 * 900000)
+    check("XRPUSD" not in ag.open, "reaching 3R must close the paper trade")
+    import core.agents.breakout_agent as B
+    rows = [json.loads(x) for x in open(B._RESULTS)]
+    last = rows[-1]
+    check(last["why"] == "target" and abs(last["r"] - 3.0) < 1e-6 and last["mfe_r"] >= 3.0,
+          f"result must record outcome, R and best R reached: {last}")
+
+
+@test
+def breakout_agent_needs_fresh_break_and_can_be_off():
+    import core.agents.breakout_agent as B
+    ag = _bo_agent()
+    # already above the level before the "break" -> not a fresh breakout -> no entry
+    _bo_feed(ag, [(1.51, 1.52, 1.505, 1.51), (1.51, 1.53, 1.508, 1.52), (1.52, 1.53, 1.51, 1.525)], (1.50, 1.40))
+    check("XRPUSD" not in ag.open, "a close that was already beyond the level is not a fresh breakout")
+    orig = B.BREAKOUT_MODE; B.BREAKOUT_MODE = "off"
+    try:
+        ag2 = _bo_agent()
+        _bo_feed(ag2, [(1.48, 1.495, 1.47, 1.49), (1.49, 1.512, 1.505, 1.51), (1.51, 1.522, 1.506, 1.52)], (1.50, 1.40))
+        check(not ag2.open, "BREAKOUT_MODE=off must do nothing")
+    finally:
+        B.BREAKOUT_MODE = orig
+
+
+@test
+def breakout_agent_never_touches_live_trading():
+    # the monitor's breakout hook must not create real positions or orders
+    m = make_monitor()
+    from core.candle_store import CandleStore
+    ag = _bo_agent(); m.breakout = ag
+    _bo_feed(ag, [(1.48, 1.495, 1.47, 1.49), (1.49, 1.512, 1.505, 1.51), (1.51, 1.522, 1.506, 1.52)], (1.50, 1.40))
+    check("XRPUSD" in ag.open and not m._trailing and m.coindcx.orders == 0,
+          "a paper breakout must never create a real position or order")
+
+
 @test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
@@ -638,6 +707,8 @@ def all_strategies_default_live():
     check(POOL_MODES == {"EQUAL": "live", "SESSION": "live"}, f"pool modes {POOL_MODES}")
     check(LM.LIQMAP_MODE == "live", f"liquidity map mode {LM.LIQMAP_MODE}")
     check(PATTERN_VETO_ENABLED is False, "pattern agent must stay advisory")
+    import core.agents.breakout_agent as B
+    check(B.BREAKOUT_MODE == "paper", f"breakout agent must default to PAPER (got {B.BREAKOUT_MODE})")
 
 
 # ── runner ─────────────────────────────────────────────────────────────
