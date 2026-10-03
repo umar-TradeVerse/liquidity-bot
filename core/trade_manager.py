@@ -30,6 +30,16 @@ from core.trading_common import (  # explicit, so lint can catch undefined names
 )
 
 
+def _flow_note(f):
+    """Short order-flow note for the in-trade line (log-only)."""
+    if not f:
+        return "n/a"
+    d = f.get("delta")
+    rv = f.get("rvol")
+    return (f"rvol {rv:.2f}x" if rv is not None else "rvol n/a") + (
+        f", delta {d['delta']:+.6g} (buy {d['buy_pct']:.0f}%)" if d else ", delta n/a")
+
+
 class TradeManagerMixin:
 
     async def _check_breakeven_move(self, symbol: str, tr: dict):
@@ -287,6 +297,7 @@ class TradeManagerMixin:
         tr["_prev_c"] = {k: candle[k] for k in ("open", "high", "low", "close")}
         logger.info(f"{symbol} | OBI in-trade {obi:+.3f} (pressure against {side}: {pressure:+.3f}, "
                     f"rising {rise}/{OBI_RISE_CANDLES} candles) | {r_now:+.2f}R | candle: {pattern}"
+                    f" | flow: {_flow_note(getattr(self, '_last_flow', {}).get(symbol))}"
                     f"{' | ESCALATION reached' if trigger else ''}")
         if not (trigger and losing):
             return False
