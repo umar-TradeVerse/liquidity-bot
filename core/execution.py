@@ -506,6 +506,12 @@ class ExecutionMixin:
                 # comment there. Not repeated here anymore.
 
                 tp_price = getattr(signal, 'target', None) or (signal.pdh if signal.side == 'BUY' else signal.pdl)
+                from core import simple_mode
+                if simple_mode.ON and not getattr(signal, 'simple_exit', False):
+                    # 2026-10-05 SIMPLE_MODE: fixed 1.5R target, set on the exchange
+                    _r = abs(signal.entry_price - signal.sl_price)
+                    tp_price = (signal.entry_price + simple_mode.TP_R * _r if signal.side == 'BUY'
+                                else signal.entry_price - simple_mode.TP_R * _r)
                 opened_at_ist = datetime.now(IST).isoformat()
                 risk = abs(signal.entry_price - signal.sl_price)
 
@@ -532,7 +538,8 @@ class ExecutionMixin:
                 # closer than the original single target (tp_price). If TP1
                 # would already be beyond that target, skip the ladder
                 # entirely for this trade — it behaves exactly as before.
-                if not signal.trend_mode and risk > 0 and not getattr(signal, 'simple_exit', False):
+                if not signal.trend_mode and risk > 0 and not getattr(signal, 'simple_exit', False) \
+                        and not simple_mode.ON:    # no TP ladder in SIMPLE_MODE
                     candidate_prices = []
                     for r in TP_LADDER_R:
                         p = (signal.entry_price + r * risk if signal.side == 'BUY'
@@ -647,6 +654,7 @@ class ExecutionMixin:
                 )
                 await self.telegram.send_alert(msg)
                 logger.info(f"Trade executed: {record}")
+                self.risk.record_direction(symbol, signal.side)   # SIMPLE_MODE arbitration
 
             else:
                 error_msg = order_result.get('error', 'Unknown') if order_result else 'No response from API'
