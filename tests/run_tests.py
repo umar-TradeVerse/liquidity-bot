@@ -571,24 +571,24 @@ def orderflow_trade_feed_delta_cvd():
     tr = lambda ms, q, maker: {"timestamp": T0 + ms, "price": 1.5, "quantity": q, "is_maker": maker}
     f = TradeFlow(CDX())
     CDX.batch = [tr(1000, 10, False), tr(2000, 4, True)]            # buy 10, sell 4
-    run(f.poll("XRPUSD"))
+    run(f.poll("KAITOUSD"))
     CDX.batch = [tr(2000, 4, True), tr(3000, 6, False)]             # overlap + new buy 6
-    run(f.poll("XRPUSD"))
-    d = f.candle("XRPUSD", T0)
+    run(f.poll("KAITOUSD"))
+    d = f.candle("KAITOUSD", T0)
     check(d["n"] == 3 and abs(d["delta"] - 12) < 1e-9, f"dedupe/delta wrong: {d}")
     check(not d["gap"], "overlapping polls must not be flagged as a gap")
     CDX.batch = [tr(900000 + 5000, 5, True)]                         # next candle, but jumps past what we saw
-    run(f.poll("XRPUSD"))
+    run(f.poll("KAITOUSD"))
     CDX.batch = [tr(900000 + 600000, 1, True)]                       # oldest newer than last seen -> GAP
-    run(f.poll("XRPUSD"))
-    d2 = f.candle("XRPUSD", T0 + 900000)
+    run(f.poll("KAITOUSD"))
+    d2 = f.candle("KAITOUSD", T0 + 900000)
     check(d2["gap"] and abs(d2["cvd"] - (12 - 6)) < 1e-9, f"gap flag / CVD wrong: {d2}")
     nxt = (T0 // 86400000 + 1) * 86400000
     CDX.batch = [{"timestamp": nxt + 1000, "price": 1.5, "quantity": 2, "is_maker": False}]
-    run(f.poll("XRPUSD"))
-    check(abs(f.candle("XRPUSD", nxt)["cvd"] - 2) < 1e-9, "CVD must reset on a new day")
+    run(f.poll("KAITOUSD"))
+    check(abs(f.candle("KAITOUSD", nxt)["cvd"] - 2) < 1e-9, "CVD must reset on a new day")
     g = TradeFlow(CDX()); CDX.base_works = False; CDX.batch = [tr(1000, 3, False)]
-    run(g.poll("XRPUSD"))
+    run(g.poll("KAITOUSD"))
     check(g.endpoint == ("public", "/market_data/v3/trade_history"), "must fall back to the 2nd endpoint")
 
     class Dead:
@@ -596,13 +596,13 @@ def orderflow_trade_feed_delta_cvd():
         async def _get(self, *a, **k): raise RuntimeError("404")
     h = TradeFlow(Dead())
     try:
-        run(h.poll("XRPUSD"))
+        run(h.poll("KAITOUSD"))
     except Exception:
         pass
-    check(h.disabled_until > 0 and h.candle("XRPUSD", T0) is None,
+    check(h.disabled_until > 0 and h.candle("KAITOUSD", T0) is None,
           "no working endpoint must disable delta quietly, never crash")
     h.disabled_until = 0                         # an hour later: retry fails again...
-    run(h.poll("XRPUSD"))
+    run(h.poll("KAITOUSD"))
     check(h.disabled_until > time.time() + 3000, "a failed hourly retry must back off again")
 
 
@@ -767,6 +767,52 @@ def simple_mode_one_direction_per_coin_per_day():
     m2.state.levels["ETHUSD"].auto_traded_today = False
     run(m2._handle_signal(main_signal(side="SELL")))
     check(m2.coindcx.orders == 1, "SIMPLE: same direction is still allowed")
+
+
+@test
+def unpriced_close_is_estimated_and_counted():
+    from core.monitor import MarketMonitor
+    from core.agents.risk_agent import RiskAgent
+
+    class NoFill:
+        async def get_last_fill(self, sym): return None
+    def mon(last_close):
+        m = MarketMonitor.__new__(MarketMonitor)
+        m.coindcx, m.risk = NoFill(), RiskAgent()
+        m.risk.realised_usd, m.risk.seen = 0.0, []
+        m._last_candle = {"RIFUSD": {"open": 1, "high": 1, "low": 1, "close": last_close}}
+        m._trailing = {"RIFUSD": {"side": "SELL", "entry": 0.085, "sl": 0.0859, "live_sl": 0.0859,
+                                  "tp": 0.08365, "qty_open": 5882.0, "opened_at": f"rif-{last_close}"}}
+        return m
+    # RIFUSD 12-Oct: exchange returned no fill. Price above the stop -> book the stop.
+    m = mon(0.0861)
+    reason = run(m._classify_reconciled_exit("RIFUSD"))
+    check("ESTIMATED" in reason and m._trailing["RIFUSD"]["_last_fill_price"] == 0.0859,
+          f"price past the stop must be booked at the stop: {reason}")
+    m._log_close("RIFUSD", m._trailing["RIFUSD"], exit_price=0.0859, reason=reason)
+    check(m.risk.realised_usd < -5, f"the estimated loss must reach the daily halt (day ${m.risk.realised_usd:.2f})")
+    # price between entry and stop -> the last close
+    m = mon(0.0855)
+    run(m._classify_reconciled_exit("RIFUSD"))
+    check(m._trailing["RIFUSD"]["_last_fill_price"] == 0.0855, "between entry and stop -> last close")
+
+
+@test
+def orderflow_skips_gap_heavy_coins():
+    from core.orderflow import TradeFlow, ORDERFLOW_SKIP
+    check({"ETHUSD", "SOLUSD", "TAOUSD", "XRPUSD"} <= ORDERFLOW_SKIP, f"skip list: {ORDERFLOW_SKIP}")
+
+    class CDX:
+        calls = 0
+        async def _get_base(self, *a, **k):
+            CDX.calls += 1; return []
+        async def _get(self, *a, **k):
+            CDX.calls += 1; return []
+    f = TradeFlow(CDX())
+    run(f.poll("ETHUSD")); run(f.poll("XRPUSD"))
+    check(CDX.calls == 0, "skipped coins must make no trade-feed API calls")
+    run(f.poll("KAITOUSD"))
+    check(CDX.calls > 0, "KAITOUSD (mostly complete) must still be polled")
 
 
 @test
