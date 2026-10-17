@@ -209,7 +209,8 @@ ENTRY_EXPIRY_MINUTES = 360  # 2026-09-14: raised from 90 to 360 (6h), per
                             # -- the 90-min window was discarding the
                             # better-performing later confirmations.
 
-ENTRY_DELAY_CANDLES = 3  # 2026-09-28: reduced 4 -> 3 per explicit request. (Introduced 2026-09-14.)
+from core import simple_mode as _simple_mode
+ENTRY_DELAY_CANDLES = 1 if _simple_mode.ON else 3  # 2026-10-05: 1 in SIMPLE_MODE (sharper entry); was 3 since 2026-09-28
                          # A confirmed trigger waits this many MORE candles
                          # before actually entering, at that later candle's
                          # close. Backtested at 4 candles (60min): avg R
