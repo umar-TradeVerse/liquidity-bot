@@ -259,6 +259,39 @@ class TradeManagerMixin:
 
 
 
+    async def _simple_manage(self, symbol: str, tr: dict, candle: dict):
+        """SIMPLE_MODE trade management (2026-10-05). Order per candle:
+        1) stop  2) 1.5R target  3) breakeven at +1R (applies from the NEXT
+        candle, so a candle can never hit a stop it just created)  4) 24h cap.
+        Stop and target also sit on the exchange; this is the bot-side check."""
+        from core import simple_mode
+        side, e = tr["side"], tr["entry"]
+        R = abs(e - tr["sl"]) or 1e-12
+        tr["n_simple"] = tr.get("n_simple", 0) + 1
+        live_sl = tr.get("live_sl", tr["sl"])
+        if (candle["low"] <= live_sl) if side == "BUY" else (candle["high"] >= live_sl):
+            at_be = abs(live_sl - e) < 1e-12
+            await self._exit_position(symbol, tr, exit_price=live_sl, reason="sl_hit",
+                                      label="Breakeven Stop Hit" if at_be else "Stop Loss Hit")
+            return
+        tp = tr.get("tp")
+        if tp and ((candle["high"] >= tp) if side == "BUY" else (candle["low"] <= tp)):
+            await self._exit_position(symbol, tr, exit_price=tp, reason="target_achieved",
+                                      label=f"Take Profit — {simple_mode.TP_R}R target reached")
+            return
+        fav = (candle["high"] - e) if side == "BUY" else (e - candle["low"])
+        if not tr.get("be_done") and fav >= simple_mode.BE_AT_R * R:
+            tr["be_done"] = True
+            if await self.coindcx.update_stop_loss(symbol, new_sl_price=e):
+                tr["live_sl"] = e
+                logger.info(f"{symbol} | SIMPLE: +{simple_mode.BE_AT_R}R reached — stop moved to entry {e:.6g}")
+            else:
+                tr["live_sl"] = e      # bot still enforces it even if the exchange update failed
+                logger.warning(f"{symbol} | SIMPLE: breakeven exchange update failed — bot enforcing entry stop")
+        if tr["n_simple"] >= simple_mode.TIMEOUT_CANDLES:
+            await self._exit_position(symbol, tr, exit_price=candle["close"], reason="timeout",
+                                      label="Closed — 24h time limit")
+
     async def _obi_watch(self, symbol: str, tr: dict, candle: dict) -> bool:
         """2026-10-02: OBI logged on EVERY candle of an open trade, plus the
         ESCALATION exit (rule designed by Umar).
@@ -301,7 +334,8 @@ class TradeManagerMixin:
                     f"{' | ESCALATION reached' if trigger else ''}")
         if not (trigger and losing):
             return False
-        if OBI_EXIT_MODE != "live":
+        from core import simple_mode
+        if OBI_EXIT_MODE != "live" or simple_mode.ON:      # SIMPLE_MODE: OBI logged, never exits
             logger.info(f"{symbol} | OBI escalation exit WOULD fire (OBI_EXIT_MODE=off — logging only)")
             return False
         await self._exit_position(
@@ -482,6 +516,12 @@ class TradeManagerMixin:
             elif tp_hit:
                 await self._exit_position(symbol, tr, exit_price=tr["tp"], reason="target_achieved",
                                           label="Take Profit — next liquidity pool reached")
+            return
+
+        # 2026-10-05 SIMPLE_MODE: one stop, one target, one breakeven move.
+        from core import simple_mode
+        if simple_mode.ON:
+            await self._simple_manage(symbol, tr, candle)
             return
 
         # Track max favorable / max adverse excursion every candle, regardless
