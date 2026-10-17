@@ -15,7 +15,9 @@ def evaluate(signal, level, regime: str, stability_max_counter_confirms: int) ->
         return Verdict(AGENT, False,
                        f"trend stability: {level.counter_trend_confirms} counter-trend "
                        f"confirms today, {level.trend_bias} no longer trusted")
-    if signal.counter_trend:
+    from core import simple_mode
+    # 2026-10-05: trend-bias block OFF in SIMPLE_MODE -- redundant since the breakout guard
+    if signal.counter_trend and not simple_mode.ON:
         return Verdict(AGENT, False, f"fights today's {level.trend_bias} bias")
     btc_counter = (signal.side == 'BUY' and regime == 'BEARISH') or \
                   (signal.side == 'SELL' and regime == 'BULLISH')
