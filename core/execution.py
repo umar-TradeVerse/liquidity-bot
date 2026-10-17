@@ -37,6 +37,23 @@ from core.trading_common import (  # explicit, so lint can catch undefined names
 
 class ExecutionMixin:
 
+    def _estimate_exit(self, symbol: str, tr: dict) -> float:
+        """Conservative exit price when the exchange returns no fill:
+        price past the stop -> the stop; past the target -> the target;
+        otherwise the last candle close; no price known at all -> the stop."""
+        side, sl, tp = tr["side"], tr.get("live_sl", tr.get("sl")), tr.get("tp")
+        c = (getattr(self, "_last_candle", None) or {}).get(symbol)
+        last = c["close"] if c else None
+        if last is None:
+            return sl
+        if side == "BUY":
+            if sl is not None and last <= sl: return sl
+            if tp is not None and last >= tp: return tp
+        else:
+            if sl is not None and last >= sl: return sl
+            if tp is not None and last <= tp: return tp
+        return last
+
     async def _classify_reconciled_exit(self, symbol: str) -> str:
         tr = self._trailing.get(symbol)
         if not tr:
@@ -46,10 +63,16 @@ class ExecutionMixin:
             fill = await self.coindcx.get_last_fill(symbol)
         except Exception as e:
             logger.error(f"{symbol} | Failed to fetch last fill for exit classification: {e}")
-            return "reason unknown (fill lookup failed)"
+            fill = None
 
         if not fill or fill.get("price") is None:
-            return "reason unknown (no fill data returned)"
+            # 2026-10-16: never leave a close uncounted (RIFUSD 12-Oct: no fill data ->
+            # P&L skipped -> invisible to the daily halt). Book a conservative estimate.
+            est = self._estimate_exit(symbol, tr)
+            tr["_last_fill_price"] = est
+            logger.warning(f"{symbol} | No fill data from exchange — P&L ESTIMATED at {est:.6g} "
+                           f"so the daily loss halt still counts this close")
+            return f"reason unknown (no fill data) — P&L ESTIMATED at {est:.4f}"
 
         price = fill["price"]
         tr["_last_fill_price"] = price   # used for realised P&L on reconciled closes
@@ -238,6 +261,9 @@ class ExecutionMixin:
                     if _fill: tr["_last_fill_ts"] = _fill.get("timestamp")
                 except Exception as e:
                     logger.error(f"{symbol} | Last-fill lookup failed on already-closed exit: {e}")
+            if _fill_px is None and positions_ok:   # 2026-10-16: estimate rather than skip
+                _fill_px = self._estimate_exit(symbol, tr)
+                logger.warning(f"{symbol} | No fill data on already-closed exit — P&L ESTIMATED at {_fill_px:.6g}")
             self._log_close(symbol, tr, exit_price=_fill_px, reason=f"{reason}_already_closed")
             self.state.reset_symbol_watch(symbol)
             self._trailing.pop(symbol, None)
