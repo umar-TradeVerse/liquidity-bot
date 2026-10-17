@@ -30,6 +30,17 @@ for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE"):
 RESULTS = []
 
 
+class legacy:
+    """Run a block with SIMPLE_MODE off -- for tests of the old behaviours,
+    which Railway SIMPLE_MODE=off can still bring back."""
+    def __enter__(self):
+        from core import simple_mode
+        self.prev = simple_mode.ON; simple_mode.ON = False
+    def __exit__(self, *a):
+        from core import simple_mode
+        simple_mode.ON = self.prev
+
+
 def test(fn):
     RESULTS.append(fn)
     return fn
@@ -85,6 +96,7 @@ def make_monitor(regime="NEUTRAL", bias="NONE", confirms=0, auto=False, halted=F
     m.telegram, m.coindcx = FakeTelegram(), FakeExchange()
     m.risk = RiskAgent()
     m.risk.realised_usd = -30.0 if halted else 0.0
+    m.risk.day_dir = {}        # each test starts a fresh trading day (no inherited direction)
     m.pattern = PatternAgent()
     m._last_obi, m._open_positions, m._trailing = {}, {}, {}
     m._position_lock = asyncio.Lock()
@@ -129,23 +141,24 @@ def no_undefined_names():
 
 @test
 def decision_flow_every_path():
-    cases = [  # name, monitor kwargs, signal kwargs, expected (alerts, order placed)
-        ("hard-rule rejection", {}, {"reject": "R:R low"}, (1, False)),
-        ("already traded today", {"auto": True}, {}, (1, False)),
-        ("trend stability (log only)", {"bias": "UPTREND", "confirms": 2}, {}, (0, False)),
-        ("counter-trend (log only)", {"bias": "UPTREND"}, {"counter": True}, (0, False)),
-        ("BTC regime (log only)", {"regime": "BULLISH"}, {}, (0, False)),
-        ("daily loss halt", {"halted": True}, {}, (1, False)),
-        ("clean setup trades", {}, {}, (2, True)),
-    ]
-    for name, mk, sk, exp in cases:
-        m = make_monitor(**mk)
-        try:
-            run(m._handle_signal(main_signal(**sk)))
-        except Exception:
-            pass
-        got = (len(m.telegram.sent), m.coindcx.orders > 0)
-        check(got == exp, f"{name}: expected (alerts, order)={exp}, got {got}")
+    with legacy():
+        cases = [  # name, monitor kwargs, signal kwargs, expected (alerts, order placed)
+            ("hard-rule rejection", {}, {"reject": "R:R low"}, (1, False)),
+            ("already traded today", {"auto": True}, {}, (1, False)),
+            ("trend stability (log only)", {"bias": "UPTREND", "confirms": 2}, {}, (0, False)),
+            ("counter-trend (log only)", {"bias": "UPTREND"}, {"counter": True}, (0, False)),
+            ("BTC regime (log only)", {"regime": "BULLISH"}, {}, (0, False)),
+            ("daily loss halt", {"halted": True}, {}, (1, False)),
+            ("clean setup trades", {}, {}, (2, True)),
+        ]
+        for name, mk, sk, exp in cases:
+            m = make_monitor(**mk)
+            try:
+                run(m._handle_signal(main_signal(**sk)))
+            except Exception:
+                pass
+            got = (len(m.telegram.sent), m.coindcx.orders > 0)
+            check(got == exp, f"{name}: expected (alerts, order)={exp}, got {got}")
 
 
 @test
@@ -313,33 +326,34 @@ def off_hours_manages_but_never_enters():
 
 @test
 def trend_trail_no_same_candle_exit():
-    """Regression: 01-Oct XRPUSD. A candle must never hit the trail it just
-    created (its low came BEFORE its high). Exit only on a later candle."""
-    m = make_monitor(symbol="XRPUSD", pdh=1.5443, pdl=1.4852)
+    with legacy():
+        """Regression: 01-Oct XRPUSD. A candle must never hit the trail it just
+        created (its low came BEFORE its high). Exit only on a later candle."""
+        m = make_monitor(symbol="XRPUSD", pdh=1.5443, pdl=1.4852)
 
-    class X(FakeExchange):
-        async def update_stop_loss(self, sym, new_sl_price=None):
-            return True
+        class X(FakeExchange):
+            async def update_stop_loss(self, sym, new_sl_price=None):
+                return True
 
-        async def get_open_positions(self):
-            return {"XRPUSD": 100.0}
+            async def get_open_positions(self):
+                return {"XRPUSD": 100.0}
 
-        async def get_position_details(self, sym):
-            return {"roe": 0.0}
-    m.coindcx = X()
-    m._trailing["XRPUSD"] = {"side": "BUY", "entry": 1.4814, "sl": 1.4744, "live_sl": 1.4744,
-                             "mfe": 1.4814, "tp": 1.5443, "qty_open": 100, "opened_at": "t"}
-    m._open_positions["XRPUSD"] = 100
+            async def get_position_details(self, sym):
+                return {"roe": 0.0}
+        m.coindcx = X()
+        m._trailing["XRPUSD"] = {"side": "BUY", "entry": 1.4814, "sl": 1.4744, "live_sl": 1.4744,
+                                 "mfe": 1.4814, "tp": 1.5443, "qty_open": 100, "opened_at": "t"}
+        m._open_positions["XRPUSD"] = 100
 
-    async def go():
-        await m._check_exit_conditions("XRPUSD", {"open": 1.4814, "high": 1.4923, "low": 1.4810,
-                                                  "close": 1.4918, "time": 1}, None)
-        check("XRPUSD" in m._trailing, "exited on the same candle that set the trail (look-ahead bug)")
-        check(abs(m._trailing["XRPUSD"].get("trail_sl", 0) - 1.4902) < 1e-4, "trail not set to 1.4902")
-        await m._check_exit_conditions("XRPUSD", {"open": 1.4918, "high": 1.4920, "low": 1.4895,
-                                                  "close": 1.4900, "time": 2}, None)
-        check("XRPUSD" not in m._trailing, "a later candle through the trail must exit")
-    run(go())
+        async def go():
+            await m._check_exit_conditions("XRPUSD", {"open": 1.4814, "high": 1.4923, "low": 1.4810,
+                                                      "close": 1.4918, "time": 1}, None)
+            check("XRPUSD" in m._trailing, "exited on the same candle that set the trail (look-ahead bug)")
+            check(abs(m._trailing["XRPUSD"].get("trail_sl", 0) - 1.4902) < 1e-4, "trail not set to 1.4902")
+            await m._check_exit_conditions("XRPUSD", {"open": 1.4918, "high": 1.4920, "low": 1.4895,
+                                                      "close": 1.4900, "time": 2}, None)
+            check("XRPUSD" not in m._trailing, "a later candle through the trail must exit")
+        run(go())
 
 
 def _obi_monitor(obi_seq):
@@ -389,12 +403,13 @@ def _feed(m, sym, readings_and_closes):
 
 @test
 def obi_escalation_umars_example_exits():
-    # SHORT at 0.07916; book pressure 0.46 -> 0.55 -> 0.60 -> 0.70 -> 0.82, trade losing
-    m = _obi_monitor([])
-    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
-                                 (0.70, 0.07935), (0.82, 0.07940)])
-    check(open_ == [True, True, True, True, False],
-          f"must stay open through the rise and exit when it passes 0.80 on the 4th rise: {open_}")
+    with legacy():
+        # SHORT at 0.07916; book pressure 0.46 -> 0.55 -> 0.60 -> 0.70 -> 0.82, trade losing
+        m = _obi_monitor([])
+        open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
+                                     (0.70, 0.07935), (0.82, 0.07940)])
+        check(open_ == [True, True, True, True, False],
+              f"must stay open through the rise and exit when it passes 0.80 on the 4th rise: {open_}")
 
 
 @test
@@ -424,24 +439,25 @@ def obi_escalation_needs_level_and_losing():
 
 @test
 def obi_escalation_long_mirror_and_safety():
-    m = _obi_monitor([])
-    m._trailing["ZAMAUSD"].update({"side": "BUY", "sl": 0.0784, "live_sl": 0.0784, "tp": 0.0820,
-                                   "invalidate_level": 0.0785})
-    open_ = _feed(m, "ZAMAUSD", [(-0.46, 0.0790), (-0.55, 0.0789), (-0.60, 0.0789),
-                                 (-0.70, 0.0788), (-0.85, 0.0788)])
-    check(open_[-1] is False, f"LONG: rising sell-side pressure past 0.80 while losing must exit: {open_}")
-    m = _obi_monitor([])
-    open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (None, 0.07925), (0.60, 0.07930)])
-    check(all(open_), "an order-book API failure must never close the trade")
-    import core.trade_manager as TM   # the OBI rule lives in the Trade Manager since the 02-Oct split
-    orig = TM.OBI_EXIT_MODE; TM.OBI_EXIT_MODE = "off"
-    try:
+    with legacy():
         m = _obi_monitor([])
-        open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
-                                     (0.70, 0.07935), (0.82, 0.07940)])
-        check(all(open_), "OBI_EXIT_MODE=off must log only, never exit")
-    finally:
-        TM.OBI_EXIT_MODE = orig
+        m._trailing["ZAMAUSD"].update({"side": "BUY", "sl": 0.0784, "live_sl": 0.0784, "tp": 0.0820,
+                                       "invalidate_level": 0.0785})
+        open_ = _feed(m, "ZAMAUSD", [(-0.46, 0.0790), (-0.55, 0.0789), (-0.60, 0.0789),
+                                     (-0.70, 0.0788), (-0.85, 0.0788)])
+        check(open_[-1] is False, f"LONG: rising sell-side pressure past 0.80 while losing must exit: {open_}")
+        m = _obi_monitor([])
+        open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (None, 0.07925), (0.60, 0.07930)])
+        check(all(open_), "an order-book API failure must never close the trade")
+        import core.trade_manager as TM   # the OBI rule lives in the Trade Manager since the 02-Oct split
+        orig = TM.OBI_EXIT_MODE; TM.OBI_EXIT_MODE = "off"
+        try:
+            m = _obi_monitor([])
+            open_ = _feed(m, "ZAMAUSD", [(0.46, 0.07920), (0.55, 0.07925), (0.60, 0.07930),
+                                         (0.70, 0.07935), (0.82, 0.07940)])
+            check(all(open_), "OBI_EXIT_MODE=off must log only, never exit")
+        finally:
+            TM.OBI_EXIT_MODE = orig
 
 
 @test
@@ -697,6 +713,60 @@ def breakout_agent_never_touches_live_trading():
     _bo_feed(ag, [(1.48, 1.495, 1.47, 1.49), (1.49, 1.512, 1.505, 1.51), (1.51, 1.522, 1.506, 1.52)], (1.50, 1.40))
     check("XRPUSD" in ag.open and not m._trailing and m.coindcx.orders == 0,
           "a paper breakout must never create a real position or order")
+
+
+@test
+def simple_mode_counter_trend_allowed_regime_still_blocks():
+    from core import simple_mode
+    check(simple_mode.ON, "SIMPLE_MODE must default ON")
+    m = make_monitor(bias="UPTREND")
+    run(m._handle_signal(main_signal(counter=True)))
+    check(m.coindcx.orders == 1, "SIMPLE: a PDH-sweep SHORT in an 'uptrend' must now trade (trend block off)")
+    m = make_monitor(regime="BULLISH")
+    run(m._handle_signal(main_signal()))
+    check(m.coindcx.orders == 0, "SIMPLE: the BTC-regime block must still apply")
+
+
+@test
+def simple_mode_exits_one_stop_one_target():
+    from core import simple_mode
+
+    class X(FakeExchange):
+        moves = []
+        async def update_stop_loss(self, sym, new_sl_price=None):
+            X.moves.append(new_sl_price); return True
+        async def get_open_positions(self): return {"TAOUSD": 1.0} if self.orders else {}
+        async def get_position_details(self, sym): return {"roe": 0.0}
+        async def get_orderbook(self, *a, **k): raise RuntimeError("no book in test")
+    m = make_monitor(symbol="TAOUSD", pdh=308.0, pdl=288.0)
+    m.coindcx = X()
+    from core.strategy import Signal
+    sig = Signal("TAOUSD", "SELL", 305.74, 310.59, 308.0, 288.0, swept_level=308.0)   # TAO 04-Oct short
+    run(m._handle_signal(sig))
+    tr = m._trailing["TAOUSD"]
+    check(abs(tr["tp"] - (305.74 - 1.5 * 4.85)) < 1e-9 and abs(m.coindcx.tp - tr["tp"]) < 1e-9,
+          f"SIMPLE: exchange TP must be exactly 1.5R (got {m.coindcx.tp})")
+    check("tp1_price" not in tr, "SIMPLE: no TP ladder")
+    c = lambda h, l, cl, t: {"open": cl, "high": h, "low": l, "close": cl, "time": t}
+    # +1R reached (low 300.89) on a candle whose high is ABOVE entry: must NOT exit on that same candle
+    run(m._check_exit_conditions("TAOUSD", c(306.0, 300.80, 301.5, 1), None))
+    check("TAOUSD" in m._trailing and tr["live_sl"] == 305.74 and X.moves == [305.74],
+          "SIMPLE: at +1R the stop moves to entry once, effective from the next candle")
+    run(m._check_exit_conditions("TAOUSD", c(303.0, 298.40, 298.6, 2), None))
+    check("TAOUSD" not in m._trailing, "SIMPLE: reaching 1.5R (298.465) must close at the target")
+
+
+@test
+def simple_mode_one_direction_per_coin_per_day():
+    m = make_monitor()
+    m.risk.record_direction("ETHUSD", "SELL")
+    run(m._handle_signal(main_signal(side="BUY")))
+    check(m.coindcx.orders == 0, "SIMPLE: after today's first ETH trade was SELL, a BUY must be vetoed")
+    m2 = make_monitor()
+    m2.risk.record_direction("ETHUSD", "SELL")
+    m2.state.levels["ETHUSD"].auto_traded_today = False
+    run(m2._handle_signal(main_signal(side="SELL")))
+    check(m2.coindcx.orders == 1, "SIMPLE: same direction is still allowed")
 
 
 @test
