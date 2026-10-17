@@ -16,9 +16,8 @@ PHASE 2 (CoinDCX public futures trade feed — being VERIFIED live)
   The feed is polled every loop; trades are de-duplicated and bucketed into
   their 15m candle. Coverage is checked: if a poll's oldest trade is newer
   than the last trade already seen, trades were missed and the candle is
-  marked 'gap'. A one-time PROBE line logs the raw response so the field
-  meanings (especially which side was the aggressor) can be confirmed.
-  Until confirmed, delta lines carry '[unverified]'.
+  marked 'gap'. Aggressor side VERIFIED 16-Oct (delta sign matched candle
+  direction on 62% of complete candles). Coins in ORDERFLOW_SKIP are not polled.
 """
 import time
 from collections import deque
@@ -34,6 +33,13 @@ CANDLE_MS = 900 * 1000
 
 # Candidate CoinDCX endpoints for the public futures trade feed. The first that
 # returns a list of trades is used; the PROBE line records which one worked.
+# 2026-10-16: the 30-trade feed can't keep up with these coins (98-100% of their
+# candles were GAP over 10-16 Oct), so their delta is meaningless -- skip polling
+# them (saves API calls; 8 feed timeouts that week). Railway: ORDERFLOW_SKIP.
+import os as _os
+ORDERFLOW_SKIP = {s.strip().upper() for s in
+                  _os.getenv("ORDERFLOW_SKIP", "ETHUSD,SOLUSD,TAOUSD,XRPUSD").split(",") if s.strip()}
+
 TRADE_ENDPOINTS = (
     ("base", "/exchange/v1/derivatives/futures/data/trades"),
     ("public", "/market_data/v3/trade_history"),
@@ -167,7 +173,7 @@ class TradeFlow:
 
     async def poll(self, symbol):
         """Called every loop: pull recent trades and bucket new ones by candle."""
-        if time.time() < self.disabled_until:
+        if time.time() < self.disabled_until or symbol.upper() in ORDERFLOW_SKIP:
             return
         try:
             raw = await self._fetch(symbol)
@@ -219,5 +225,5 @@ def fmt_flow(rvol, vol, d):
     s = f"vol {vol:.6g} (rvol {rvol:.2f}x)" if rvol is not None else f"vol {vol:.6g} (rvol n/a)"
     if d:
         s += (f" | delta {d['delta']:+.6g} (buy {d['buy_pct']:.0f}%, {d['n']} trades"
-              f"{', GAP' if d['gap'] else ''}) | CVD {d['cvd']:+.6g} [unverified]")
+              f"{', GAP' if d['gap'] else ''}) | CVD {d['cvd']:+.6g}")   # sign verified 16-Oct: 62% agreement
     return s
