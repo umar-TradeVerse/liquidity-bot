@@ -50,6 +50,7 @@ class RiskAgent:
         self.realised_usd = 0.0
         self.halt_alerted = False
         self.seen = []            # keys of closes already booked (any day)
+        self.day_dir = {}         # symbol -> side of today's first executed trade
         self._load()
 
     # ── persistence ───────────────────────────────────────────────────
@@ -59,6 +60,7 @@ class RiskAgent:
                 d = json.load(f)
             self.seen = list(d.get("seen", []))
             if d.get("day") == self.day:
+                self.day_dir = dict(d.get("day_dir", {}))
                 self.realised_usd = float(d.get("realised_usd", 0.0))
                 self.halt_alerted = bool(d.get("halt_alerted", False))
                 logger.info(f"Daily P&L restored for {self.day}: ${self.realised_usd:+.2f}")
@@ -72,7 +74,8 @@ class RiskAgent:
             os.makedirs(_PERSIST_DIR, exist_ok=True)
             with open(_PNL_PATH, "w") as f:
                 json.dump({"day": self.day, "realised_usd": round(self.realised_usd, 4),
-                           "halt_alerted": self.halt_alerted, "seen": self.seen}, f)
+                           "halt_alerted": self.halt_alerted, "seen": self.seen,
+                           "day_dir": self.day_dir}, f)
         except Exception as e:
             logger.error(f"Could not write {_PNL_PATH}: {e}")
 
@@ -82,6 +85,7 @@ class RiskAgent:
             logger.info(f"Daily P&L rollover {self.day} -> {today} "
                         f"(closed at ${self.realised_usd:+.2f}) — halt cleared")
             self.day, self.realised_usd, self.halt_alerted = today, 0.0, False
+            self.day_dir = {}
             self._save()
 
     # ── P&L recording ─────────────────────────────────────────────────
@@ -138,11 +142,23 @@ class RiskAgent:
         # Pool-agent signals have their own daily slot (tracked in pool_agent.py)
         if level and level.auto_traded_today and getattr(signal, 'source', '') != 'pool':
             return Verdict(AGENT, False, "today's auto-trade for this symbol already used")
+        # 2026-10-05 SIMPLE_MODE arbitration: one direction per coin per day.
+        from core import simple_mode
+        self._roll()
+        first = self.day_dir.get(signal.symbol)
+        if simple_mode.ON and first and first != signal.side:
+            return Verdict(AGENT, False, f"today's first {signal.symbol} trade was {first} — "
+                                         f"no opposite trade on this coin today")
         if self.halted:
             return Verdict(AGENT, False,
                            f"DAILY LOSS HALT — day P&L ${self.realised_usd:+.2f} "
                            f"<= -${DAILY_LOSS_LIMIT_USD:.2f} (₹{DAILY_LOSS_LIMIT_INR})")
         return Verdict(AGENT, True, f"day P&L ${self.realised_usd:+.2f}")
+
+    def record_direction(self, symbol, side):
+        self._roll()
+        self.day_dir.setdefault(symbol, side)
+        self._save()
 
     @staticmethod
     def concurrency(open_count: int, max_positions: int) -> Verdict:
