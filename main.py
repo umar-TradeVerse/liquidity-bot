@@ -106,6 +106,15 @@ async def main():
         id="daily_reset",
         replace_existing=True
     )
+    # 2026-11-05: nightly log report to Telegram at 11:00 pm IST (no console needed)
+    from core.command_listener import send_logs
+    scheduler.add_job(
+        send_logs,
+        CronTrigger(hour=23, minute=0, timezone=IST),
+        args=[telegram, 24, "Nightly report — "],
+        id="nightly_logs",
+        replace_existing=True
+    )
     scheduler.start()
     # Restart recovery: if a same-day state snapshot exists (mounted volume,
     # see core/persistence.py), restore levels + in-flight trailing (SL/TP/
@@ -150,7 +159,7 @@ async def main():
     try:
         await asyncio.gather(
             monitor.run(),
-            run_command_listener(telegram),
+            run_command_listener(telegram, monitor),
         )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
