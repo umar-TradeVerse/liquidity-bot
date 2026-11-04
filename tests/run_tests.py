@@ -816,6 +816,84 @@ def orderflow_skips_gap_heavy_coins():
 
 
 @test
+def ops_log_file_window_and_rotation():
+    import tempfile, os
+    from datetime import datetime
+    import utils.logger as UL, core.ops_reports as OR
+    d = tempfile.mkdtemp(); base = os.path.join(d, "bot.log")
+    old_log = OR.COMBINED_LOG; OR.COMBINED_LOG = base
+    try:
+        open(base + ".1", "w").write("2026-11-04 10:00:00 | main | INFO | old line (30h ago)\n"
+                                     "2026-11-05 09:00:00 | main | INFO | rotated recent line\n")
+        open(base, "w").write("2026-11-05 14:00:00 | monitor | INFO | XRPUSD | Candle: O=1 H=1 L=1 C=1\n"
+                              "2026-11-05 15:30:00 | monitor | ERROR | boom\n"
+                              "Traceback (continuation line)\n")
+        now = datetime(2026, 11, 5, 16, 0, 0)
+        txt = open(OR.build_log_file(24, now=now)).read()
+        check("old line" not in txt and "rotated recent line" in txt and "Candle:" in txt,
+              "24h window must include rotated recent lines and exclude older ones")
+        check("Traceback (continuation line)" in txt, "continuation lines must follow their entry")
+        txt6 = open(OR.build_log_file(6, now=now)).read()
+        check("rotated recent line" not in txt6 and "boom" in txt6, "a 6h window must only include the last 6 hours")
+        check(txt.index("rotated recent line") < txt.index("Candle:"), "rotated (older) files must come first")
+    finally:
+        OR.COMBINED_LOG = old_log
+
+
+@test
+def ops_status_and_settings_never_leak_secrets():
+    import os, core.ops_reports as OR
+    os.environ["COINDCX_API_KEY"] = "SUPERSECRETKEY123"; os.environ["COINDCX_API_SECRET"] = "SUPERSECRETSECRET"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "123:SECRETTOKEN"; os.environ["TRADE_SIZE_USD"] = "50"
+    st = OR.settings_text()
+    check("SUPERSECRET" not in st and "SECRETTOKEN" not in st, "settings must never show secrets")
+    check("`TRADE_SIZE_USD` = 50" in st and "Min sweep depth (main strategy): 0.00%" in st, f"settings content: {st}")
+
+    class R:
+        realised_usd, halted = -3.5, False
+    class Mon:
+        _trailing = {"TAOUSD": {"side": "SELL", "entry": 305.74, "sl": 310.59, "live_sl": 305.74, "tp": 298.47}}
+        risk = R()
+    txt = OR.status_text(Mon())
+    check("TAOUSD SHORT @ 305.74" in txt and "$-3.50" in txt and "Running for" in txt, f"status content: {txt}")
+    check("Open positions: none" in OR.status_text(type("M", (), {"_trailing": {}, "risk": R()})()), "empty positions")
+
+
+@test
+def ops_telegram_commands_dispatch():
+    import asyncio, core.command_listener as CL
+
+    class TG:
+        chat_id = "6314805705"; sent = []; docs = []; calls = 0
+        async def get_updates(self, offset=None, timeout=25):
+            TG.calls += 1
+            if TG.calls > 1:
+                raise asyncio.CancelledError()
+            mk = lambda t: {"update_id": len(t), "message": {"chat": {"id": 6314805705}, "text": t}}
+            return [mk("/status"), mk("/settings"), mk("/logs 6"), mk("/help"),
+                    {"update_id": 99, "message": {"chat": {"id": 1}, "text": "/status"}}]   # stranger: ignored
+        async def send_alert(self, m, parse_mode="Markdown"):
+            TG.sent.append(m); return True
+        async def send_document(self, path, caption=None):
+            TG.docs.append(caption); return True
+    try:
+        run(CL.run_command_listener(TG(), None))
+    except asyncio.CancelledError:
+        pass
+    check(any("Bot status" in m for m in TG.sent), "/status must reply")
+    check(any("Active settings" in m for m in TG.sent), "/settings must reply")
+    check(any("/logs" in m for m in TG.sent), "/help must list /logs")
+    check(sum("Bot status" in m for m in TG.sent) == 1, "a stranger's /status must be ignored")
+
+
+@test
+def main_strategy_min_sweep_removed():
+    import core.strategy as S
+    check(S.MIN_LIQUIDITY_SWEEP_PCT == 0.0, f"minimum sweep depth must be removed (got {S.MIN_LIQUIDITY_SWEEP_PCT})")
+    check(S.MAX_LIQUIDITY_SWEEP_PCT > 0, "the 'too deep' limit must stay")
+
+
+@test
 def all_strategies_default_live():
     from core.agents.pool_agent import POOL_MODES
     import core.agents.liquidity_map_agent as LM
