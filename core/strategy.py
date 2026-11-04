@@ -187,7 +187,9 @@ MIN_REWARD_RISK_RATIO = 1.0
 # 89% of which were winners — 1.0% still filters shallow/marginal sweeps
 # (e.g. the KAITO case that tapped PDH by only 0.3% and lost) without
 # gutting the strategy's actual operating range.
-MIN_LIQUIDITY_SWEEP_PCT = 0.005  # 0.5% — loosened from 1.0% on 2026-08-15.
+MIN_LIQUIDITY_SWEEP_PCT = 0.0  # 2026-11-05: minimum REMOVED on request (was 0.5%, from 1.0% on 2026-08-15).
+# Replay 20-Jul..16-Oct, simple mode: 0.5% -> 67 trades, -Rs450; none -> 115 trades, +Rs201
+# (halves mixed: -1,570 / +1,771). The 'too deep' limit below still applies.
                                   # Evidence review showed 1.0% blocked 93%
                                   # winners among rejections in the 20-trade
                                   # verified set; 0.5% is a middle ground —
