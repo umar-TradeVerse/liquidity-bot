@@ -4,6 +4,7 @@ Liquidity Strategy Bot — CoinDCX
 Entry point: starts scheduler + monitoring loop
 """
 import asyncio
+import time
 import sys
 import os
 from typing import Optional
@@ -14,7 +15,7 @@ from core.state import BotState, DailyLevel, SYMBOLS
 from core.strategy import StrategyEngine
 from core.paper_exchange import PAPER, TRADING_MODE, PaperExchange
 from core.monitor import MarketMonitor
-from core import persistence
+from core import persistence, ops_reports
 from core.command_listener import run_command_listener
 from notifications.telegram import TelegramBot
 from exchange.coindcx import CoinDCXClient
@@ -90,6 +91,7 @@ async def daily_reset(state: BotState, engine: StrategyEngine, telegram: Telegra
 
 async def main():
     logger.info("Starting Liquidity Bot...")
+    ops_reports.STARTED = time.time()   # /status uptime counts from here, not from the first /status
     # Init components
     coindcx = CoinDCXClient(
         api_key=os.getenv('COINDCX_API_KEY'),

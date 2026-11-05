@@ -1243,6 +1243,15 @@ def paper_mode_is_visible_in_status_and_settings():
     check("LIVE" in ops_reports.status_text(), "/status says LIVE by default")
 
 
+@test
+def status_uptime_counts_from_bot_start():
+    import inspect
+    import main as MAIN
+    src = inspect.getsource(MAIN.main)
+    check("ops_reports.STARTED = time.time()" in src,
+          "main() must start the /status uptime clock (it showed 0:00:00 on the first /status)")
+
+
 # ── runner ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import logging
