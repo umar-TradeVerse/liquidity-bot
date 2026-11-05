@@ -178,10 +178,19 @@ candle picked by position instead of time · `/status` uptime started at first `
 1. **No profitable strategy yet.** Stay in paper until something passes the replay in both halves.
    The owner has a plan to discuss (expected to cover new strategy work).
 2. **P&L uses planned prices, not fills** — the daily halt doesn't see slippage (owner: OK for now).
-3. **SORB-15** (separate BTC session-breakout bot, separate repo) — systemd timers
-   `sorb15-watchdog.timer` (every 5 min) and `sorb15-live-watchdog.timer` (ran once 5 Nov 18:45 IST,
-   **no next run scheduled**) exist on the Droplet. Whether the bot is live and which Telegram token
-   it uses is unknown — must have its own token and its own CoinDCX key bound to 206.189.138.66.
+3. **SORB-15** (separate session-breakout bot, separate repo; BTC/Oil/NatGas) runs on the same Droplet
+   as user `sorb15` from `/home/sorb15/sorb15-bot`:
+   - `sorb15.service` = **paper** (env `.env`) + `sorb15-watchdog.timer` — **running**.
+   - `sorb15-live.service` = **LIVE real money** (env `.env.live`) — was running until 5 Nov 23:3x IST;
+     the owner had it **stopped**: disabled, its watchdog timer disabled, and locked off by
+     `/etc/systemd/system/sorb15-live.service.d/off-switch.conf`
+     (`ConditionPathExists=!/etc/sorb15-live.disabled`). `mask` is impossible (unit file sits in
+     /etc/systemd/system). Re-enable ONLY on the owner's request:
+     `rm /etc/sorb15-live.disabled && systemctl enable --now sorb15-live.service sorb15-live-watchdog.timer`.
+   - Paper and live share ONE Telegram token (…hLcE, not the liquidity bot's) — 0 409s so far. Give
+     paper its own @BotFather bot before ever running both again. Logs showed no live positions/orders
+     in the 3 days before it was stopped.
+   - Watchdogs were healthy (no restart loop); the earlier "no next run" was just a freshly enabled timer.
 4. Volume vs delta mismatch on ZAMA/RIF/AERO (uninvestigated); order-book heatmap (proposed).
 5. On 5 Nov 22:15 IST, before paper mode, live SOL and XRP longs were rejected by CoinDCX with
    "Insufficient funds" (as was KAITO at 17:00) — nothing filled.
