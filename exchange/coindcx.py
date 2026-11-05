@@ -356,6 +356,23 @@ class CoinDCXClient:
             for c in recent
         ]
 
+    async def get_futures_book(self, symbol: str) -> Optional[dict]:
+        """Full 50-level FUTURES order book (both sides), for the log-only
+        order-book recorder (2026-11-06). Always futures -- the venue orders
+        actually fill on -- whatever CANDLE_SOURCE says. None on any failure."""
+        pair = SYMBOL_MAP.get(symbol)
+        if not pair:
+            return None
+        res = await self._get(f"/market_data/v3/orderbook/{pair}-futures/50")
+        if not isinstance(res, dict) or not res.get("bids") or not res.get("asks"):
+            return None
+        try:
+            return {"bids": {float(p): float(q) for p, q in res["bids"].items()},
+                    "asks": {float(p): float(q) for p, q in res["asks"].items()},
+                    "ts": res.get("ts")}
+        except (TypeError, ValueError, AttributeError):
+            return None
+
     async def get_orderbook(self, symbol: str, depth: int = 5) -> Optional[dict]:
         """2026-09-03: fetches order book depth for OBI (Order Book Imbalance)
         tracking. INFORMATIONAL ONLY -- this never gates a trade decision,

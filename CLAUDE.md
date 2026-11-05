@@ -94,6 +94,7 @@ core/state.py              BotState, DailyLevel
 core/persistence.py        state snapshot (+ last candle per symbol) + trades.jsonl (tagged mode)
 core/candle_store.py       shared 15m candle history for sub-agents
 core/orderflow.py, candle_patterns.py, obi.py   LOG-ONLY research data
+core/book_recorder.py      LOG-ONLY: 50-level futures order book near tracked levels (wall research)
 core/ops_reports.py        /logs, /status, /settings text
 core/command_listener.py   Telegram command polling
 core/agents/               risk, context, liquidity_map, pool (off), breakout (off), pattern (advisory)
@@ -136,6 +137,7 @@ deeper level. Skips Context. **Replay says it loses even before fees** (§6).
 |---|---|---|
 | `TRADING_MODE` | `live` (default if unset) / `paper` | paper = every account call simulated, signed requests blocked; market data live. **Any other value = paper** (typo-safe). Paper P&L counts toward the halt; pattern memory learns from paper trades. |
 | `CANDLE_SOURCE` | `spot` (default) / `futures` | price feed for signals + OBI order book. Bot trades futures but has always read the spot (`B-`) feed. **futures replayed worse in both halves — not adopted.** |
+| `BOOK_RECORDER` | on (default) / off | log-only: every ~15 s, for coins within 1% of PDH/PDL or a Liquidity Map level, saves the 50-level futures book to `PERSIST_DIR/orderbook/YYYY-MM-DD.jsonl.gz` (~700 B/snapshot, kept 45 days). Started 6 Nov 2026 for the wall-hunt research (§8). |
 | `SIMPLE_MODE` | on (default) / off | |
 | `LIQMAP_MODE`, `POOL_*_MODE`, `BREAKOUT_MODE`, `OBI_EXIT_MODE` | | see code |
 
@@ -191,7 +193,17 @@ candle picked by position instead of time · `/status` uptime started at first `
      paper its own @BotFather bot before ever running both again. Logs showed no live positions/orders
      in the 3 days before it was stopped.
    - Watchdogs were healthy (no restart loop); the earlier "no next run" was just a freshly enabled timer.
-4. Volume vs delta mismatch on ZAMA/RIF/AERO (uninvestigated); order-book heatmap (proposed).
+4. **Wall hunt** (owner's idea): a big resting order near a level is where stop-hunts cluster —
+   trade the reversal after price sweeps through it. Untestable on history (CoinDCX keeps no book
+   history), so the **order-book recorder runs since 6 Nov 2026**. After ~4 weeks: replay on the
+   recorded books (whole period + halves) before building any agent. Proposed definitions, fixed
+   in advance: wall = one level ≥ 5× median size, within 0.3% of a level, seen ≥ 4 snapshots in a
+   row; sweep = a candle trades through it; confirm = within 2 candles a close back past it in the
+   reversal colour; stop beyond the sweep extreme, 1.5R. Book reach: ETH ±0.02% (walls effectively
+   invisible), TAO ±0.23%, XRP/SOL/ZAMA/AERO/RIF ±0.4–0.9%, KAITO ±2.4%.
+5. **TFO killzones / PW / PM levels** — tested, none positive in both halves
+   (`scripts/replay/README.md`). NY AM killzone is a near-miss (+0.13R avg, ~break-even after fees).
+6. Volume vs delta mismatch on ZAMA/RIF/AERO (uninvestigated).
 5. On 5 Nov 22:15 IST, before paper mode, live SOL and XRP longs were rejected by CoinDCX with
    "Insufficient funds" (as was KAITO at 17:00) — nothing filled.
 

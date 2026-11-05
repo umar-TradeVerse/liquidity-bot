@@ -37,6 +37,7 @@ from core.agents.breakout_agent import BreakoutAgent
 from core.candle_patterns import classify as classify_candle
 from core.orderflow import VolumeTracker, TradeFlow, volume_profile, fmt_flow, fmt_vp
 from core.trade_manager import TradeManagerMixin
+from core.book_recorder import BookRecorder
 
 
 class MarketMonitor(ExecutionMixin, TradeManagerMixin):
@@ -63,6 +64,8 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         # Order-flow measurements (2026-10-03, log-only): volume, volume profile, delta/CVD
         self.vol = VolumeTracker()
         self.flow = TradeFlow(coindcx)
+        # Order-book recorder (2026-11-06, log-only): futures book near levels, for wall research
+        self.books = BookRecorder(coindcx)
         self._last_flow: dict = {}
         # Breakout Sub-Agent (2026-10-03) — PAPER TRADING ONLY, never places orders
         self.breakout = BreakoutAgent(self.candles, float(os.getenv('TRADE_SIZE_USD', 40)), TRADE_LEVERAGE)
@@ -85,6 +88,18 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         if self._trailing:
             logger.info(f"Restored trailing state for: {list(self._trailing.keys())}")
 
+
+    def _tracked_levels(self, symbol: str) -> list:
+        """[(name, price)] the bot is watching on this coin: PDH/PDL and the
+        Liquidity Map's active levels (for the order-book recorder)."""
+        out = []
+        lv = self.state.get_level(symbol)
+        if lv is not None:
+            out += [("PDH", lv.pdh), ("PDL", lv.pdl)]
+        liq = getattr(self, "liqmap", None)
+        for v in (getattr(liq, "levels", {}) or {}).get(symbol, []) if liq else []:
+            out.append(("LM-" + v.get("k", "?"), v.get("p")))
+        return out
 
     def candle_memory(self) -> dict:
         """Last candle processed per symbol, by the monitor and by the
@@ -273,6 +288,14 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                 await self.flow.poll(symbol)
             except Exception as e:
                 logger.warning(f"{symbol} | order-flow poll error ({e})")
+
+            # Order-book recorder (log-only): every poll, in the background
+            try:
+                books = getattr(self, "books", None)
+                if books is not None:
+                    books.maybe_record(symbol, float(candle["close"]), self._tracked_levels(symbol))
+            except Exception as e:
+                logger.warning(f"{symbol} | order-book recorder error ({e})")
 
             # 2026-11-05: `<=`, not `==` -- if the exchange briefly returns an
             # OLDER closed candle, it must not be run through the strategy a

@@ -24,7 +24,7 @@ os.environ["PERSIST_DIR"] = tempfile.mkdtemp(prefix="bot_tests_")
 os.environ.setdefault("TRADE_SIZE_USD", "75")
 for k in ("COINDCX_API_KEY", "COINDCX_API_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
     os.environ.setdefault(k, "test")
-for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE", "TRADING_MODE", "CANDLE_SOURCE"):
+for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE", "TRADING_MODE", "CANDLE_SOURCE", "BOOK_RECORDER"):
     os.environ.pop(k, None)
 
 RESULTS = []
@@ -1418,6 +1418,103 @@ def todays_trade_flag_saved_immediately():
     finally:
         E.persistence.save_state = orig
     check(True in saved, "the used-today flag is saved before the order goes out")
+
+
+# ── order-book recorder (2026-11-06, log-only) ─────────────────────────
+class _BookCDX:
+    def __init__(self, fail=False):
+        self.calls, self.fail = 0, fail
+
+    async def get_futures_book(self, sym):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("api down")
+        return {"bids": {99.0: 5.0, 99.5: 1.0}, "asks": {100.5: 2.0, 100.0: 300.0}, "ts": 1}
+
+
+def _read_books(d):
+    import gzip, json
+    rows = []
+    for name in sorted(os.listdir(d)):
+        with gzip.open(os.path.join(d, name), "rt") as f:
+            rows += [json.loads(x) for x in f]
+    return rows
+
+
+@test
+def book_recorder_records_only_near_levels():
+    import tempfile as _t
+    import core.book_recorder as BR
+    check(BR.BOOK_RECORDER is True, "recorder is on by default (log-only)")
+    tmp = _t.mkdtemp()
+    cdx = _BookCDX()
+    rec = BR.BookRecorder(cdx, persist_dir=tmp)
+
+    async def go():
+        rec.maybe_record("SOLUSD", 100.0, [("PDH", 105.0), ("PDL", 90.0)])     # 5% away: nothing
+        rec.maybe_record("SOLUSD", 100.0, [("PDH", 100.8), ("LM-low", 99.5)])  # within 1%: record
+        rec.maybe_record("SOLUSD", 100.0, [("PDH", 100.8)])                    # in flight: skipped
+        await asyncio.sleep(0.05)
+    run(go())
+    rows = _read_books(os.path.join(tmp, "orderbook"))
+    check(cdx.calls == 1 and len(rows) == 1, f"one fetch, one snapshot (calls {cdx.calls}, rows {len(rows)})")
+    r = rows[0]
+    check(r["s"] == "SOLUSD" and r["c"] == 100.0 and r["lv"] == [["PDH", 100.8], ["LM-low", 99.5]],
+          f"snapshot names the nearby levels: {r}")
+    check(r["b"][0] == [99.5, 1.0] and r["a"][0] == [100.0, 300.0],
+          "book stored best price first on each side (walls visible as big qty)")
+
+
+@test
+def book_recorder_never_breaks_the_bot():
+    import tempfile as _t
+    import core.book_recorder as BR
+    rec = BR.BookRecorder(_BookCDX(fail=True), persist_dir=_t.mkdtemp())
+
+    async def go():
+        rec.maybe_record("RIFUSD", 0.06, [("PDL", 0.0601)])
+        await asyncio.sleep(0.05)
+        rec.maybe_record("RIFUSD", 0.06, [("PDL", 0.0601)])                    # free again after a failure
+        await asyncio.sleep(0.05)
+    run(go())
+    check(rec.failures == 2 and not rec._busy, "a failed fetch is counted and skipped, nothing raised")
+    BR.BOOK_RECORDER = False
+    try:
+        cdx = _BookCDX(); rec2 = BR.BookRecorder(cdx, persist_dir=_t.mkdtemp())
+
+        async def go2():
+            rec2.maybe_record("RIFUSD", 0.06, [("PDL", 0.0601)])
+            await asyncio.sleep(0.02)
+        run(go2())
+        check(cdx.calls == 0, "BOOK_RECORDER=off records nothing")
+    finally:
+        BR.BOOK_RECORDER = True
+
+
+@test
+def book_recorder_keeps_45_days():
+    import tempfile as _t
+    import core.book_recorder as BR
+    tmp = _t.mkdtemp(); d = os.path.join(tmp, "orderbook"); os.makedirs(d)
+    for name in ("2020-01-01.jsonl.gz", "2099-01-01.jsonl.gz"):
+        open(os.path.join(d, name), "w").close()
+    rec = BR.BookRecorder(_BookCDX(), persist_dir=tmp)
+    rec._write(int(time.time() * 1000), {"t": 1})
+    left = sorted(os.listdir(d))
+    check("2020-01-01.jsonl.gz" not in left and "2099-01-01.jsonl.gz" in left and len(left) == 2,
+          f"files older than 45 days are deleted, newer kept: {left}")
+
+
+@test
+def monitor_feeds_recorder_its_levels():
+    m, _ = _candle_monitor([_c(900000)])
+    seen = []
+    m.books = type("B", (), {"maybe_record": lambda self, *a: seen.append(a)})()
+    m.liqmap = type("L", (), {"levels": {"ETHUSD": [{"k": "high", "p": 2710.0}]}})()
+    run(m._process_symbol("ETHUSD"))
+    check(seen and seen[0][0] == "ETHUSD" and seen[0][1] == 2700.0
+          and seen[0][2] == [("PDH", 2743.0), ("PDL", 2600.0), ("LM-high", 2710.0)],
+          f"every poll hands the recorder the close and all tracked levels: {seen}")
 
 
 # ── runner ─────────────────────────────────────────────────────────────
