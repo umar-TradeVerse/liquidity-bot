@@ -137,7 +137,7 @@ deeper level. Skips Context. **Replay says it loses even before fees** (§6).
 |---|---|---|
 | `TRADING_MODE` | `live` (default if unset) / `paper` | paper = every account call simulated, signed requests blocked; market data live. **Any other value = paper** (typo-safe). Paper P&L counts toward the halt; pattern memory learns from paper trades. |
 | `CANDLE_SOURCE` | `spot` (default) / `futures` | price feed for signals + OBI order book. Bot trades futures but has always read the spot (`B-`) feed. **futures replayed worse in both halves — not adopted.** |
-| `BOOK_RECORDER` | on (default) / off | log-only: every ~15 s, for coins within 1% of PDH/PDL or a Liquidity Map level, saves the 50-level futures book to `PERSIST_DIR/orderbook/YYYY-MM-DD.jsonl.gz` (~700 B/snapshot, kept 45 days). Started 6 Nov 2026 for the wall-hunt research (§8). |
+| `BOOK_RECORDER` | on (default) / off | log-only: every ~15 s, for coins within 1% of PDH/PDL or a Liquidity Map level, saves the 50-level futures book to `PERSIST_DIR/orderbook/YYYY-MM-DD.jsonl.gz` (~700 B/snapshot, kept 45 days). Started 6 Nov 2026 for the wall-hunt research (§8). Runs 24/7: overnight (23:00–05:30 IST) every coin is still polled for candles + books, but the strategy and sub-agents never run. |
 | `SIMPLE_MODE` | on (default) / off | |
 | `LIQMAP_MODE`, `POOL_*_MODE`, `BREAKOUT_MODE`, `OBI_EXIT_MODE` | | see code |
 

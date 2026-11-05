@@ -166,25 +166,27 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                     # Only NEW entries stop. Previously the bot did nothing
                     # overnight and open trades relied solely on the
                     # exchange-side SL.
+                    # 2026-11-06: every coin is still polled overnight (candle
+                    # log line + order-book recorder), but _process_symbol
+                    # returns before the strategy and sub-agents when
+                    # entries_allowed=False -- nothing can arm or enter.
+                    if not self._offhours_logged:
+                        logger.info(f"Outside entry hours (23:00–05:30 IST) — no new entries; "
+                                    f"managing {len(self._trailing)} open position(s)"
+                                    f"{': ' + str(list(self._trailing.keys())) if self._trailing else ''}"
+                                    f", still logging candles and order books")
+                        self._offhours_logged = True
                     if self._trailing:
-                        if not self._offhours_logged:
-                            logger.info(f"Outside entry hours (23:00–05:30 IST) — managing "
-                                        f"{len(self._trailing)} open position(s): "
-                                        f"{list(self._trailing.keys())} — no new entries")
-                            self._offhours_logged = True
                         await self._reconcile_positions()
-                        tasks = [self._process_symbol(sym, entries_allowed=False)
-                                 for sym in list(self._trailing.keys())]
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        self._loops_since_save += 1
-                        if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
-                            persistence.save_state(self.state, self._trailing, self.candle_memory())
-                            self._loops_since_save = 0
-                        self._save_if_positions_changed()
-                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    else:
-                        self._save_if_positions_changed()
-                        await asyncio.sleep(60)
+                    active_symbols = set(SYMBOLS) | set(self._trailing.keys())
+                    tasks = [self._process_symbol(sym, entries_allowed=False) for sym in active_symbols]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    self._loops_since_save += 1
+                    if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
+                        persistence.save_state(self.state, self._trailing, self.candle_memory())
+                        self._loops_since_save = 0
+                    self._save_if_positions_changed()
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
                 self._offhours_logged = False
 

@@ -1517,6 +1517,60 @@ def monitor_feeds_recorder_its_levels():
           f"every poll hands the recorder the close and all tracked levels: {seen}")
 
 
+@test
+def overnight_polls_every_coin_but_never_enters():
+    # 23:00-05:30 IST with NO open trade: every coin is still polled (candle log +
+    # order-book recorder), the strategy and sub-agents never run.
+    import core.monitor as M
+    from core.state import BotState, DailyLevel
+    calls = {"engine": 0, "handled": 0, "recorded": set()}
+
+    class Eng:
+        _last_candle, pending_expiry_alerts = {}, []
+
+        def process_candle(self, *a):
+            calls["engine"] += 1
+
+    class CDX:
+        t = 0
+
+        async def get_latest_15m_candle(self, sym):
+            CDX.t += 900000
+            return {"time": CDX.t, "open": 1, "high": 1, "low": 1, "close": 1.0}
+
+    class Flow:
+        async def poll(self, sym):
+            pass
+    m = M.MarketMonitor.__new__(M.MarketMonitor)
+    m.state = BotState()
+    for s in M.SYMBOLS:
+        m.state.levels[s] = DailyLevel(pdh=1.005, pdl=0.9)
+    m.coindcx, m.engine, m.flow, m._offhours_logged, m._saved_open = CDX(), Eng(), Flow(), False, []
+    m._trailing, m._last_candle_time, m._last_candle = {}, {}, {}
+    m._loops_since_save, m._SAVE_EVERY_N_LOOPS = 0, 999
+    m._update_flow = lambda *a: "flow n/a"
+    m.books = type("B", (), {"maybe_record": lambda self, sym, *a: calls["recorded"].add(sym)})()
+    m._is_trading_hours = lambda: False
+
+    async def handled(*a):
+        calls["handled"] += 1
+    m._handle_signal = handled
+    orig_poll, orig_save = M.POLL_INTERVAL_SECONDS, M.persistence.save_state
+    M.POLL_INTERVAL_SECONDS, M.persistence.save_state = 0.01, (lambda *a, **k: None)
+
+    async def go():
+        try:
+            await asyncio.wait_for(m.run(), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass
+    try:
+        run(go())
+    finally:
+        M.POLL_INTERVAL_SECONDS, M.persistence.save_state = orig_poll, orig_save
+    check(calls["recorded"] == set(M.SYMBOLS), f"every coin polled overnight: {sorted(calls['recorded'])}")
+    check(calls["engine"] == 0 and calls["handled"] == 0, "no strategy, no entries overnight")
+
+
 # ── runner ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import logging
