@@ -56,8 +56,11 @@ def _ensure_dir_available() -> bool:
     return False
 
 
-def save_state(state, trailing: dict):
-    """Write current levels + trailing snapshot. Safe to call every poll cycle."""
+def save_state(state, trailing: dict, candles: Optional[dict] = None):
+    """Write current levels + trailing snapshot. Safe to call every poll cycle.
+
+    candles (2026-11-05): the last candle processed per symbol, so a restart
+    does not run that same candle through the strategy a second time."""
     if not _ensure_dir_available():
         return
     try:
@@ -69,6 +72,7 @@ def save_state(state, trailing: dict):
                 for sym, lvl in state.levels.items()
             },
             "trailing": trailing,
+            "candles": candles or {},
         }
         tmp_path = STATE_SNAPSHOT_PATH + ".tmp"
         with open(tmp_path, "w") as f:
@@ -97,17 +101,25 @@ def load_state() -> Optional[dict]:
         return None
 
     if snapshot.get("date_ist") != date.today().isoformat():
+        # 2026-11-05: yesterday's LEVELS are stale, but its open positions are
+        # not -- a restart across the day change (e.g. 05:25 -> 05:31 IST) used
+        # to drop them, leaving live trades unmanaged and their closes uncounted.
+        trailing = snapshot.get("trailing", {}) or {}
         logger.info(
             f"State snapshot is from {snapshot.get('date_ist')}, not today "
-            f"({date.today().isoformat()}) — ignoring, daily_reset will run normally."
+            f"({date.today().isoformat()}) — levels ignored, daily_reset will run normally"
+            f"{f'; keeping {len(trailing)} open position(s)' if trailing else ''}."
         )
-        return None
+        if not trailing:
+            return None
+        return {"levels": {}, "trailing": trailing, "candles": {}, "same_day": False}
 
     logger.info(
         f"Restoring state snapshot saved at {snapshot.get('saved_at_ist')} "
         f"({len(snapshot.get('trailing', {}))} open position(s) tracked)"
     )
-    return {"levels": snapshot.get("levels", {}), "trailing": snapshot.get("trailing", {})}
+    return {"levels": snapshot.get("levels", {}), "trailing": snapshot.get("trailing", {}),
+            "candles": snapshot.get("candles", {}), "same_day": True}
 
 
 def get_pattern_stats(trend_mode: bool) -> dict:
@@ -181,6 +193,8 @@ def log_trade_event(event: dict):
     try:
         event = dict(event)
         event.setdefault("logged_at_ist", datetime.now(IST).isoformat())
+        from core.paper_exchange import TRADING_MODE      # 2026-11-05: tag paper vs live
+        event.setdefault("mode", TRADING_MODE)
         with open(TRADES_LOG_PATH, "a") as f:
             f.write(json.dumps(event) + "\n")
     except Exception as e:

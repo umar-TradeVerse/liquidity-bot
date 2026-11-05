@@ -22,6 +22,10 @@ IST = pytz.timezone("Asia/Kolkata")
 COINDCX_BASE_URL = "https://api.coindcx.com"
 COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 
+class PositionsUnavailable(RuntimeError):
+    """The open-positions call failed -- positions are UNKNOWN, not empty."""
+
+
 SYMBOL_MAP = {
     "ETHUSD": "B-ETH_USDT",
     "SOLUSD": "B-SOL_USDT",
@@ -569,14 +573,19 @@ class CoinDCXClient:
 
         result = await self._post("/exchange/v1/derivatives/futures/positions", body)
 
+        # 2026-11-05: a failed call (timeout, DNS, 4xx/5xx -> None) or an
+        # unknown reply must RAISE, never look like "no open positions":
+        # every caller already treats an exception as "unknown, try again",
+        # whereas {} made reconcile close and forget every live trade.
         if isinstance(result, list):
             entries = result
         elif isinstance(result, dict) and "positions" in result:
             entries = result["positions"]
+        elif result is None:
+            raise PositionsUnavailable(f"positions call failed: {self.last_error}")
         else:
-            if result is not None:
-                logger.warning(f"Unexpected positions response shape: {type(result)}")
-            entries = []
+            logger.warning(f"Unexpected positions response shape: {type(result)}")
+            raise PositionsUnavailable(f"unexpected positions response: {type(result).__name__}")
 
         positions = {}
         for entry in entries:

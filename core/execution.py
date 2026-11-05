@@ -243,6 +243,13 @@ class ExecutionMixin:
             logger.error(f"{symbol} | Failed to fetch live position before close: {e}", exc_info=True)
             live_positions = {}
             positions_ok = False
+        if not positions_ok:
+            # 2026-11-05: position size unknown -> keep tracking it and retry
+            # on the next candle, instead of booking a close that never happened.
+            tr["retry_close"] = {"exit_price": exit_price, "reason": reason, "label": label}
+            tr['position_closed'] = True   # nothing else this candle
+            logger.warning(f"{symbol} | Exit ({reason}) postponed — positions unknown, retrying next candle")
+            return
 
         quantity = abs(live_positions.get(symbol, 0))
 
@@ -295,18 +302,22 @@ class ExecutionMixin:
             )
             logger.info(f"{symbol} | Exited via {reason} at {exit_price:.4f} (qty {quantity})")
         else:
-            await self.telegram.send_alert(
-                f"⚠️ *{label} — Close Failed*\n\n"
-                f"*Symbol:* {symbol}\n"
-                f"Tried to close automatically but the exchange call failed. "
-                f"Please check and close manually on CoinDCX."
-            )
-            logger.error(f"{symbol} | Failed to auto-close on {reason} trigger")
-
-        # qty=0 on a FAILED close so the Risk Agent never books P&L for a
-        # position that is actually still open on the exchange.
-        self._log_close(symbol, tr, exit_price=exit_price, reason=reason,
-                        qty=quantity if success else 0)
+            # 2026-11-05: the position is still open on the exchange -- keep
+            # tracking it (SL/TP/reconcile) and retry the close next candle.
+            tr["retry_close"] = {"exit_price": exit_price, "reason": reason, "label": label}
+            tr["close_failures"] = tr.get("close_failures", 0) + 1
+            logger.error(f"{symbol} | Failed to auto-close on {reason} trigger "
+                         f"(attempt {tr['close_failures']}) — retrying next candle")
+            if tr["close_failures"] in (1, 4):
+                await self.telegram.send_alert(
+                    f"⚠️ *{label} — Close Failed*\n\n"
+                    f"*Symbol:* {symbol}\n"
+                    f"The exchange close call failed (attempt {tr['close_failures']}). "
+                    f"The bot keeps tracking the position and retries every candle; "
+                    f"the exchange stop is still in place. Close manually on CoinDCX if urgent."
+                )
+            return
+        self._log_close(symbol, tr, exit_price=exit_price, reason=reason, qty=quantity)
         self.state.reset_symbol_watch(symbol)
         self._trailing.pop(symbol, None)
         self._open_positions.pop(symbol, None)

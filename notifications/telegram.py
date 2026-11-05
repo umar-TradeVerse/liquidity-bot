@@ -27,7 +27,7 @@ class TelegramBot:
         url = f"{TELEGRAM_API}/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
-            "text": message,
+            "text": getattr(self, "prefix", "") + message,   # "📝 PAPER — " in paper mode
             "parse_mode": parse_mode,
             "disable_web_page_preview": True
         }
@@ -89,12 +89,17 @@ class TelegramBot:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        self._poll_failures = 0
                         return data.get("result", [])
                     logger.warning(f"getUpdates returned {resp.status}")
         except asyncio.TimeoutError:
-            pass  # normal for long-polling with no new messages
+            return []  # normal for long-polling with no new messages
         except Exception as e:
             logger.error(f"getUpdates error: {e}")
+        # 2026-11-05: back off after a failure (DNS outage, 409 conflict, 429)
+        # -- before this the listener retried instantly, hundreds of times a second.
+        self._poll_failures = getattr(self, "_poll_failures", 0) + 1
+        await asyncio.sleep(min(60, 2 ** min(self._poll_failures, 6)))
         return []
 
     async def send_document(self, file_path: str, caption: Optional[str] = None) -> bool:

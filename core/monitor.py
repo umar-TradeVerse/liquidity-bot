@@ -27,6 +27,8 @@ from core.trading_common import (  # explicit, so lint can catch undefined names
 # Re-export every shared name so code importing from core.monitor keeps
 # working (main.py, tests, agents). Done without 'import *' so lint can
 # still detect undefined names in this file.
+from typing import Optional
+
 import core.trading_common as _common
 globals().update({_n: getattr(_common, _n) for _n in _common.__all__ if _n not in globals()})
 from core.execution import ExecutionMixin
@@ -84,6 +86,29 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
             logger.info(f"Restored trailing state for: {list(self._trailing.keys())}")
 
 
+    def candle_memory(self) -> dict:
+        """Last candle processed per symbol, by the monitor and by the
+        strategy engine -- saved in the snapshot (2026-11-05)."""
+        return {"monitor": dict(getattr(self, "_last_candle", {}) or {}),
+                "engine": dict(getattr(getattr(self, "engine", None), "_last_candle", {}) or {})}
+
+    def restore_candles(self, mem: Optional[dict]):
+        """2026-11-05: after a restart the exchange returns the same closed
+        candle that was processed just before the stop. Without this it went
+        through the strategy twice: a delayed entry fired one candle early,
+        and the sweep candle could become its own trigger."""
+        mem = mem or {}
+        for sym, c in (mem.get("monitor") or {}).items():
+            if c and "time" in c:
+                self._last_candle[sym] = c
+                self._last_candle_time[sym] = c["time"]
+        if getattr(self, "engine", None) is not None:
+            for sym, c in (mem.get("engine") or {}).items():
+                if c and "time" in c:
+                    self.engine._last_candle[sym] = c
+        if self._last_candle_time:
+            logger.info(f"Restored last processed candle for {len(mem.get('monitor') or {})} symbol(s)")
+
     def _save_if_positions_changed(self):
         """2026-10-01 fix: save the snapshot IMMEDIATELY whenever a position
         opens or closes. Previously a trade that closed overnight left the
@@ -91,7 +116,7 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         'rediscovered' the close and booked its P&L again."""
         now_open = sorted(self._trailing.keys())
         if now_open != self._saved_open:
-            persistence.save_state(self.state, self._trailing)
+            persistence.save_state(self.state, self._trailing, self.candle_memory())
             self._saved_open = now_open
             self._loops_since_save = 0
 
@@ -106,6 +131,16 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
         while True:
             try:
                 if not self.state.levels_ready() or self.state.paused:
+                    # 2026-11-05: no levels / paused stops NEW entries only.
+                    # Open trades are still reconciled and managed (stop,
+                    # breakeven, target, timeout) -- before this a failed
+                    # 05:30 level fetch left them unmanaged for the whole day.
+                    if self._trailing:
+                        await self._reconcile_positions()
+                        await asyncio.gather(*[self._process_symbol(sym, entries_allowed=False)
+                                               for sym in list(self._trailing)],
+                                             return_exceptions=True)
+                        self._save_if_positions_changed()
                     await asyncio.sleep(30)
                     continue
 
@@ -128,7 +163,7 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                         await asyncio.gather(*tasks, return_exceptions=True)
                         self._loops_since_save += 1
                         if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
-                            persistence.save_state(self.state, self._trailing)
+                            persistence.save_state(self.state, self._trailing, self.candle_memory())
                             self._loops_since_save = 0
                         self._save_if_positions_changed()
                         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -157,7 +192,7 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
 
                 self._loops_since_save += 1
                 if self._loops_since_save >= self._SAVE_EVERY_N_LOOPS:
-                    persistence.save_state(self.state, self._trailing)
+                    persistence.save_state(self.state, self._trailing, self.candle_memory())
                     self._loops_since_save = 0
                 self._save_if_positions_changed()
 
@@ -239,7 +274,11 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
             except Exception as e:
                 logger.warning(f"{symbol} | order-flow poll error ({e})")
 
-            if self._last_candle_time[symbol] == candle['time']:
+            # 2026-11-05: `<=`, not `==` -- if the exchange briefly returns an
+            # OLDER closed candle, it must not be run through the strategy a
+            # second time (double entry-delay countdown, re-armed triggers).
+            last_t = self._last_candle_time.get(symbol)
+            if last_t is not None and int(candle['time']) <= int(last_t):
                 logger.debug(f"{symbol} | Candle already processed")
                 return
 
@@ -305,7 +344,13 @@ class MarketMonitor(ExecutionMixin, TradeManagerMixin):
                         remaining.append(ev)
                 self.engine.pending_expiry_alerts = remaining
 
-            if signal:
+            if signal and symbol in self._trailing:
+                # 2026-11-05: the 05:30 daily reset rebuilds levels with
+                # in_trade=False, so a trade still open from yesterday no
+                # longer stopped a new main signal -> a second live order on
+                # the same coin (adds to / nets against the open position).
+                logger.info(f"{symbol} | {signal.side} signal skipped — symbol already in a trade")
+            elif signal:
                 await self._handle_signal(signal)
 
             # ── Liquidity Pool Agent (separate sub-agent, 2026-09-29) ──────

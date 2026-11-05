@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 from core.state import BotState, DailyLevel, SYMBOLS
 from core.strategy import StrategyEngine
+from core.paper_exchange import PAPER, TRADING_MODE, PaperExchange
 from core.monitor import MarketMonitor
 from core import persistence
 from core.command_listener import run_command_listener
@@ -66,10 +67,16 @@ async def daily_reset(state: BotState, engine: StrategyEngine, telegram: Telegra
             )
             state.paused = True
             return
+    # 2026-11-05: a trade still open from yesterday keeps its symbol marked
+    # in_trade -- reset_daily() rebuilt every level with in_trade=False, which
+    # let the strategy arm and fire a second entry on a coin already in a trade.
+    if monitor is not None:
+        for sym in monitor._trailing:
+            state.mark_in_trade(sym)
     # Snapshot immediately so a restart later today never reloads yesterday's
     # (now stale) state instead of today's freshly-reset levels.
     if monitor is not None:
-        persistence.save_state(state, monitor._trailing)
+        persistence.save_state(state, monitor._trailing, monitor.candle_memory())
     await telegram.send_alert(
         f"✅ Daily levels set:\n"
         f"{'='*30}\n" +
@@ -88,7 +95,13 @@ async def main():
         api_key=os.getenv('COINDCX_API_KEY'),
         api_secret=os.getenv('COINDCX_API_SECRET')
     )
+    if PAPER:
+        # 2026-11-05: TRADING_MODE=paper -- no order ever reaches CoinDCX
+        coindcx = PaperExchange(coindcx)
+        logger.info("TRADING_MODE=paper — orders are SIMULATED, nothing is sent to CoinDCX")
     telegram = TelegramBot()
+    if PAPER:
+        telegram.prefix = "📝 PAPER — "
     state = BotState()
     engine = StrategyEngine(coindcx, state)
     monitor = MarketMonitor(coindcx, engine, state, telegram)
@@ -96,7 +109,7 @@ async def main():
     if not await telegram.test_connection():
         logger.error("Telegram connection failed — check BOT_TOKEN and CHAT_ID")
         sys.exit(1)
-    await telegram.send_alert("🤖 Liquidity Bot started successfully.")
+    await telegram.send_alert(f"🤖 Liquidity Bot started successfully ({TRADING_MODE.upper()} trading).")
     # Scheduler for 5:30 AM IST daily reset (runs every day, weekends included)
     scheduler = AsyncIOScheduler(timezone=IST)
     scheduler.add_job(
@@ -132,6 +145,7 @@ async def main():
                 level_dict = {k: v for k, v in level_dict.items() if k in _known}
             state.levels[sym] = DailyLevel(**level_dict) if level_dict is not None else None
         monitor.restore_trailing(restored["trailing"])
+        monitor.restore_candles(restored.get("candles"))
         await telegram.send_alert(
             f"♻️ Restored today's state from snapshot "
             f"({len(restored['trailing'])} open position(s) reattached)."

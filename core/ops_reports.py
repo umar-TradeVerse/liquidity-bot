@@ -18,7 +18,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Only these settings may ever be shown. Keys/secrets/tokens are never listed.
 SETTINGS_SHOWN = (
-    "TRADE_SIZE_USD", "SIMPLE_MODE", "POOL_EQUAL_MODE", "POOL_SESSION_MODE",
+    "TRADING_MODE", "TRADE_SIZE_USD", "SIMPLE_MODE", "POOL_EQUAL_MODE", "POOL_SESSION_MODE",
     "LIQMAP_MODE", "LIQMAP_MIN_SWEEP_PCT", "BREAKOUT_MODE", "OBI_EXIT_MODE",
     "EARLY_FAILURE_MODE", "ORDERFLOW_SKIP", "USD_INR_RATE", "DEBUG",
 )
@@ -64,7 +64,10 @@ def status_text(monitor=None) -> str:
     now = datetime.now(IST)
     hm = now.hour * 60 + now.minute
     window = "OPEN (05:30–23:00 IST)" if 5 * 60 + 30 <= hm < 23 * 60 else "closed — managing open trades only"
-    lines = ["🟢 *Bot status*", f"Running for {up}", f"Entry hours: {window}", f"Code: `{_version()}`"]
+    from core.paper_exchange import TRADING_MODE
+    lines = ["🟢 *Bot status*", f"Running for {up}",
+             f"Trading: {'📝 PAPER — simulated, no real orders' if TRADING_MODE == 'paper' else '💰 LIVE — real orders'}",
+             f"Entry hours: {window}", f"Code: `{_version()}`"]
     if monitor is not None:
         tr = getattr(monitor, "_trailing", {}) or {}
         if tr:
@@ -97,10 +100,14 @@ def settings_text() -> str:
             continue                                   # defence in depth
         v = os.getenv(k)
         lines.append(f"`{k}` = {v if v is not None else '(default)'}")
+    from core.paper_exchange import TRADING_MODE
     lines += ["", "*Effective values*",
+              f"Trading: {TRADING_MODE.upper()}"
+              f"{' — simulated, no real orders' if TRADING_MODE == 'paper' else ' — real orders'}",
               f"Simple mode: {'ON' if simple_mode.ON else 'OFF'} — entry delay "
               f"{S.ENTRY_DELAY_CANDLES} candle(s), target {simple_mode.TP_R}R",
-              f"Min sweep depth (main strategy): {S.MIN_LIQUIDITY_SWEEP_PCT * 100:.2f}%",
+              f"Min sweep depth (main strategy): {S.MIN_LIQUIDITY_SWEEP_PCT * 100:.2f}% "
+              f"(every sweep must still go {S.MIN_SWEEP_DEPTH_PCT * 100:.1f}% past the level)",
               f"USD→INR rate: {USD_TO_INR_RATE}",
               "", "_To change a setting: server console →_ `nano /etc/bots/liquidity-bot.env` "
               "_then_ `systemctl restart liquidity-bot`"]

@@ -24,7 +24,7 @@ os.environ["PERSIST_DIR"] = tempfile.mkdtemp(prefix="bot_tests_")
 os.environ.setdefault("TRADE_SIZE_USD", "75")
 for k in ("COINDCX_API_KEY", "COINDCX_API_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
     os.environ.setdefault(k, "test")
-for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE"):
+for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE", "TRADING_MODE"):
     os.environ.pop(k, None)
 
 RESULTS = []
@@ -218,7 +218,7 @@ def duplicate_close_ignored():
 def snapshot_saved_when_position_closes():
     import core.monitor as M
     saves, orig = [], M.persistence.save_state
-    M.persistence.save_state = lambda st, trl: saves.append(sorted(trl))
+    M.persistence.save_state = lambda st, trl, *a: saves.append(sorted(trl))
     try:
         m = M.MarketMonitor.__new__(M.MarketMonitor)
         m.state, m._saved_open, m._loops_since_save, m._trailing = None, ["SOLUSD"], 1, {}
@@ -903,6 +903,344 @@ def all_strategies_default_live():
     check(PATTERN_VETO_ENABLED is False, "pattern agent must stay advisory")
     import core.agents.breakout_agent as B
     check(B.BREAKOUT_MODE == "paper", f"breakout agent must default to PAPER (got {B.BREAKOUT_MODE})")
+
+
+# ── 2026-11-05 robustness fixes ────────────────────────────────────────
+def _candle_monitor(candles, signal=None, trailing=None):
+    """A monitor whose exchange returns `candles` in order and whose engine
+    returns `signal` every time. Records engine and _handle_signal calls."""
+    import core.monitor as M
+    from core.state import BotState, DailyLevel
+    calls = {"engine": [], "handled": []}
+
+    class Eng:
+        pending_expiry_alerts = []
+
+        def __init__(self):
+            self._last_candle = {}
+
+        def process_candle(self, sym, c):
+            calls["engine"].append(c["time"])
+            return signal
+
+    class CDX:
+        def __init__(self):
+            self.queue = list(candles)
+
+        async def get_latest_15m_candle(self, sym):
+            return self.queue.pop(0)
+
+    class Flow:
+        async def poll(self, sym):
+            pass
+
+    m = M.MarketMonitor.__new__(M.MarketMonitor)
+    m.state = BotState(); m.state.levels["ETHUSD"] = DailyLevel(pdh=2743.0, pdl=2600.0)
+    m.coindcx, m.engine, m.flow, m.telegram = CDX(), Eng(), Flow(), FakeTelegram()
+    m._trailing = trailing or {}
+    m._last_candle_time, m._last_candle = {"ETHUSD": None}, {}
+    m._update_flow = lambda *a: "flow n/a"
+
+    async def handled(sig):
+        calls["handled"].append(sig.side)
+
+    async def no_exit(*a):
+        pass
+    m._handle_signal, m._check_exit_conditions = handled, no_exit
+    return m, calls
+
+
+def _c(t):
+    return {"time": t, "open": 2700.0, "high": 2701.0, "low": 2699.0, "close": 2700.0}
+
+
+@test
+def main_signal_never_doubles_an_open_position():
+    # ETH long still open across the 05:30 reset; a morning SHORT signal must not
+    # become a second live order on the same coin (it would net/flip the long).
+    import main as MAIN
+    from core.state import BotState
+    m, calls = _candle_monitor([_c(900000)], signal=main_signal("SELL"),
+                               trailing={"ETHUSD": {"side": "BUY", "entry": 2650.0, "sl": 2630.0}})
+    run(m._process_symbol("ETHUSD"))
+    check(calls["handled"] == [], f"main signal on a coin already in a trade must be skipped: {calls}")
+
+    st = BotState()
+
+    class Eng:
+        async def fetch_and_set_levels(self):
+            for s in list(st.levels):
+                st.set_levels(s, pdh=2743.0, pdl=2600.0)
+            return True
+    mon = type("Mon", (), {"_trailing": {"ETHUSD": {"side": "BUY"}}, "candle_memory": lambda self: {}})()
+    orig = MAIN.persistence.save_state
+    MAIN.persistence.save_state = lambda *a, **k: None
+    try:
+        run(MAIN.daily_reset(st, Eng(), FakeTelegram(), mon))
+    finally:
+        MAIN.persistence.save_state = orig
+    check(st.levels["ETHUSD"].in_trade is True, "daily reset must keep an open coin marked in_trade")
+    others = [s for s, lv in st.levels.items() if s != "ETHUSD" and lv and lv.in_trade]
+    check(others == [], f"only the open coin is marked in_trade, got {others}")
+
+
+@test
+def older_candle_is_not_processed_again():
+    m, calls = _candle_monitor([_c(1800000), _c(900000), _c(1800000), _c(2700000)])
+    for _ in range(4):
+        run(m._process_symbol("ETHUSD"))
+    check(calls["engine"] == [1800000, 2700000],
+          f"an older or repeated candle must never reach the strategy again: {calls['engine']}")
+
+
+@test
+def restart_does_not_replay_the_last_candle():
+    # Before a restart the 11:15 candle was processed (and the snapshot saved).
+    # After it, the exchange returns that same closed candle again.
+    import json
+    m1, _ = _candle_monitor([_c(900000)])
+    run(m1._process_symbol("ETHUSD"))
+    m1.engine._last_candle = {"ETHUSD": _c(900000)}
+    mem = json.loads(json.dumps(m1.candle_memory()))
+    m2, c2 = _candle_monitor([_c(900000), _c(1800000)])
+    m2.restore_candles(mem)
+    run(m2._process_symbol("ETHUSD"))
+    run(m2._process_symbol("ETHUSD"))
+    check(c2["engine"] == [1800000], f"the already-processed candle must not run again: {c2['engine']}")
+    check(m2.engine._last_candle.get("ETHUSD", {}).get("time") == 900000,
+          "the strategy's previous candle (inside-bar check) is restored")
+
+
+@test
+def failed_positions_call_never_closes_trades():
+    from exchange.coindcx import CoinDCXClient, PositionsUnavailable
+    cdx = CoinDCXClient.__new__(CoinDCXClient)
+    cdx.last_error = "Request timed out"
+
+    async def fail(*a):
+        return None
+    cdx._post = fail
+    try:
+        run(cdx.get_open_positions())
+        raised = False
+    except PositionsUnavailable:
+        raised = True
+    check(raised, "a failed positions call must raise, not return {} (= 'nothing open')")
+
+    # reconcile and the exit path must keep the trade when positions are unknown
+    from core.agents.risk_agent import RiskAgent
+    m = make_monitor(symbol="SOLUSD", pdh=121.0, pdl=117.0)
+
+    class X(FakeExchange):
+        async def get_open_positions(self):
+            raise PositionsUnavailable("timeout")
+    m.coindcx = X()
+    m.risk = RiskAgent(); m.risk.realised_usd, m.risk.seen = 0.0, []
+    tr = {"side": "BUY", "entry": 119.0, "sl": 118.0, "live_sl": 118.0, "tp": 120.5,
+          "qty_open": 4.2, "opened_at": "sol-1"}
+    m._trailing = {"SOLUSD": tr}
+    m._orphan_alerted = set()
+    run(m._reconcile_positions())
+    check("SOLUSD" in m._trailing and m.risk.realised_usd == 0.0,
+          "reconcile with unknown positions must not close or book anything")
+    run(m._exit_position("SOLUSD", tr, exit_price=118.0, reason="sl_hit", label="Stop"))
+    check("SOLUSD" in m._trailing and tr.get("retry_close", {}).get("reason") == "sl_hit"
+          and m.risk.realised_usd == 0.0, "exit with unknown positions is postponed, not booked")
+
+
+@test
+def failed_close_keeps_tracking_and_retries():
+    from core.agents.risk_agent import RiskAgent
+    m = make_monitor(symbol="SOLUSD", pdh=121.0, pdl=117.0)
+
+    class X(FakeExchange):
+        ok = False
+        async def get_open_positions(self):
+            return {"SOLUSD": 4.2}
+        async def close_position_market(self, *a):
+            return X.ok
+        async def get_orderbook(self, *a, **k):
+            raise RuntimeError("no book in test")
+    m.coindcx = X()
+    m.risk = RiskAgent(); m.risk.realised_usd, m.risk.seen = 0.0, []
+    logged = []
+    m._log_close = lambda *a, **k: logged.append(k.get("reason"))
+    tr = {"side": "BUY", "entry": 119.0, "sl": 118.0, "live_sl": 118.0, "tp": 120.5,
+          "qty_open": 4.2, "opened_at": "sol-2"}
+    m._trailing = {"SOLUSD": tr}
+    run(m._exit_position("SOLUSD", tr, exit_price=118.95, reason="timeout", label="Closed — 24h"))
+    check("SOLUSD" in m._trailing and logged == [],
+          "a failed market close must keep the position tracked and book nothing")
+    X.ok = True
+    c = {"open": 119.0, "high": 119.2, "low": 118.9, "close": 119.0, "time": 5}
+    run(m._check_exit_conditions("SOLUSD", c, None))
+    check("SOLUSD" not in m._trailing and logged == ["timeout"],
+          f"the postponed exit is retried on the next candle (logged {logged})")
+
+
+@test
+def telegram_poll_backs_off_after_errors():
+    import notifications.telegram as T
+    slept = []
+    orig_sleep, orig_cs = T.asyncio.sleep, T.aiohttp.ClientSession
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise OSError("Temporary failure in name resolution")
+    T.asyncio.sleep, T.aiohttp.ClientSession = fake_sleep, Boom
+    try:
+        bot = T.TelegramBot.__new__(T.TelegramBot)
+        bot.token, bot.chat_id = "test", "1"
+        bot.base_url = "http://invalid"
+        for _ in range(3):
+            run(bot.get_updates(offset=None, timeout=1))
+    finally:
+        T.asyncio.sleep, T.aiohttp.ClientSession = orig_sleep, orig_cs
+    check(len(slept) == 3 and slept[0] >= 1 and slept[2] > slept[0],
+          f"each failed poll must wait, increasingly (slept {slept})")
+
+
+@test
+def open_trades_managed_while_levels_missing():
+    import core.monitor as M
+    from core.state import BotState
+    managed = []
+    m = M.MarketMonitor.__new__(M.MarketMonitor)
+    m.state = BotState()                    # levels never loaded (05:30 fetch failed)
+    m.state.paused = True
+    m._trailing = {"SOLUSD": {"side": "BUY"}}
+    m._saved_open = ["SOLUSD"]
+
+    async def proc(sym, entries_allowed=True):
+        managed.append((sym, entries_allowed))
+
+    async def rc():
+        managed.append("reconcile")
+    m._process_symbol, m._reconcile_positions = proc, rc
+    orig_save = M.persistence.save_state
+    M.persistence.save_state = lambda *a, **k: None
+
+    async def go():
+        try:
+            await asyncio.wait_for(m.run(), timeout=0.05)
+        except asyncio.TimeoutError:
+            pass
+    try:
+        run(go())
+    finally:
+        M.persistence.save_state = orig_save
+    check("reconcile" in managed and ("SOLUSD", False) in managed,
+          f"paused / no levels: open trades are still reconciled and managed, never entered ({managed})")
+
+
+@test
+def yesterdays_snapshot_keeps_open_positions():
+    import json
+    import core.persistence as P
+    with open(P.STATE_SNAPSHOT_PATH, "w") as f:
+        json.dump({"date_ist": "2000-01-01", "levels": {"ETHUSD": None},
+                   "trailing": {"ETHUSD": {"side": "BUY", "entry": 2650.0}}}, f)
+    r = P.load_state()
+    check(r is not None and "ETHUSD" in r["trailing"] and r["levels"] == {} and r["same_day"] is False,
+          f"a stale snapshot drops its levels but keeps open positions: {r}")
+    os.remove(P.STATE_SNAPSHOT_PATH)
+
+
+# ── paper trading switch (2026-11-05) ─────────────────────────────────
+@test
+def trading_mode_defaults_live_and_typos_are_paper():
+    import importlib
+    import core.paper_exchange as PX
+    check(PX.TRADING_MODE == "live" and PX.PAPER is False, "unset TRADING_MODE must stay LIVE")
+    try:
+        for raw, want in (("paper", "paper"), (" Paper ", "paper"), ("live", "live"),
+                          ("LIVE", "live"), ("papr", "paper"), ("", "paper")):
+            os.environ["TRADING_MODE"] = raw
+            importlib.reload(PX)
+            check(PX.TRADING_MODE == want, f"TRADING_MODE={raw!r} must mean {want}, got {PX.TRADING_MODE}")
+    finally:
+        os.environ.pop("TRADING_MODE", None)
+        importlib.reload(PX)
+
+
+@test
+def paper_covers_every_account_call():
+    # Every CoinDCX method that sends a signed (account) request must be
+    # simulated -- so a method added later can't silently trade real money.
+    import inspect
+    from exchange.coindcx import CoinDCXClient
+    from core.paper_exchange import PaperExchange
+    signed = [n for n, f in inspect.getmembers(CoinDCXClient, inspect.isfunction)
+              if n != "_post" and "self._post(" in inspect.getsource(f)]
+    missing = [n for n in signed if n not in PaperExchange.__dict__]
+    check(len(signed) >= 10 and not missing, f"paper mode does not simulate: {missing}")
+
+
+class _RealNoPost:
+    """Stands in for CoinDCXClient: market data works, any signed POST is recorded."""
+    def __init__(self):
+        self.posts = []
+
+    async def _post(self, endpoint, data=None):
+        self.posts.append(endpoint)
+        return None
+
+    async def get_latest_15m_candle(self, sym):
+        return {"time": 1, "open": 2700.0, "high": 2701.0, "low": 2699.0, "close": 2700.0}
+
+    async def get_orderbook(self, *a, **k):
+        raise RuntimeError("no book in test")
+
+
+@test
+def paper_trade_full_cycle_never_touches_the_account():
+    import tempfile as _t
+    from core.paper_exchange import PaperExchange
+    from core.agents.risk_agent import RiskAgent
+    from core.monitor import MarketMonitor
+    path = os.path.join(_t.mkdtemp(), "paper_positions.json")
+    real = _RealNoPost()
+    px = PaperExchange(real, path=path)
+    run(px.get_latest_15m_candle("ETHUSD"))
+    m = make_monitor()
+    m.coindcx = px
+    m.risk = RiskAgent(); m.risk.realised_usd, m.risk.seen, m.risk.day_dir = 0.0, [], {}
+    m._log_close = MarketMonitor._log_close.__get__(m)
+    m._orphan_alerted = set()
+    run(m._handle_signal(main_signal("SELL")))           # SELL 2700, SL 2716 -> TP 2676
+    tr = m._trailing.get("ETHUSD")
+    check(tr and abs(tr["tp"] - 2676.0) < 1e-9, f"paper entry tracked with the 1.5R target: {tr}")
+    pos = run(px.get_open_positions())
+    check(pos.get("ETHUSD", 0) < 0 and px.positions["ETHUSD"]["tp"] == tr["tp"],
+          f"simulated SHORT position with exchange-side TP recorded: {px.positions}")
+    check(PaperExchange(_RealNoPost(), path=path).positions.get("ETHUSD"),
+          "simulated positions survive a restart")
+    run(m._reconcile_positions())
+    check("ETHUSD" in m._trailing, "reconcile sees the paper position as open")
+    c = {"open": 2690.0, "high": 2692.0, "low": 2675.0, "close": 2680.0, "time": 2}
+    run(m._check_exit_conditions("ETHUSD", c, None))
+    check("ETHUSD" not in m._trailing and run(px.get_open_positions()) == {},
+          "target reached -> paper position closed")
+    check(m.risk.realised_usd > 0, f"paper P&L booked for the daily halt: {m.risk.realised_usd}")
+    check(real.posts == [], f"paper mode must never send a signed request: {real.posts}")
+    run(real._post("/exchange/v1/derivatives/futures/orders/create", {}))
+    check(real.posts == [], "the real client's signed POST is disabled outright in paper mode")
+
+
+@test
+def paper_mode_is_visible_in_status_and_settings():
+    import core.paper_exchange as PX
+    from core import ops_reports
+    PX.TRADING_MODE = "paper"
+    try:
+        check("PAPER" in ops_reports.status_text() and "PAPER" in ops_reports.settings_text(),
+              "/status and /settings must say PAPER")
+    finally:
+        PX.TRADING_MODE = "live"
+    check("LIVE" in ops_reports.status_text(), "/status says LIVE by default")
 
 
 # ── runner ─────────────────────────────────────────────────────────────

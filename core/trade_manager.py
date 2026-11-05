@@ -486,11 +486,21 @@ class TradeManagerMixin:
         tr = self._trailing.get(symbol)
         if not tr:
             return
+        # 2026-11-05: the daily level is only needed by the legacy exit stack
+        # (checked below); SIMPLE_MODE and Liquidity Map exits must keep
+        # running even when today's levels failed to load.
         level = self.state.get_level(symbol)
-        if not level:
-            return
 
         side = tr["side"]
+
+        # 2026-11-05: an exit that could not complete last candle (close order
+        # failed, or positions were unknown) is retried before anything else.
+        retry = tr.pop("retry_close", None)
+        if retry:
+            tr['position_closed'] = False
+            logger.info(f"{symbol} | Retrying postponed exit ({retry['reason']})")
+            await self._exit_position(symbol, tr, **retry)
+            return
 
         # 2026-10-02: in-trade order-book watch (all strategies, 24/7).
         if await self._obi_watch(symbol, tr, candle):
@@ -522,6 +532,9 @@ class TradeManagerMixin:
         from core import simple_mode
         if simple_mode.ON:
             await self._simple_manage(symbol, tr, candle)
+            return
+
+        if not level:
             return
 
         # Track max favorable / max adverse excursion every candle, regardless
