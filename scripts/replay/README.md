@@ -42,3 +42,29 @@ Fees are ~0.10R per trade (1R ≈ ₹500, round trip ≈ ₹50). Main strategy b
 fees ≈ +0.05R/trade — not enough. No exit/sweep variant tested (TP 1R/2R/3R, no
 breakeven, sweep min 0 / 0.5%, Liquidity Map depth 0.5% / 1.0%) was positive
 in both halves. Removing the 0.2% minimum sweep was worse in both halves.
+
+## ICT Killzones & Pivots [TFO] levels (tested 5 Nov 2026)
+
+Same main-strategy engine, spot signals, futures fills/exits, fees included,
+8 Oct 2025 – 4 Nov 2026, halves split 28 Apr 2026. TFO defaults: sessions in
+New York time (DST-aware) — Asia 20:00–00:00, London 02:00–05:00, NY AM 09:30–11:00,
+NY PM 13:30–16:00; a killzone's high/low is traded until that killzone's next
+session starts. Weeks start Monday 00:00 UTC, months the 1st 00:00 UTC.
+Options: `--levels weekly|monthly|kz:ASIA|kz:LNDN|kz:NYAM|kz:NYPM`, `--kz-filter`, `--target weekly`.
+
+| Test | Trades | avg R | Total | 1st half | 2nd half |
+|---|---|---|---|---|---|
+| Baseline: PDH/PDL | 464 | +0.03 | −₹2,867 | −₹7,513 | +₹4,646 |
+| A. PWH/PWL sweeps | 129 | +0.08 | −₹557 | +₹4,820 | −₹5,377 |
+| B. PMH/PML sweeps | 49 | −0.21 | −₹7,733 | −₹3,431 | −₹4,302 |
+| C1. Asia high/low | 578 | +0.02 | −₹19,969 | −₹20,475 | +₹506 |
+| C2. London high/low | 484 | −0.04 | −₹39,668 | −₹12,424 | −₹27,244 |
+| C3. NY AM high/low | 355 | +0.13 | +₹3,194 | +₹4,434 | −₹1,241 |
+| C4. NY PM high/low | 461 | −0.09 | −₹42,709 | −₹14,727 | −₹27,982 |
+| D. PDH/PDL, sweep inside a killzone only | 317 | +0.05 | −₹1,562 | −₹3,456 | +₹1,894 |
+| E. PDH/PDL, target = opposite weekly level | 444 | −0.11 | −₹33,298 | −₹23,135 | −₹10,163 |
+
+None is positive in both halves. NY AM is the only one with a positive average R in
+both halves (+0.14 / +0.12) but fees take it to about break-even (2nd half −₹1,241);
+with 8 variants tested, one near-miss is expected by chance. NY PM (23:00–01:30 IST
+summer) lies entirely outside the bot's 05:30–23:00 IST entry hours.

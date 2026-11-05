@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 ap = argparse.ArgumentParser()
 ap.add_argument("repo"); ap.add_argument("candles"); ap.add_argument("out")
@@ -31,6 +32,13 @@ ap.add_argument("--fix-overnight", action="store_true",
 ap.add_argument("--only", choices=["main", "liqmap"])
 ap.add_argument("--trace", help="print strategy log lines for this UTC date")
 ap.add_argument("--exec-candles", help="fill entries and run exits on THESE candles (e.g. futures) while signals use the main candle dir")
+ap.add_argument("--levels", default="daily",
+                help="level source for the main strategy: daily (PDH/PDL) | weekly (PWH/PWL) | monthly (PMH/PML) "
+                     "| kz:ASIA | kz:LNDN | kz:NYAM | kz:NYPM (killzone high/low, TFO defaults)")
+ap.add_argument("--kz-filter", action="store_true",
+                help="main strategy: only trade sweeps that started inside a TFO killzone (ASIA/LNDN/NYAM/NYPM)")
+ap.add_argument("--target", choices=["1.5R", "weekly"], default="1.5R",
+                help="weekly = take profit at the opposite PWH/PWL when it is beyond 1.5R, else 1.5R")
 ap.add_argument("--set", action="append", default=[], help="override module constant: module:NAME=value")
 args = ap.parse_args()
 
@@ -109,6 +117,63 @@ for sym, cs in C.items():
         x["close"] = c["close"]; x["n"] += 1
     daily[sym] = d
 
+# ── TFO "ICT Killzones & Pivots" levels ──────────────────────────────────
+# Sessions in America/New_York (DST-aware), TFO defaults: start inclusive, end exclusive.
+NY = ZoneInfo("America/New_York")
+KZ = {"ASIA": (20 * 60, 24 * 60), "LNDN": (2 * 60, 5 * 60), "NYAM": (9 * 60 + 30, 11 * 60),
+      "NYPM": (13 * 60 + 30, 16 * 60)}
+
+
+def kz_of(ms):
+    """Killzone name a 15m candle (by its open time) belongs to, or None."""
+    d = datetime.fromtimestamp(ms / 1000, timezone.utc).astimezone(NY)
+    m = d.hour * 60 + d.minute
+    for k, (a, b) in KZ.items():
+        if a <= m < b:
+            return k
+    return None
+
+
+def _agg(key):
+    out = {}
+    for sym, cs in C.items():
+        d = {}
+        for t in sorted(cs):
+            k = key(t)
+            x = d.setdefault(k, {"high": cs[t]["high"], "low": cs[t]["low"], "n": 0})
+            x["high"] = max(x["high"], cs[t]["high"]); x["low"] = min(x["low"], cs[t]["low"]); x["n"] += 1
+        out[sym] = d
+    return out
+
+
+def _week(ms):
+    d = datetime.fromtimestamp(ms / 1000, timezone.utc)
+    return (d - timedelta(days=d.weekday())).strftime("%Y-%m-%d")      # Monday 00:00 UTC
+
+
+def _month(ms):
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m")
+
+
+weekly, monthly = _agg(_week), _agg(_month)
+
+
+def prev_period(table, keyfn, day, min_n):
+    """High/low of the period BEFORE the one containing `day` (UTC)."""
+    t = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    cur = keyfn(t)
+    keys = [k for k in table if k < cur]
+    if not keys:
+        return None
+    x = table[keys[-1]]
+    return x if x["n"] >= min_n else None
+
+
+KZ_MODE = args.levels[3:] if args.levels.startswith("kz:") else None
+kz_live = {}        # sym -> {"hi","lo"} of the session being built
+kz_level = {}       # sym -> DailyLevel holding the last finished session's high/low
+armed_kz = {}       # (sym, side) -> killzone the current sweep was armed in
+
 # ── bot objects ───────────────────────────────────────────────────────
 state = BotState()
 engine = StrategyEngine(None, state)
@@ -137,7 +202,18 @@ def daily_reset(day):
         pd = daily[sym].get(prev)
         if not pd or pd["n"] < 90:          # coin not listed yet / data gap: it sits out today
             continue
-        state.set_levels(sym, pdh=pd["high"], pdl=pd["low"])
+        if KZ_MODE:
+            if kz_level.get(sym) is not None:
+                state.levels[sym] = kz_level[sym]      # killzone levels live across the UTC day change
+            continue
+        hl = pd
+        if args.levels == "weekly":
+            hl = prev_period(weekly[sym], _week, day, 600)
+        elif args.levels == "monthly":
+            hl = prev_period(monthly[sym], _month, day, 2500)
+        if not hl:
+            continue
+        state.set_levels(sym, pdh=hl["high"], pdl=hl["low"])
         lv = state.get_level(sym)
         recent = [daily[sym][k] for k in sorted(daily[sym]) if k < day][-strat.TREND_LOOKBACK_DAYS:]
         cl = [_classify_day(c) for c in recent]
@@ -206,6 +282,9 @@ def handle(sig, t, strategy):
     if not getattr(sig, "skip_context", False):
         if not context_agent.evaluate(sig, level, state.get_regime(), STABILITY_MAX_COUNTER_CONFIRMS).approved:
             return "context"
+    if strategy == "main" and args.kz_filter:
+        if armed_kz.get((sym, "PDH" if sig.side == "SELL" else "PDL")) is None:
+            return "outside-killzone"
     if strategy == "main" and sym in open_tr:
         overnight_collisions.append((ist(t + D15), sym, sig.side, open_tr[sym]["side"]))
         if args.fix_overnight:
@@ -223,6 +302,12 @@ def handle(sig, t, strategy):
     if strategy == "main":
         r = abs(sig.entry_price - sig.sl_price)
         tp = sig.entry_price + simple_mode.TP_R * r if sig.side == "BUY" else sig.entry_price - simple_mode.TP_R * r
+        if args.target == "weekly":
+            w = prev_period(weekly[sym], _week, SIM_DAY[0], 600)
+            if w:
+                far = w["high"] if sig.side == "BUY" else w["low"]
+                if (far - tp) * (1 if sig.side == "BUY" else -1) > 0:
+                    tp = far
     else:
         tp = sig.target
     if sym in open_tr:      # live bug path: exchange position is ADDED to/netted; we just replace tracking
@@ -260,6 +345,20 @@ for t in times:
         if not c:
             continue
         hist[sym].append(c); del hist[sym][:-500]
+        if KZ_MODE:
+            in_kz = kz_of(t) == KZ_MODE
+            if in_kz:
+                if sym not in kz_live:                      # session starts: last session's pivots retire
+                    kz_live[sym] = {"hi": c["high"], "lo": c["low"]}
+                    kz_level[sym] = None
+                    if state.levels.get(sym) is not None and sym not in open_tr:
+                        state.levels[sym] = None
+                else:
+                    x = kz_live[sym]; x["hi"] = max(x["hi"], c["high"]); x["lo"] = min(x["lo"], c["low"])
+            elif sym in kz_live:                            # session over: its high/low become the levels
+                x = kz_live.pop(sym)
+                state.set_levels(sym, pdh=x["hi"], pdl=x["lo"])
+                kz_level[sym] = state.levels[sym]
         if sym in open_tr:
             ce = EX.get(sym, {}).get(t)
             if ce:
@@ -269,6 +368,12 @@ for t in times:
             continue
         if args.only != "liqmap":
             sig = engine.process_candle(sym, c)
+            lvx = state.get_level(sym)
+            if lvx is not None:
+                for side_ in ("PDH", "PDL"):
+                    at = getattr(lvx, f"{side_.lower()}_sweep_armed_at", None)
+                    if at == c["time"]:
+                        armed_kz[(sym, side_)] = kz_of(at)
             if sig:
                 r = handle(sig, t, "main")
                 decisions[("main", r)] = decisions.get(("main", r), 0) + 1
