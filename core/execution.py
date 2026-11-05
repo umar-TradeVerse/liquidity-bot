@@ -323,6 +323,41 @@ class ExecutionMixin:
         self._open_positions.pop(symbol, None)
 
 
+    def _alert_in_background(self, message: str):
+        """Send a Telegram alert without making the caller wait for it."""
+        tasks = self.__dict__.setdefault("_bg_alerts", set())
+        t = asyncio.ensure_future(self.telegram.send_alert(message))
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    async def _confirm_unclear_order(self, symbol: str, signal, positions_before, order_result):
+        """After an order call that did not return an id, look for a NEW position
+        on this coin in the signal's direction (2026-11-05). Found -> the order
+        did fill: return a result so it is tracked normally (SL re-sent, TP set).
+        Not found -> None (a genuine reject)."""
+        err = (order_result or {}).get("error") or "No response from API"
+        if positions_before is None or symbol in positions_before:
+            return None          # can't tell a new fill from an existing position
+        if '"code":4' in str(err):
+            return None          # the exchange explicitly rejected it (e.g. Insufficient funds)
+        for attempt in range(3):
+            await asyncio.sleep(2)
+            try:
+                pos = await self.coindcx.get_open_positions()
+            except Exception as e:
+                logger.warning(f"{symbol} | order check {attempt + 1}/3: positions unknown ({e})")
+                continue
+            qty = pos.get(symbol, 0)
+            if qty and ((qty > 0) == (signal.side == "BUY")):
+                logger.warning(f"{symbol} | order reply was '{err}' but the exchange shows a new "
+                               f"{signal.side} position of {abs(qty)} — tracking it as filled")
+                try:
+                    await self.coindcx.update_position_tpsl(symbol, sl_price=signal.sl_price)
+                except Exception as e:
+                    logger.error(f"{symbol} | could not re-send SL on the unconfirmed fill: {e}")
+                return {"id": "unconfirmed-fill", "quantity": abs(qty)}
+        return None
+
     async def _handle_signal(self, signal: Signal):
         symbol = signal.symbol
         level = self.state.get_level(symbol)
@@ -462,6 +497,9 @@ class ExecutionMixin:
             # matching what "one attempt per day" actually means.
             if getattr(signal, 'source', '') != 'pool':   # pool trades use their own daily slot
                 self.state.mark_auto_traded(symbol)
+                # 2026-11-05: saved now, not at the next periodic save ~1 min
+                # later -- a restart in between could otherwise retry the coin.
+                persistence.save_state(self.state, self._trailing, self.candle_memory())
 
             # 2026-09-14: INR risk-tier gate. Computed once, here, so both
             # the alert text below and the actual sizing agree. This
@@ -502,7 +540,9 @@ class ExecutionMixin:
                           f"*PDH:* {signal.pdh:.4f} | *PDL:* {signal.pdl:.4f}")
 
 
-            await self.telegram.send_alert(
+            # 2026-11-05: sent in the background -- the order no longer waits
+            # for Telegram (a slow Telegram used to delay the entry by up to ~37 s).
+            self._alert_in_background(
                 f"🔍 *Setup Detected*\n\n"
                 f"*Symbol:* {symbol}\n*Side:* {'📈 LONG' if signal.side == 'BUY' else '📉 SHORT'}\n"
                 f"*Pattern:* {signal.pattern}{' (trend-aligned flip)' if signal.trend_mode else ''}"
@@ -522,10 +562,21 @@ class ExecutionMixin:
             initial_margin = margin_usd * 0.5 if signal.use_staged_entry else margin_usd
             quantity = (initial_margin * TRADE_LEVERAGE) / signal.entry_price
 
+            try:
+                positions_before = await self.coindcx.get_open_positions()
+            except Exception as e:
+                logger.warning(f"{symbol} | positions unknown before the order ({e})")
+                positions_before = None
             order_result = await self.coindcx.place_market_order(
                 symbol=symbol, side=signal.side, quantity=quantity,
                 sl_price=signal.sl_price, leverage=TRADE_LEVERAGE
             )
+            if not (order_result and order_result.get('id')):
+                # 2026-11-05: a timeout / empty reply is NOT proof of a reject --
+                # the order may have filled. Check the exchange before giving up.
+                adopted = await self._confirm_unclear_order(symbol, signal, positions_before, order_result)
+                if adopted:
+                    order_result = adopted
 
             if order_result and order_result.get('id'):
                 order_id = order_result.get('id', 'N/A')

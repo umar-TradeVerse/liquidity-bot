@@ -24,7 +24,7 @@ os.environ["PERSIST_DIR"] = tempfile.mkdtemp(prefix="bot_tests_")
 os.environ.setdefault("TRADE_SIZE_USD", "75")
 for k in ("COINDCX_API_KEY", "COINDCX_API_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
     os.environ.setdefault(k, "test")
-for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE", "TRADING_MODE"):
+for k in ("POOL_EQUAL_MODE", "POOL_SESSION_MODE", "LIQMAP_MODE", "TRADING_MODE", "CANDLE_SOURCE"):
     os.environ.pop(k, None)
 
 RESULTS = []
@@ -469,7 +469,7 @@ def candle_store_shared_and_failsafe():
     class CDX:
         calls, fail = 0, False
 
-        async def _get(self, path, params=None):
+        async def fetch_candles(self, params):
             CDX.calls += 1
             if CDX.fail:
                 raise RuntimeError("api down")
@@ -1250,6 +1250,174 @@ def status_uptime_counts_from_bot_start():
     src = inspect.getsource(MAIN.main)
     check("ops_reports.STARTED = time.time()" in src,
           "main() must start the /status uptime clock (it showed 0:00:00 on the first /status)")
+
+
+# ── 2026-11-05 (2): futures prices, order safety, small fixes ──────────
+def _cdx_with(get):
+    from exchange.coindcx import CoinDCXClient
+    c = CoinDCXClient.__new__(CoinDCXClient)
+    c._get = get
+    return c
+
+
+@test
+def futures_price_source_switch():
+    import exchange.coindcx as X
+    check(X.CANDLE_SOURCE == "spot", "spot stays the default (futures signals replayed worse in both halves)")
+    X.CANDLE_SOURCE = "futures"
+    try:
+        _futures_price_source_checks()
+    finally:
+        X.CANDLE_SOURCE = "spot"
+
+
+def _futures_price_source_checks():
+    calls = []
+    now = int(time.time() * 1000) // 900000 * 900000
+
+    async def get(path, params=None):
+        calls.append((path, params))
+        if path == "/market_data/candlesticks":
+            # forming candle (now) included, unsorted
+            return {"s": "ok", "data": [{"time": now - 900000, "open": 1, "high": 2, "low": 0.5, "close": 1.5},
+                                        {"time": now, "open": 1.5, "high": 1.6, "low": 1.4, "close": 1.55},
+                                        {"time": now - 1800000, "open": 1, "high": 1, "low": 1, "close": 1}]}
+        return {"ts": 1, "bids": {"99": "1", "98": "1", "97": "1"}, "asks": {"101": "1", "100": "2", "102": "1"}}
+    c = _cdx_with(get)
+    k = run(c.get_latest_15m_candle("ETHUSD"))
+    path, prm = calls[0]
+    check(path == "/market_data/candlesticks" and prm["pcode"] == "f" and prm["resolution"] == "15"
+          and prm["from"] < 10 ** 11, f"futures candlesticks, seconds not ms: {calls[0]}")
+    check(k and k["time"] == now - 900000 and k["close"] == 1.5, f"last CLOSED candle, never the forming one: {k}")
+    b = run(c.get_orderbook("ETHUSD", depth=2))
+    check(calls[-1][0] == "/market_data/v3/orderbook/B-ETH_USDT-futures/10", f"futures order book: {calls[-1][0]}")
+    check(b["bids"] == {99.0: 1.0, 98.0: 1.0} and b["asks"] == {100.0: 2.0, 101.0: 1.0},
+          f"nearest levels each side, trimmed to depth: {b}")
+
+
+@test
+def latest_candle_chosen_by_time_not_position():
+    # Reply WITHOUT the new forming candle: "second-to-last" would be stale.
+    now = int(time.time() * 1000) // 900000 * 900000
+
+    async def get(path, params=None):
+        return [{"time": now - 1800000, "open": 1, "high": 1, "low": 1, "close": 1},
+                {"time": now - 900000, "open": 2, "high": 2, "low": 2, "close": 2}]
+    k = run(_cdx_with(get).get_latest_15m_candle("ETHUSD"))
+    check(k and k["time"] == now - 900000, f"must return the newest closed candle: {k}")
+
+
+@test
+def breakeven_retried_on_exchange_until_set():
+    from core.strategy import Signal
+
+    class X(FakeExchange):
+        ok, moves = False, []
+        async def update_stop_loss(self, sym, new_sl_price=None):
+            X.moves.append(new_sl_price); return X.ok
+        async def get_open_positions(self): return {"TAOUSD": 1.0} if self.orders else {}
+        async def get_orderbook(self, *a, **k): raise RuntimeError("no book in test")
+    m = make_monitor(symbol="TAOUSD", pdh=308.0, pdl=288.0)
+    m.coindcx = X()
+    run(m._handle_signal(Signal("TAOUSD", "SELL", 305.74, 310.59, 308.0, 288.0, swept_level=308.0)))
+    c = lambda h, l, cl, t: {"open": cl, "high": h, "low": l, "close": cl, "time": t}
+    run(m._check_exit_conditions("TAOUSD", c(306.0, 300.80, 301.5, 1), None))    # +1R, exchange fails
+    tr = m._trailing["TAOUSD"]
+    check(tr["live_sl"] == 305.74 and tr.get("be_exchange_pending"), "failed exchange breakeven is remembered")
+    X.ok = True
+    run(m._check_exit_conditions("TAOUSD", c(303.0, 300.0, 301.0, 2), None))
+    check(X.moves == [305.74, 305.74] and not tr.get("be_exchange_pending"),
+          f"breakeven retried on the next candle until the exchange accepts it: {X.moves}")
+
+
+@test
+def unclear_order_reply_is_checked_on_the_exchange():
+    import core.execution as E
+    orig_sleep = E.asyncio.sleep
+
+    async def no_wait(*a):
+        pass
+    E.asyncio.sleep = no_wait
+    try:
+        for err, appears, want in (("Request timed out", True, 1), ("Request timed out", False, 0),
+                                   ('{"code":400,"message":"Insufficient funds"}', True, 0)):
+            class X(FakeExchange):
+                calls = 0
+                async def place_market_order(self, **k):
+                    return {"id": None, "error": err}
+                async def get_open_positions(self):
+                    X.calls += 1
+                    return {"ETHUSD": -0.18} if (appears and X.calls > 1) else {}
+            m = make_monitor()
+            m.coindcx = X()
+            run(m._handle_signal(main_signal("SELL")))
+            check(len(m._trailing) == want,
+                  f"order reply {err!r}, position {'appeared' if appears else 'absent'}: "
+                  f"tracked {len(m._trailing)}, expected {want}")
+            if want:
+                check(m.coindcx.tp is not None, "an unconfirmed fill still gets its TP set")
+    finally:
+        E.asyncio.sleep = orig_sleep
+
+
+@test
+def setup_alert_does_not_delay_the_order():
+    events = []
+
+    class SlowTG(FakeTelegram):
+        async def send_alert(self, msg):
+            if "Setup Detected" in msg:
+                await asyncio.sleep(0.2)
+            events.append("alert:" + msg.split("*")[1] if "*" in msg else msg[:10])
+
+    class X(FakeExchange):
+        async def place_market_order(self, **k):
+            events.append("order")
+            return {"id": "t", "quantity": k["quantity"]}
+    m = make_monitor()
+    m.coindcx, m.telegram = X(), SlowTG()
+
+    async def go():
+        await m._handle_signal(main_signal("SELL"))
+        await asyncio.sleep(0.3)
+    run(go())
+    check(events.index("order") < events.index("alert:Setup Detected"),
+          f"the order must not wait for the Setup Detected alert: {events}")
+
+
+@test
+def risk_tier_exactly_800_is_full_size():
+    from core.agents.risk_agent import RiskAgent
+    # binary-exact numbers: (2/128) x $40 x 10 = $6.25, x 128 INR/$ = exactly ₹800
+    tier, _, inr = RiskAgent.inr_tier(128.0, 126.0, 40, 10, 800, 1300, 128.0)
+    check(inr == 800 and tier == "FULL", f"₹800 is full size (spec: <= ₹800), got {tier} at ₹{inr}")
+    tier, _, _ = RiskAgent.inr_tier(128.0, 125.99, 40, 10, 800, 1300, 128.0)
+    check(tier == "STAGED", "just above ₹800 is half size")
+
+
+@test
+def commands_with_bot_name_work():
+    src = open(os.path.join(ROOT, "core", "command_listener.py")).read()
+    check('text == "/trades"' not in src and 'text == "/state"' not in src and 'text == "/help"' not in src,
+          "/trades@Bot, /state@Bot and /help@Bot must match (compare cmd, not text)")
+
+
+@test
+def todays_trade_flag_saved_immediately():
+    import core.execution as E
+    saved = []
+    orig = E.persistence.save_state
+    E.persistence.save_state = lambda st, *a, **k: saved.append(st.levels["ETHUSD"].auto_traded_today)
+    try:
+        class X(FakeExchange):
+            async def place_market_order(self, **k):
+                return {"id": None, "error": '{"code":400,"message":"Insufficient funds"}'}
+        m = make_monitor()
+        m.coindcx = X()
+        run(m._handle_signal(main_signal("SELL")))
+    finally:
+        E.persistence.save_state = orig
+    check(True in saved, "the used-today flag is saved before the order goes out")
 
 
 # ── runner ─────────────────────────────────────────────────────────────

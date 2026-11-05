@@ -18,7 +18,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Only these settings may ever be shown. Keys/secrets/tokens are never listed.
 SETTINGS_SHOWN = (
-    "TRADING_MODE", "TRADE_SIZE_USD", "SIMPLE_MODE", "POOL_EQUAL_MODE", "POOL_SESSION_MODE",
+    "TRADING_MODE", "CANDLE_SOURCE", "TRADE_SIZE_USD", "SIMPLE_MODE", "POOL_EQUAL_MODE", "POOL_SESSION_MODE",
     "LIQMAP_MODE", "LIQMAP_MIN_SWEEP_PCT", "BREAKOUT_MODE", "OBI_EXIT_MODE",
     "EARLY_FAILURE_MODE", "ORDERFLOW_SKIP", "USD_INR_RATE", "DEBUG",
 )
@@ -90,6 +90,11 @@ def status_text(monitor=None) -> str:
     return "\n".join(lines)
 
 
+def _candle_source() -> str:
+    from exchange.coindcx import CANDLE_SOURCE
+    return CANDLE_SOURCE
+
+
 def settings_text() -> str:
     from core import simple_mode
     from core.agents.risk_agent import USD_TO_INR_RATE
@@ -104,6 +109,7 @@ def settings_text() -> str:
     lines += ["", "*Effective values*",
               f"Trading: {TRADING_MODE.upper()}"
               f"{' — simulated, no real orders' if TRADING_MODE == 'paper' else ' — real orders'}",
+              f"Price data: {_candle_source().upper()} candles + order book",
               f"Simple mode: {'ON' if simple_mode.ON else 'OFF'} — entry delay "
               f"{S.ENTRY_DELAY_CANDLES} candle(s), target {simple_mode.TP_R}R",
               f"Min sweep depth (main strategy): {S.MIN_LIQUIDITY_SWEEP_PCT * 100:.2f}% "

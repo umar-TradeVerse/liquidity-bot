@@ -41,10 +41,11 @@ class CandleStore:
         self.gen[symbol] = self.gen.get(symbol, 0) + 1
         try:
             now = int(datetime.now(timezone.utc).timestamp() * 1000)
-            res = await self.cdx._get("/market_data/candles", params={
+            res = await self.cdx.fetch_candles({
                 "pair": SYMBOL_MAP[symbol], "interval": "15m",
                 "from": now - HISTORY * 900 * 1000, "to": now, "limit": HISTORY})
-            cs = sorted(res or [], key=lambda c: int(c["time"]))[:-1]   # drop forming candle
+            cs = [c for c in sorted(res or [], key=lambda c: int(c["time"]))
+                  if int(c["time"]) + 900 * 1000 <= now]                  # closed candles only
             self.hist[symbol] = [_norm(c) for c in cs]
             self.ok[symbol] = True
             logger.info(f"{symbol} | Candle history loaded: {len(self.hist[symbol])} candles (shared)")

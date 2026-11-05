@@ -287,7 +287,15 @@ class TradeManagerMixin:
                 logger.info(f"{symbol} | SIMPLE: +{simple_mode.BE_AT_R}R reached — stop moved to entry {e:.6g}")
             else:
                 tr["live_sl"] = e      # bot still enforces it even if the exchange update failed
-                logger.warning(f"{symbol} | SIMPLE: breakeven exchange update failed — bot enforcing entry stop")
+                tr["be_exchange_pending"] = True
+                logger.warning(f"{symbol} | SIMPLE: breakeven exchange update failed — bot enforcing "
+                               f"entry stop, retrying the exchange every candle")
+        elif tr.get("be_exchange_pending"):
+            # 2026-11-05: keep retrying -- until the exchange stop is at entry,
+            # a bot outage would still cost the full 1R.
+            if await self.coindcx.update_stop_loss(symbol, new_sl_price=e):
+                tr.pop("be_exchange_pending", None)
+                logger.info(f"{symbol} | SIMPLE: breakeven now set on the exchange (retry succeeded)")
         if tr["n_simple"] >= simple_mode.TIMEOUT_CANDLES:
             await self._exit_position(symbol, tr, exit_price=candle["close"], reason="timeout",
                                       label="Closed — 24h time limit")

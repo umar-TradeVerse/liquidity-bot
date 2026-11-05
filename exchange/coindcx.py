@@ -10,6 +10,7 @@ import time
 import hmac
 import hashlib
 import json
+import os
 from typing import Optional
 import aiohttp
 from datetime import datetime, timedelta
@@ -21,6 +22,21 @@ IST = pytz.timezone("Asia/Kolkata")
 
 COINDCX_BASE_URL = "https://api.coindcx.com"
 COINDCX_PUBLIC_URL = "https://public.coindcx.com"
+
+# 2026-11-05: price data source for signals (candles + order book).
+# The bot TRADES futures but has always read the spot feed ("B-" pairs on
+# /market_data/candles); exchange-side SL/TP trigger on futures prices
+# (ETH 4-Nov high: spot 2450.00, futures 2449.95).
+#   spot (default) -- unchanged behaviour.
+#   futures        -- CoinDCX futures candlesticks + futures order book.
+# Replay 8-Oct-2025..4-Nov-2026, main strategy, exits on futures prices:
+# spot signals -Rs2,867 (halves -7,513 / +4,646); futures signals -Rs30,252
+# (-17,813 / -12,439) -- the futures feed is noisier (bigger wicks), giving
+# more false sweeps. Worse in both halves, so NOT the default.
+_raw_src = os.getenv("CANDLE_SOURCE", "spot").strip().lower()
+CANDLE_SOURCE = _raw_src if _raw_src in ("futures", "spot") else "spot"
+_FUT_RES = {"15m": "15", "1d": "1D"}
+
 
 class PositionsUnavailable(RuntimeError):
     """The open-positions call failed -- positions are UNKNOWN, not empty."""
@@ -143,6 +159,24 @@ class CoinDCXClient:
             logger.error(f"GET {path} error: {e}")
             return None
 
+    async def fetch_candles(self, params: dict) -> Optional[list]:
+        """Candles for params {pair, interval ('15m'|'1d'), from, to (ms), limit},
+        oldest or newest first as the source returns them, each a dict with
+        time (ms, candle OPEN time), open, high, low, close, volume. The last
+        one may still be forming. Source per CANDLE_SOURCE (2026-11-05)."""
+        if CANDLE_SOURCE == "spot":
+            return await self._get("/market_data/candles", params=params)
+        res = await self._get("/market_data/candlesticks", params={
+            "pair": params["pair"], "resolution": _FUT_RES[params["interval"]], "pcode": "f",
+            "from": int(params["from"]) // 1000, "to": int(params["to"]) // 1000})
+        if not isinstance(res, dict) or res.get("s") != "ok" or not isinstance(res.get("data"), list):
+            if res is not None:
+                logger.warning(f"{params['pair']} | futures candles: unexpected reply {str(res)[:200]}")
+            return None
+        data = sorted(res["data"], key=lambda c: int(c["time"]))
+        limit = int(params.get("limit") or 0)
+        return data[-limit:] if limit else data
+
     async def get_previous_day_candle(self, symbol: str) -> Optional[dict]:
         coindcx_symbol = SYMBOL_MAP.get(symbol)
         if not coindcx_symbol:
@@ -162,7 +196,7 @@ class CoinDCXClient:
             "limit": 15
         }
 
-        result = await self._get("/market_data/candles", params=params)
+        result = await self.fetch_candles(params)
 
         if result and isinstance(result, list):
             debug_dates = [
@@ -230,7 +264,7 @@ class CoinDCXClient:
             "limit": 10
         }
 
-        result = await self._get("/market_data/candles", params=params)
+        result = await self.fetch_candles(params)
 
         if not result or not isinstance(result, list) or len(result) == 0:
             logger.warning(f"{symbol} | Empty/None response from 15m candles endpoint")
@@ -242,11 +276,15 @@ class CoinDCXClient:
             logger.error(f"{symbol} | Failed to sort 15m candles: {e}")
             return None
 
-        if len(candles) < 2:
-            logger.warning(f"{symbol} | Only {len(candles)} candle(s) returned, need >=2")
+        # 2026-11-05: the last candle whose 15 minutes are over -- chosen by
+        # time, not "second-to-last", so a reply that doesn't yet include the
+        # new forming candle can't hand back a stale one.
+        closed = [x for x in candles if int(x["time"]) + 900 * 1000 <= now_ts]
+        if not closed:
+            logger.warning(f"{symbol} | No closed 15m candle in the reply ({len(candles)} returned)")
             return None
 
-        c = candles[-2]
+        c = closed[-1]
 
         return {
             "open": float(c["open"]),
@@ -288,7 +326,7 @@ class CoinDCXClient:
             "limit": n + 12
         }
 
-        result = await self._get("/market_data/candles", params=params)
+        result = await self.fetch_candles(params)
 
         if not result or not isinstance(result, list) or len(result) == 0:
             logger.error(f"{symbol} | No daily candle data returned for recent-days fetch")
@@ -345,8 +383,12 @@ class CoinDCXClient:
             logger.error(f"{symbol} | Unknown symbol, no CoinDCX mapping for orderbook")
             return None
 
-        result = await self._get("/market_data/orderbook",
-                                  params={"pair": coindcx_symbol, "depth": depth})
+        if CANDLE_SOURCE == "spot":
+            result = await self._get("/market_data/orderbook",
+                                      params={"pair": coindcx_symbol, "depth": depth})
+        else:   # 2026-11-05: futures book (depth must be 10, 20 or 50)
+            book_depth = 10 if depth <= 10 else 20 if depth <= 20 else 50
+            result = await self._get(f"/market_data/v3/orderbook/{coindcx_symbol}-futures/{book_depth}")
 
         if not result or "bids" not in result or "asks" not in result:
             logger.warning(f"{symbol} | Empty/None response from orderbook endpoint "
@@ -366,7 +408,10 @@ class CoinDCXClient:
                            f"this instrument, see get_orderbook docstring")
             return None
 
-        return {"bids": bids, "asks": asks, "timestamp": result.get("timestamp")}
+        # nearest `depth` levels each side (the futures book returns a fixed depth)
+        bids = dict(sorted(bids.items(), reverse=True)[:depth])
+        asks = dict(sorted(asks.items())[:depth])
+        return {"bids": bids, "asks": asks, "timestamp": result.get("timestamp") or result.get("ts")}
 
     async def _get_instrument_details(self, coindcx_symbol: str) -> Optional[dict]:
         if coindcx_symbol in self._instrument_cache:

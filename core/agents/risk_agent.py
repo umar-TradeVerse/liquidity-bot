@@ -173,6 +173,6 @@ class RiskAgent:
         risk_inr = risk_usd * usd_inr
         if risk_inr > staged_max_inr:
             return "SKIP", risk_usd, risk_inr
-        if risk_inr >= full_max_inr:
+        if risk_inr > full_max_inr:          # 2026-11-05: exactly ₹800 is still FULL size (spec: <= ₹800)
             return "STAGED", risk_usd, risk_inr
         return "FULL", risk_usd, risk_inr

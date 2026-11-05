@@ -78,7 +78,7 @@ async def run_command_listener(telegram: TelegramBot, monitor=None):
                 elif cmd == "/settings":
                     from core.ops_reports import settings_text
                     await telegram.send_alert(settings_text())
-                elif text == "/trades":
+                elif cmd == "/trades":   # cmd, not text: "/trades@BotName" works too (2026-11-05)
                     sent = await telegram.send_document(
                         persistence.TRADES_LOG_PATH,
                         caption="📊 Full trade history (one JSON line per open/close event)."
@@ -89,12 +89,12 @@ async def run_command_listener(telegram: TelegramBot, monitor=None):
                             "(no trades logged since this feature was deployed) or "
                             "the volume isn't mounted."
                         )
-                elif text == "/state":
+                elif cmd == "/state":
                     await telegram.send_document(
                         persistence.STATE_SNAPSHOT_PATH,
                         caption="🗂 Current state snapshot."
                     )
-                elif text == "/help":
+                elif cmd == "/help":
                     await telegram.send_alert(HELP_TEXT)
 
         except Exception as e:

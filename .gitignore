@@ -7,3 +7,6 @@ logs/
 .DS_Store
 venv/
 .venv/
+
+# replay downloads (scripts/replay/README.md)
+replay_data/
